@@ -11,7 +11,7 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 # 2. 配置 Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('gemini-1.5-flash-latest')
 
 # 3. 定义你的“一手信息源” (可随时修改)
 RSS_FEEDS = [
@@ -31,6 +31,7 @@ def clean_content_jina(url):
         # 设置 User-Agent 防止被某些网站拦截
         response = requests.get(jina_url, timeout=15)
         if response.status_code == 200:
+            print(f"Jina 抓取成功，长度: {len(response.text)}")
             return response.text
     except Exception as e:
         print(f"Jina 清洗失败: {e}")
@@ -100,4 +101,5 @@ def main():
                 print("内容被 AI 判定为无价值，跳过。")
 
 if __name__ == "__main__":
+
     main()
