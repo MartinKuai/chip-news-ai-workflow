@@ -1,66 +1,79 @@
 import feedparser
 import requests
 import os
-import google.generativeai as genai
 import time
+import json
 
 # 1. 从 GitHub Secrets 读取配置
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-# 2. 配置 Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-pro')
-
-# 3. 定义你的“一手信息源” (可随时修改)
+# 2. 定义 RSS 源
 RSS_FEEDS = [
-    # 路透社科技版 (硬新闻)
-    "https://moxie.foxnews.com/google-publisher/tech.xml", # 替代源，部分路透源需特定Header
-    # Hacker News 热门 (技术趋势)
+    "https://moxie.foxnews.com/google-publisher/tech.xml", 
     "https://hnrss.org/newest?points=100", 
 ]
 
 def clean_content_jina(url):
-    """使用 Jina Reader 将网页转为干净的 Markdown"""
+    """使用 Jina Reader 将网页转为 Markdown"""
     jina_url = f"https://r.jina.ai/{url}"
-    headers = {
-        "Authorization": f"Bearer {os.environ.get('JINA_API_KEY', '')}" # 免费版不需要Key，但预留接口
-    }
     try:
-        # 设置 User-Agent 防止被某些网站拦截
-        response = requests.get(jina_url, timeout=15)
+        response = requests.get(jina_url, timeout=20) # 延长超时时间
         if response.status_code == 200:
-            print(f"Jina 抓取成功，长度: {len(response.text)}")
+            print(f"✅ Jina 抓取成功 (长度: {len(response.text)})")
             return response.text
     except Exception as e:
-        print(f"Jina 清洗失败: {e}")
+        print(f"❌ Jina 请求错误: {e}")
     return None
 
-def analyze_article(text, title):
-    """让 Gemini 充当分析师"""
-    if len(text) < 200: return "SKIP" # 内容太短直接跳过
+def analyze_via_rest_api(text, title):
+    """【核心修改】直接使用 REST API 调用 Gemini 1.5 Flash"""
+    if len(text) < 200: return "SKIP"
 
-    prompt = f"""
-    你是一位半导体与科技行业的资深销售工程师。请审阅以下新闻。
+    # API 端点 (直接写死，最稳妥)
+    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
     
+    headers = {'Content-Type': 'application/json'}
+    
+    prompt = f"""
+    你是一位半导体行业的情报官。请阅读新闻：
     标题：{title}
     内容：
     {text[:8000]} 
 
     任务：
-    1. 判断价值：这是否包含具体的**市场数据、技术参数、人事变动或供应链动态**？如果是纯观点/废话，输出 "SKIP"。
-    2. 如果有价值，请用**中文**生成简报（不超过 100 字）：
-       - 用【】标注核心实体（如【台积电】、【3nm工艺】）。
-       - 提炼关键数据。
-       - 语气客观专业。
+    1. 假如内容是关于具体市场数据、芯片技术参数、重大并购或人事变动的，请用中文总结（100字以内）。
+    2. 假如内容是泛泛而谈的观点、教程或无关内容，直接回复 "SKIP"。
+    3. 总结格式：
+       - 核心事实：...
+       - 关键数据：...
     """
-    
+
+    payload = {
+        "contents": [{
+            "parts": [{"text": prompt}]
+        }]
+    }
+
     try:
-        response = model.generate_content(prompt)
-        return response.text.strip()
+        response = requests.post(api_url, headers=headers, json=payload, timeout=30)
+        
+        if response.status_code == 200:
+            result = response.json()
+            # 解析嵌套的 JSON 结构
+            try:
+                answer = result['candidates'][0]['content']['parts'][0]['text']
+                return answer.strip()
+            except (KeyError, IndexError):
+                print(f"⚠️ API 返回结构异常: {result}")
+                return "SKIP"
+        else:
+            print(f"❌ Gemini API 报错 ({response.status_code}): {response.text}")
+            return "SKIP"
+            
     except Exception as e:
-        print(f"Gemini 分析失败: {e}")
+        print(f"❌ 网络请求失败: {e}")
         return "SKIP"
 
 def send_telegram(msg):
@@ -68,39 +81,34 @@ def send_telegram(msg):
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": msg,
-        "parse_mode": "Markdown" # 支持粗体等格式
+        "parse_mode": "Markdown"
     }
     requests.post(url, json=payload)
 
 def main():
-    print("开始执行任务...")
-    # 发送一条开始消息 (调试用，稳定后可注释掉)
-    # send_telegram("🤖 每日情报抓取任务开始...")
+    print("🚀 任务开始 (REST API 版)...")
     
     for feed_url in RSS_FEEDS:
-        print(f"正在抓取: {feed_url}")
+        print(f"📡 正在检查源: {feed_url}")
         feed = feedparser.parse(feed_url)
         
-        # 每个源只取前 2 条最新的，避免消息轰炸
         for entry in feed.entries[:2]:
-            print(f"处理文章: {entry.title}")
+            print(f"📄 处理文章: {entry.title}")
             
-            # 1. 清洗网页
             content = clean_content_jina(entry.link)
             if not content: continue
             
-            # 2. AI 分析
-            analysis = analyze_article(content, entry.title)
+            # 这里调用新的 REST API 函数
+            analysis = analyze_via_rest_api(content, entry.title)
             
-            # 3. 发送结果
-            if analysis != "SKIP":
-                message = f"📰 *{entry.title}*\n\n{analysis}\n\n🔗 [原文链接]({entry.link})"
+            if analysis and "SKIP" not in analysis:
+                print("💡 发现有价值新闻，正在发送...")
+                # 这里的格式调整得更易读
+                message = f"🚨 *{entry.title}*\n\n{analysis}\n\n🔗 [原文链接]({entry.link})"
                 send_telegram(message)
-                time.sleep(2) # 避免发送太快被 Telegram 限制
+                time.sleep(2) 
             else:
-                print("内容被 AI 判定为无价值，跳过。")
+                print("🗑️ 内容被跳过")
 
 if __name__ == "__main__":
-
     main()
-
