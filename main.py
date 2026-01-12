@@ -9,7 +9,19 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 RSS_FEEDS = [
-    "https://moxie.foxnews.com/google-publisher/tech.xml", 
+    # 1. 行业权威
+    "https://www.eetimes.com/feed/", 
+    
+    # 2. 深度工艺与制造
+    "https://semiengineering.com/feed/",
+    
+    # 3. 企业级/服务器硬件 (适合 B2B)
+    "https://www.servethehome.com/feed/",
+    
+    # 4. 市场行情 (TrendForce)
+    "https://www.trendforce.com/rss",
+    
+    # 5. 原有的 Hacker News (可选保留，看技术趋势)
     "https://hnrss.org/newest?points=100", 
 ]
 
@@ -51,14 +63,29 @@ def analyze_via_rest_api(text, title, model_name="gemini-1.5-flash-001"):
     headers = {'Content-Type': 'application/json'}
     
     prompt = f"""
-    你是一位半导体行业的情报官。请阅读新闻：
+    你是一位专业的半导体芯片销售工程师。请阅读这篇来自专业媒体的新闻。
+    
     标题：{title}
     内容：
     {text[:8000]} 
+    
+    【任务判断】
+    请判断这篇文章对于“销售工程师”是否有商业或技术价值。
+    -如果是以下内容，请直接回复 "SKIP"：
+       * 纯粹的消费级数码产品评测（如“iPhone 16 手机壳评测”）。
+       * 过于基础的编程教程。
+       * 与芯片、半导体供应链、服务器硬件无关的社会新闻。
+    
+    -如果是以下内容，必须生成总结：
+       * 晶圆厂（TSMC, Intel, Samsung）的工艺进展或扩产计划。
+       * 关键原厂（NVIDIA, AMD, TI, ADI 等）的新产品发布或财报。
+       * 供应链涨价、缺货或库存预警。
+       * 具体的 B2B 硬件技术突破（如 CXL, HBM, RISC-V）。
 
-    任务：
-    1. 假如内容是关于具体市场数据、芯片技术参数、重大并购或人事变动的，请用中文总结（100字以内）。
-    2. 假如内容是泛泛而谈的观点、教程或无关内容，直接回复 "SKIP"。
+    【总结格式】
+    (如果通过筛选，请用中文总结，100字以内)
+    🚨 *核心情报*：一句话概括发生了什么。
+    📉 *关键数据*：提取文中的金额、制程纳米数、良率或日期。
     """
 
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
@@ -124,3 +151,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
