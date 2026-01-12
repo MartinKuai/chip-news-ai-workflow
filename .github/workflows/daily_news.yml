@@ -1,0 +1,29 @@
+name: Daily News Agent
+
+on:
+  schedule:
+    # 北京时间早上 7:00 = UTC 时间前一天的 23:00
+    - cron: '0 23 * * *'
+  workflow_dispatch: # 允许你手动点击按钮立即测试
+
+jobs:
+  run_agent:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run script
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py
