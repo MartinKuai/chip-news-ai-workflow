@@ -11,7 +11,7 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 # 2. 配置 Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash-latest')
+model = genai.GenerativeModel('gemini-pro')
 
 # 3. 定义你的“一手信息源” (可随时修改)
 RSS_FEEDS = [
@@ -103,3 +103,4 @@ def main():
 if __name__ == "__main__":
 
     main()
+
