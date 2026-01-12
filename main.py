@@ -45,14 +45,27 @@ def check_available_models():
         return []
 
 def clean_content_jina(url):
+    """使用 Jina Reader 将网页转为 Markdown (带重试机制)"""
     jina_url = f"https://r.jina.ai/{url}"
-    try:
-        response = requests.get(jina_url, timeout=20)
-        if response.status_code == 200:
-            print(f"✅ Jina 抓取成功 (长度: {len(response.text)})")
-            return response.text
-    except Exception as e:
-        print(f"❌ Jina 请求错误: {e}")
+    
+    # 重试配置：尝试 3 次，每次间隔 5 秒
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # 这里的 timeout 延长到 30 秒
+            response = requests.get(jina_url, timeout=30)
+            if response.status_code == 200:
+                print(f"✅ Jina 抓取成功 (长度: {len(response.text)})")
+                return response.text
+            else:
+                print(f"⚠️ Jina 返回状态码 {response.status_code}，正在重试...")
+        except Exception as e:
+            print(f"⚠️ 第 {attempt + 1} 次尝试失败 ({e})，等待重试...")
+        
+        # 失败后休息一下再试
+        time.sleep(5)
+    
+    print(f"❌ 最终抓取失败: {url}")
     return None
 
 def analyze_via_rest_api(text, title, model_name="gemini-1.5-flash-001"):
@@ -107,7 +120,38 @@ def analyze_via_rest_api(text, title, model_name="gemini-1.5-flash-001"):
 
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+    
+    # 第一次尝试：使用 Markdown 格式（好看）
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID, 
+        "text": msg, 
+        "parse_mode": "Markdown"
+    }
+    
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        
+        # 如果发送成功，直接返回
+        if response.status_code == 200:
+            print("✅ Telegram 消息发送成功")
+            return
+        else:
+            print(f"⚠️ Markdown 格式发送失败 ({response.text})，正在尝试纯文本模式...")
+            
+    except Exception as e:
+        print(f"⚠️ 网络请求异常: {e}")
+
+    # === 兜底方案 ===
+    # 如果上面失败了，移除 parse_mode，发送纯文本（难看点，但绝对能收到）
+    payload.pop("parse_mode", None)
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code == 200:
+            print("✅ 纯文本消息发送成功 (兜底)")
+        else:
+            print(f"❌ 彻底发送失败: {response.text}")
+    except Exception as e:
+        print(f"❌ 兜底发送也失败: {e}")
 
 def main():
     print("🚀 任务开始 (诊断模式)...")
@@ -151,4 +195,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
