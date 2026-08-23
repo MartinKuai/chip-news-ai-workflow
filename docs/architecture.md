@@ -1,190 +1,140 @@
-# Architecture
+# Daily Chip News V2 架构
 
-This document separates the **current V1 implementation** from the **planned V2 micro-graph**. The distinction is intentional: the repository should show what already works, what failed in long-running use, and what is being improved next.
-
-## 1. V1 — current implementation
-
-V1 is a linear content-automation pipeline:
+Daily Chip News V2 使用一个三节点内容生产 Micro-Graph：
 
 ```mermaid
 flowchart LR
-    A[RSS feeds] --> B[Article URLs]
-    B --> C[Jina Reader]
-    C --> D[Clean article text]
-    D --> E[Gemini]
-    E -->|irrelevant| F[SKIP]
-    E -->|relevant| G[Chinese brief]
-    G --> H[Telegram]
-
-    I[GitHub Actions] -. daily schedule .-> A
+    A[RSS / 行业信息源] --> B[Researcher 研究员]
+    B -->|Research Notes| C[Writer 写手]
+    C -->|Draft| D[Reviewer 审稿人]
+    D -->|PASS| E[Telegram Publisher]
+    D -->|REJECT + Revision Brief| C
 ```
 
-### Responsibilities
+Publisher 是确定性基础设施，不作为 Agent 节点。
 
-| Stage | Responsibility |
-| --- | --- |
-| RSS collection | Pull a small set of recent articles from selected sources |
-| Content extraction | Reduce web-page noise before LLM processing |
-| Relevance filter | Decide whether an item matters to a semiconductor sales / business context |
-| Summarization | Produce a compact Chinese brief with core intelligence and key data |
-| Delivery | Push qualified items into Telegram |
-| Scheduling | Run the pipeline automatically every day |
+## 1. 设计目标
 
-### What V1 proved
+架构围绕三条原则：
 
-V1 proved that a small AI workflow can remove a meaningful amount of repetitive information triage without requiring a full content-management system.
+- **角色隔离**：检索、写作、审稿不混在同一个 Prompt 中。
+- **上下文隔离**：Writer 只接收经过筛选的结构化研究笔记，不继承网页正文和 Researcher 的处理上下文。
+- **显式 QA Gate**：只有 Reviewer 返回 `PASS` 的内容才允许进入发布层。
 
-It also exposed two weaknesses that matter in a long-running workflow:
+整个图保持小型、可观察、可调试，不引入数据库、向量库或复杂多 Agent 基础设施。
 
-1. **Quality control is implicit.** The same LLM call both judges relevance and produces the final content.
-2. **Operational failures can look like editorial decisions.** If an API failure is converted into `SKIP`, the scheduler can remain green while content delivery silently stops.
+## 2. Researcher / 研究员
 
-Those observations are the main reason for V2.
+Researcher 负责：
 
----
+1. 使用 Jina Reader 提取文章正文；
+2. 判断文章是否具有半导体商业或技术价值；
+3. 只提取原文可以支持的事实；
+4. 将事实整理为结构化 Research Notes。
 
-## 2. V2 — planned three-node editorial micro-graph
+它不写最终文案。
 
-V2 keeps the graph deliberately small:
-
-```mermaid
-flowchart LR
-    A[Researcher] -->|Research Notes| B[Writer]
-    B -->|Draft| C[Reviewer]
-    C -->|PASS| D[Publisher]
-    C -->|REJECT + Revision Brief| B
-```
-
-The Publisher remains deterministic infrastructure rather than an agent node.
-
-### Design goal
-
-The graph is designed around three principles:
-
-- **Role separation** — research, writing, and review should not collapse into one prompt.
-- **Context isolation** — the Writer receives a clean context instead of raw browsing history.
-- **Explicit QA** — publication requires a visible review decision against a defined rubric.
-
----
-
-## 3. Node 1 — Researcher
-
-The Researcher retrieves, extracts, and normalizes evidence. It does **not** write the final article.
-
-### Input
+输出契约：
 
 ```json
 {
-  "date": "2026-08-24",
-  "topic_scope": [
-    "semiconductors",
-    "memory",
-    "foundries",
-    "AI infrastructure",
-    "B2B hardware"
-  ],
-  "source_limit": 10
-}
-```
-
-### Output contract
-
-```json
-{
+  "decision": "KEEP",
+  "reason": "与 HBM 供应链相关",
   "topic": "HBM supply",
+  "source": "SemiEngineering",
+  "url": "https://example.com/article",
+  "published_at": "2026-08-24",
   "notes": [
     {
-      "claim": "A source-supported factual statement",
-      "evidence": "Relevant excerpt or normalized fact",
-      "source": "Publisher name",
-      "url": "https://example.com/article",
-      "published_at": "2026-08-24",
-      "why_it_matters": "Why this matters to a business-facing semiconductor reader",
+      "claim": "可由原文直接支持的事实",
+      "evidence": "证据摘要",
+      "why_it_matters": "对半导体业务读者的意义",
       "confidence": 0.92
     }
   ]
 }
 ```
 
-Only structured notes move forward. Raw browsing context and long article bodies are not passed to the Writer.
+`decision=SKIP` 时不会进入 Writer。
 
----
+## 3. Writer / 写手
 
-## 4. Node 2 — Writer
+Writer 每次从干净上下文开始，只接收：
 
-The Writer starts from a fresh context containing only:
+- Editorial Brief；
+- Research Notes；
+- 必要时的 Revision Brief。
 
-1. an editorial brief;
-2. structured Research Notes;
-3. the required output schema.
+不会向 Writer 传递：
 
-The Writer should not see the Researcher's browsing trace or hidden intermediate reasoning.
+- 原始网页正文；
+- RSS 抓取过程；
+- Researcher 的提示词或中间处理上下文；
+- Reviewer 的长篇解释。
 
-### Draft contract
+输出契约：
 
 ```json
 {
   "headline": "...",
   "summary": "...",
-  "key_facts": ["...", "...", "..."],
+  "key_facts": ["...", "..."],
   "why_it_matters": "...",
   "telegram_copy": "..."
 }
 ```
 
-The first V2 implementation should keep distribution narrow. Telegram remains the primary output; platform-specific content for X, TikTok, or YouTube should only be added if there is a real use case.
+Writer 被明确要求不得补充 Research Notes 中不存在的事实、数字、因果或预测。
 
----
+## 4. Reviewer / 审稿人
 
-## 5. Node 3 — Reviewer
+Reviewer 是质量门，不是第二个 Writer。
 
-The Reviewer is a QA gate, not a second Writer.
+审核维度：
 
-### Review rubric
+- factual grounding
+- source coverage
+- unsupported claims
+- recency
+- commercial relevance
+- clarity
+- duplication
+- tone
+- length
+- output formatting
 
-The reviewer checks:
-
-- factual grounding;
-- source coverage;
-- unsupported claims;
-- recency;
-- commercial relevance;
-- clarity;
-- duplication;
-- tone;
-- length;
-- output formatting.
-
-### Review contract
+输出契约：
 
 ```json
 {
   "status": "REJECT",
   "scores": {
     "factuality": 9,
-    "relevance": 7,
+    "relevance": 8,
     "clarity": 8
   },
   "issues": [
     {
       "severity": "major",
-      "problem": "A conclusion is not supported by the supplied Research Notes"
+      "problem": "某项结论缺少 Research Notes 支撑"
     }
   ],
   "revision_brief": [
-    "Remove the unsupported market-share conclusion",
-    "Explain the supply-chain impact more directly"
+    "删除未经证据支持的结论"
   ]
 }
 ```
 
-The Reviewer should not rewrite the content itself. On rejection, the Writer receives the original Research Notes plus the concise revision brief.
+以下情况必须 `REJECT`：
 
----
+- `factuality < 8`
+- `relevance < 8`
+- 出现 major issue
+- 草稿包含研究笔记无法支持的事实或数字
 
-## 6. Revision loop
+Reviewer 不直接改写正文。
 
-The rewrite loop is capped:
+## 5. 有界返工循环
 
 ```text
 Researcher
@@ -199,39 +149,78 @@ Reviewer ── PASS ──> Publish
         max 2 revisions
 ```
 
-If the maximum number of revisions is reached, the item should be held instead of being published automatically.
+默认最多返工 2 次。
 
----
+如果达到上限仍未通过，状态进入 `HOLD`，内容不会自动发布。
 
-## 7. Operational state
+## 6. Graph State
 
-A minimal graph state can remain small:
+单篇文章的最小状态可以表示为：
 
 ```json
 {
-  "research_notes": {},
+  "article": {},
+  "research": {},
   "draft": {},
   "review": {},
   "revision_count": 0,
-  "publish_status": "pending"
+  "status": "PASS"
 }
 ```
 
-The project does not need a database, vector store, or large orchestration layer for the first V2 iteration.
+主流程只需要判断四类内容状态：
 
----
+- `SKIP`：Researcher 判定无发布价值
+- `PASS`：Reviewer 验收通过
+- `REJECT`：进入返工
+- `HOLD`：超过返工上限，不发布
 
-## 8. Acceptance criteria for V2
+Gemini、Jina、Telegram 等基础设施错误通过异常显式暴露，不会伪装成 `SKIP`。
 
-V2 is complete only when all of the following are true:
+## 7. Publisher / 发布层
 
-- Researcher output is structured and source-linked.
-- Writer receives a clean, intentionally limited context.
-- Reviewer can return both PASS and REJECT through machine-readable output.
-- A rejected draft can return to Writer with a revision brief.
-- Rewrite attempts are capped.
-- A model/API failure is distinguishable from an editorial `SKIP` decision.
-- Scheduled execution reports a visible failure when the AI stage is unavailable.
-- Telegram publishing occurs only after Reviewer PASS.
+Publisher 不调用 LLM，只做确定性操作：
 
-The objective is a small, inspectable workflow that demonstrates content automation, context design, and QA—not a large multi-agent architecture.
+1. 接收 Reviewer 已通过的 `telegram_copy`；
+2. 附加原文链接；
+3. 调用 Telegram Bot API 发布。
+
+因此 AI 节点没有权限绕过 Reviewer 直接发布内容。
+
+## 8. 调度与运行
+
+GitHub Actions 每日触发一次主流程：
+
+```text
+GitHub Actions
+      ↓
+Collect RSS candidates
+      ↓
+Run Micro-Graph per article
+      ↓
+Publish only PASS items
+      ↓
+Print run statistics
+```
+
+运行统计包括：
+
+- candidate 数量
+- Researcher SKIP 数量
+- Reviewer PASS 数量
+- REJECT 后返工数量
+- HOLD 数量
+- 最终发布数量
+
+## 9. 技术边界
+
+V2 保持以下边界：
+
+- Python 显式编排，不引入大型 Agent 框架；
+- Gemini API 负责三个 AI 节点；
+- RSS + Jina Reader 负责候选信息获取和正文提取；
+- Telegram Bot API 负责发布；
+- GitHub Actions 负责定时调度；
+- 不使用数据库、向量库、RAG 或持久化 memory。
+
+目标不是展示复杂度，而是展示一个完整、可解释、带质量门的 AI 内容自动化闭环。
