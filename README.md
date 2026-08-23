@@ -1,5 +1,7 @@
 # Daily Chip News
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 > An AI-assisted semiconductor intelligence workflow that turns scattered industry updates into a focused daily brief for semiconductor sales and business-facing roles.
 
 Daily Chip News started from a practical problem: semiconductor sales work requires continuous attention to foundries, chip vendors, memory pricing, supply-chain changes, and B2B hardware trends, but the useful signals are buried in a large amount of low-relevance content.
@@ -77,7 +79,8 @@ The repository has accumulated **230+ scheduled workflow runs** in GitHub Action
 ├── .gitignore
 ├── main.py                    # current V1 pipeline
 ├── requirements.txt
-└── README.md
+├── README.md                  # English
+└── README.zh-CN.md            # Simplified Chinese
 ```
 
 ## Run locally
