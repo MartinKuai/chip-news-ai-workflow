@@ -1,27 +1,37 @@
-name: Daily News Agent
+name: Daily Chip News
 
 on:
   schedule:
-    # UTC 22:55 = 北京时间 06:55
-    - cron: '55 22 * * *'
-  workflow_dispatch: # 允许你手动点击按钮立即测试
+    # UTC 22:55 = Beijing time 06:55
+    - cron: "55 22 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-chip-news
+  cancel-in-progress: false
 
 jobs:
-  run_agent:
+  run-agent:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.11"
+          cache: pip
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run script
+      - name: Run daily intelligence workflow
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
