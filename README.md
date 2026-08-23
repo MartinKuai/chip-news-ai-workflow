@@ -2,200 +2,165 @@
 
 **简体中文** | [English](README.en.md)
 
-> 一个面向半导体销售、解决方案与业务岗位的 AI 行业情报自动化工作流。通过三节点 Micro-Graph，把“信息检索 → 内容生产 → 质量审核 → 自动发布”拆成可检查、可返工的闭环。
+Daily Chip News 是一个面向半导体销售、AI 售前、解决方案和应用落地岗位的 AI 内容生产 Workflow。它解决的不是“让模型随便总结几条 RSS”，而是把分散的行业来源变成有证据、可审核、达到门槛后才发布的中文情报。
 
-Daily Chip News 来自一个真实的信息处理场景：半导体相关岗位需要长期关注晶圆厂、芯片原厂、存储行情、供应链变化与 B2B 硬件趋势，但真正有价值的信息往往分散在多个来源，并混杂着大量低相关内容。
+代码已经升级为 V2 Micro-Graph。仓库历史拥有 **230+ 次 GitHub Actions scheduled runs**；这是整个项目历史的运行记录，不代表这些运行全部由 V2 产生。V2 仍需在配置新的 Gemini Free Tier API key 和模型变量后完成首次在线验证。
 
-项目使用一个刻意保持轻量的三节点工作流：
-
-**Researcher 研究员 → Writer 写手 → Reviewer 审稿人 → Publisher 发布**
-
-其中 Publisher 是确定性发布层，不作为 Agent 节点。
-
-截至 2026 年 8 月，仓库在 GitHub Actions 中累计记录 **230+ 次定时任务运行**，用于持续验证这类 AI 内容自动化流程，而不是一次性的 API Demo。
-
-## 工作流
+## Workflow
 
 ```mermaid
-flowchart LR
-    A[RSS / 行业信息源] --> B[Researcher 研究员]
-    B -->|结构化研究笔记| C[Writer 写手]
-    C -->|草稿| D[Reviewer 审稿人]
-    D -->|PASS| E[Telegram Publisher]
-    D -->|REJECT + 修改要求| C
-    F[GitHub Actions] -. 每日触发 .-> A
+flowchart TD
+    A[RSS / Industry Sources] --> B[Researcher 研究员]
+    B -->|Structured Research Notes| C[Writer 写手]
+    C -->|Draft| D[Reviewer 审稿人]
+    D -->|PASS| E[Deterministic Publisher]
+    D -->|REJECT 且未达上限| C
+    D -->|REJECT 且达到上限| F[HOLD]
+    E --> G[Telegram]
 ```
 
-三个节点职责严格分离：
+V2 使用 LangGraph 的最小 `StateGraph`。严格只有三个 AI Agent 节点：
 
-- **Researcher / 研究员**：抓取正文、判断商业/技术价值，只输出带来源的结构化研究笔记，不写最终稿。
-- **Writer / 写手**：使用全新、干净的上下文，只接收 Editorial Brief、Research Notes 与必要的 Revision Brief，然后生成草稿。
-- **Reviewer / 审稿人**：按照显式 Rubric 检查事实支撑、相关性、清晰度、时效性、重复、语气、长度和格式；不直接改稿。
+- **Researcher / 研究员**：获取候选文章正文、判断相关性、提取证据，只输出结构化 Research Notes。
+- **Writer / 写手**：每次用 fresh context 写作，只看到 Editorial Brief、Research Notes、可选 Revision Brief 和输出结构。
+- **Reviewer / 审稿人**：依据显式 Rubric 做 QA Gate，只给 `PASS` / `REJECT`、评分、问题和精简返工要求，不代替 Writer 改稿。
 
-审稿不通过时，Reviewer 只返回结构化问题与修改要求，再由 Writer 重新生成。返工次数默认最多 2 次；超过上限后内容进入 HOLD，不自动发布。
+Publisher 是确定性基础设施，不是第四个 Agent。只有 Reviewer `PASS` 才会调用 Telegram；`SKIP`、`REJECT`、`HOLD` 和基础设施异常都不会发布。
 
-## 为什么采用三节点 Micro-Graph
+## 为什么这样设计
 
-单次 LLM 调用很容易把“找资料、写内容、检查内容”混在同一个上下文里。这个项目把三个职责拆开，主要解决三个问题：
+单次大 Prompt 容易把抓取、推断、写作和自我审核混在一起。V2 用三项边界保持结果可解释：
 
-1. **证据与成稿隔离**：Researcher 只传结构化笔记，Writer 不接触原始浏览轨迹和冗长网页上下文。
-2. **干净上下文写作**：Writer 每次基于明确 Brief 与研究笔记生成，减少历史上下文污染。
-3. **显式质量门**：任何内容只有在 Reviewer 返回 PASS 后才允许进入 Telegram 发布层。
+1. **Context isolation**：原始网页正文停留在 Researcher；Writer 永远不接收正文、RSS 历史或 Researcher Prompt。
+2. **Structured handoff**：节点之间只传机器可读的 Research Notes、Draft、Review 和 Revision Brief。
+3. **QA gate + bounded revision**：Reviewer 拒绝后只把原 Research Notes 和精简返工要求交回 Writer；默认最多返工 2 次，仍不通过则 `HOLD`。
 
-重点是 **context isolation（上下文隔离）+ structured handoff（结构化交接）+ QA gate（质量门）**，而不是堆叠更多 Agent。
+这让项目体现“识别场景 → 设计工作流 → PoC → QA”，不依赖数据库、Redis、向量库、RAG、MCP、Celery、Supervisor 或额外持久化。
 
-## 节点数据契约
+## 数据契约
 
-### Researcher 输出
+Researcher 的 KEEP 输出示例：
 
 ```json
 {
   "decision": "KEEP",
+  "reason": "与 HBM 供应相关",
   "topic": "HBM supply",
-  "source": "SemiEngineering",
+  "source": "Example Source",
   "url": "https://example.com/article",
   "published_at": "2026-08-24",
   "notes": [
     {
-      "claim": "可由原文直接支持的事实",
-      "evidence": "证据摘要",
-      "why_it_matters": "对半导体业务读者的意义",
-      "confidence": 0.92
+      "claim": "原文可以支持的事实",
+      "evidence": "简短证据摘要",
+      "why_it_matters": "对商业或技术决策的意义",
+      "confidence": 0.9
     }
   ]
 }
 ```
 
-### Writer 输出
+Writer 输出：
 
 ```json
 {
   "headline": "...",
   "summary": "...",
-  "key_facts": ["...", "..."],
+  "key_facts": ["..."],
   "why_it_matters": "...",
   "telegram_copy": "..."
 }
 ```
 
-### Reviewer 输出
+Reviewer 输出：
 
 ```json
 {
   "status": "REJECT",
-  "scores": {
-    "factuality": 9,
-    "relevance": 8,
-    "clarity": 8
-  },
-  "issues": [
-    {
-      "severity": "major",
-      "problem": "某项结论缺少 Research Notes 支撑"
-    }
-  ],
-  "revision_brief": [
-    "删除未经证据支持的结论"
-  ]
+  "scores": {"factuality": 9, "relevance": 8, "clarity": 9},
+  "issues": [{"severity": "major", "problem": "某项结论缺少来源支持"}],
+  "revision_brief": ["删除缺乏研究笔记支持的结论"]
 }
 ```
 
-## 内容来源与关注范围
+Reviewer Rubric 覆盖 factual grounding、source support、unsupported claims、commercial relevance、recency、clarity、duplication、tone、length 和 format。
 
-默认信息源包括：
+## 独立模型路由
 
-- EE Times
-- Semiconductor Engineering
-- ServeTheHome
-- TrendForce
-- Hacker News 高分技术条目
+三个节点从配置层独立读取模型，不共享单一全局型号：
 
-重点关注：
+- `RESEARCHER_MODEL`：优先低成本、高吞吐和结构化抽取能力。
+- `WRITER_MODEL`：更重视中文语言生成质量。
+- `REVIEWER_MODEL`：更重视事实检查、规则遵循和判断稳定性。
 
-- 晶圆厂扩产与制程节点进展
-- 主要芯片厂商新品与财报
-- 存储、HBM 与服务器硬件
-- 供应链涨价、缺货与库存变化
-- CXL、RISC-V 等 B2B 硬件技术趋势
-- AI 基础设施相关半导体信息
+仓库不预设当前一定可用的 Gemini 型号。创建 API key 后，根据该账户实际可用模型填写三个变量；它们可以相同，也可以真正不同。
 
-网页正文通过 Jina Reader 做清洗后进入 Researcher。
+## Secret 边界
 
-## 技术栈
+仓库只保存变量名和安全占位值。真实凭证应放在本地 `.env` / 系统环境变量，或 GitHub Repository Secrets 中。Gemini client 使用 `x-goog-api-key` header，不把 key 放入 URL；错误和日志不会输出 key、Telegram token、含凭证的完整 URL或全部环境变量。
 
-| 环节 | 工具 |
-| --- | --- |
-| 信息采集 | RSS / `feedparser` |
-| 正文提取 | Jina Reader |
-| AI 节点 | Gemini API |
-| Graph 编排 | Python 显式 Micro-Graph |
-| 质量控制 | Reviewer Rubric + bounded rewrite loop |
-| 内容推送 | Telegram Bot API |
-| 定时调度 | GitHub Actions |
-| 运行环境 | Python 3.11 |
+GitHub 配置：
 
-## 仓库结构
-
-```text
-.
-├── .github/
-│   └── workflows/
-│       └── daily_news.yml     # 每日自动运行
-├── docs/
-│   └── architecture.md        # V2 架构、状态与数据契约
-├── .env.example               # 环境变量示例
-├── .gitignore
-├── main.py                    # 三节点 Micro-Graph 主流程
-├── requirements.txt
-├── README.md                  # 简体中文（默认）
-└── README.en.md               # English
-```
+- Repository Secret：`GEMINI_API_KEY`
+- Repository Secrets：`TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`
+- Repository Variables：`RESEARCHER_MODEL`、`WRITER_MODEL`、`REVIEWER_MODEL`
 
 ## 本地运行
 
-安装依赖：
-
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-配置环境变量：
+复制 `.env.example` 为 `.env`，填入本地值：
 
-```bash
-GEMINI_API_KEY=...
-GEMINI_MODEL=gemini-3.5-flash-lite
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHAT_ID=...
+```env
+GEMINI_API_KEY=your_gemini_api_key
+RESEARCHER_MODEL=your_researcher_model
+WRITER_MODEL=your_writer_model
+REVIEWER_MODEL=your_reviewer_model
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+TELEGRAM_CHAT_ID=your_telegram_chat_id
 ARTICLES_PER_FEED=2
 MAX_REVISIONS=2
 ```
 
-运行：
+然后运行：
 
 ```bash
 python main.py
 ```
 
-不要把真实 API Key 或 Telegram 凭证提交到仓库。
+缺少 Secret 或模型变量时，程序会给出不含敏感值的配置错误并以失败状态退出。Gemini 的认证、quota、模型不存在、网络或 JSON 错误也会显式失败，不会伪装成业务 `SKIP`；Telegram 最终发送失败同样使任务失败。
 
-## 自动化执行
+## 测试与仓库结构
 
-GitHub Actions 每天自动触发一次，也支持手动运行。凭证通过 GitHub Actions Secrets 注入。
+本地静态 / mock 验证不需要真实 Gemini key：
 
-运行日志会区分：
+```bash
+python -m compileall .
+python -m unittest discover -s tests
+```
 
-- Researcher 主动 `SKIP`
-- Reviewer `PASS`
-- Reviewer `REJECT` 后返工
-- 达到返工上限后的 `HOLD`
-- Gemini / Jina / Telegram 等基础设施错误
+```text
+.
+├─ src/daily_chip_news/
+│  ├─ config.py
+│  ├─ gemini.py
+│  ├─ schemas.py
+│  ├─ sources.py
+│  ├─ graph.py
+│  ├─ publisher.py
+│  ├─ app.py
+│  └─ nodes/
+│     ├─ researcher.py
+│     ├─ writer.py
+│     └─ reviewer.py
+├─ tests/
+├─ docs/architecture.md
+├─ .github/workflows/daily_news.yml
+├─ .env.example
+├─ main.py
+└─ requirements.txt
+```
 
-因此“内容不值得发布”和“系统运行失败”不会被混为同一种结果。
-
-## 设计原则
-
-这个项目不追求大型多 Agent 架构，也不引入数据库、向量库或复杂编排平台。它只保留完成内容自动化闭环所需的最小结构：
-
-**研究 → 写作 → 审核 → 发布**
-
-更详细的节点职责、状态流转与数据契约见 [`docs/architecture.md`](docs/architecture.md)。
+更详细的状态、路由、上下文和失败语义见 [`docs/architecture.md`](docs/architecture.md)。
