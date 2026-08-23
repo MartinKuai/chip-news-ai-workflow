@@ -135,7 +135,7 @@ Article C → SKIP   → continue
 Article D → PASS   → publish
 ```
 
-Article extraction, structured JSON, schema validation, and an isolated transient request failure affect only the current item. Run-level failures include Gemini authentication, invalid model configuration, sustained service unavailability, Telegram authentication or target configuration errors, and complete RSS collection failure.
+Article extraction, structured JSON, schema validation, and an isolated transient request failure affect only the current item. Sustained Gemini unavailability is inferred only when two consecutive articles fail with network, 429, or 5xx errors during the Researcher node's first Gemini call after bounded retries; transient failures in Writer or Reviewer remain item-scoped and processing continues. Gemini authentication, permission, or model-configuration errors, Telegram authentication or target configuration errors, and complete RSS collection failure remain run-level failures.
 
 Every run ends with one summary:
 

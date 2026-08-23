@@ -135,7 +135,7 @@ Article C → SKIP   → 继续
 Article D → PASS   → 发布
 ```
 
-正文提取、结构化 JSON、schema 校验或单篇瞬态调用失败只影响当前文章。Gemini 认证、模型配置、持续服务不可用、Telegram 认证/目标配置，以及所有 RSS 均不可用属于运行级故障。
+正文提取、结构化 JSON、schema 校验或单篇瞬态调用失败只影响当前文章。只有连续两篇文章在 Researcher 的首次 Gemini 调用阶段，经有限重试仍发生网络、429 或 5xx 失败时，才判定 Gemini 服务级不可用；Writer 和 Reviewer 阶段的瞬态失败按单篇隔离并继续处理。Gemini 认证、权限或模型配置错误、Telegram 认证/目标配置，以及所有 RSS 均不可用，仍属于运行级故障。
 
 每次运行结束时都会输出统一 summary：
 

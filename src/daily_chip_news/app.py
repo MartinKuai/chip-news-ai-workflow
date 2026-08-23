@@ -150,7 +150,7 @@ def run_daily(
     }
     failures: list[FailureRecord] = []
     fatal_failure: GlobalWorkflowError | None = None
-    consecutive_gemini_transient_failures = 0
+    consecutive_researcher_transient_failures = 0
 
     for article in candidates:
         stats["processed"] += 1
@@ -170,21 +170,24 @@ def run_daily(
             stats["failed"] += 1
             _record_failure(failures, article, exc.stage, cause)
 
-            if isinstance(cause, GeminiAPIError) and cause.transient:
-                consecutive_gemini_transient_failures += 1
-            elif (
-                isinstance(cause, (GeminiResponseError, SchemaError))
-                or exc.stage == "publisher"
+            if (
+                isinstance(cause, GeminiAPIError)
+                and cause.transient
+                and exc.stage == "researcher"
             ):
-                # Gemini responded; only this article's output or delivery was bad.
-                consecutive_gemini_transient_failures = 0
+                consecutive_researcher_transient_failures += 1
+            else:
+                # Only Researcher transient failures can contribute to outage
+                # evidence; every other item outcome breaks that sequence.
+                consecutive_researcher_transient_failures = 0
 
             if _is_global_failure(cause):
                 fatal_failure = GlobalWorkflowError(exc.stage, type(cause).__name__)
             elif (
                 isinstance(cause, GeminiAPIError)
                 and cause.transient
-                and consecutive_gemini_transient_failures
+                and exc.stage == "researcher"
+                and consecutive_researcher_transient_failures
                 >= GEMINI_TRANSIENT_FAILURE_THRESHOLD
             ):
                 fatal_failure = GlobalWorkflowError(
@@ -201,7 +204,7 @@ def run_daily(
             break
 
         # Any completed graph proves Gemini was available for this item.
-        consecutive_gemini_transient_failures = 0
+        consecutive_researcher_transient_failures = 0
         status = result["status"]
         stats["revisions"] += int(result.get("revision_count", 0))
         if status == "SKIP":

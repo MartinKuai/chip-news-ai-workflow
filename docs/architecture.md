@@ -177,7 +177,7 @@ Reviewer 的完整输出不直接进入下一次 Writer 调用；仅 `revision_b
 
 ### Article level
 
-图节点异常包装为带安全阶段信息的 `NodeExecutionError`：`researcher`、`writer`、`reviewer` 或 `publisher`。正文提取、JSON 解析、schema 校验和单篇瞬态请求失败计入 `failed`，后续文章继续运行。
+图节点异常包装为带安全阶段信息的 `NodeExecutionError`：`researcher`、`writer`、`reviewer` 或 `publisher`。正文提取、JSON 解析、schema 校验和单篇瞬态请求失败计入 `failed`，后续文章继续运行；Writer 或 Reviewer 阶段的瞬态 Gemini 失败不会累计服务级不可用计数。
 
 ### Run level
 
@@ -185,7 +185,7 @@ Reviewer 的完整输出不直接进入下一次 Writer 调用；仅 `revision_b
 
 - 所有 RSS 来源均不可用。
 - Gemini 认证、权限或模型配置错误。
-- 连续两篇文章在有限重试后仍发生 Gemini 网络、429 或 5xx 错误。
+- 连续两篇文章在 Researcher 首次 Gemini 调用阶段、有限重试后仍发生 Gemini 网络、429 或 5xx 错误。
 - Telegram 认证或目标配置错误。
 - 未分类的程序运行错误。
 
