@@ -13,7 +13,13 @@ from .gemini import GeminiAPIError, GeminiResponseError
 from .graph import NodeExecutionError, create_runtime_graph
 from .publisher import PublisherError
 from .schemas import Article, SchemaError
-from .sources import SourceError, collect_articles
+from .sources import (
+    SourceCollectionError,
+    SourceCollectionResult,
+    SourceError,
+    SourceFailure,
+    collect_articles,
+)
 
 
 GEMINI_TRANSIENT_FAILURE_THRESHOLD = 2
@@ -68,6 +74,7 @@ def _is_global_failure(cause: Exception) -> bool:
 def _print_summary(
     stats: dict[str, int],
     failures: list[FailureRecord],
+    source_failures: list[SourceFailure],
     *,
     workflow_failed: bool,
 ) -> None:
@@ -75,6 +82,10 @@ def _print_summary(
     for name, value in stats.items():
         print(f"  {name}: {value}")
     print(f"  workflow_status: {'FAIL' if workflow_failed else 'PASS'}")
+    if source_failures:
+        print("Failed sources:")
+        for failure in source_failures:
+            print(f"  {failure.source} | error={failure.error}")
     if failures:
         print("Failed items:")
         for failure in failures:
@@ -92,12 +103,43 @@ def run_daily(
 ) -> dict[str, int]:
     """Process every independent item unless a run-wide failure is detected."""
     runtime_graph = graph or create_runtime_graph(settings)
-    candidates = (
-        list(articles)
-        if articles is not None
-        else collect_articles(settings.articles_per_feed)
-    )
+    if articles is not None:
+        collection = SourceCollectionResult(
+            articles=list(articles),
+            sources_total=0,
+            sources_ok=0,
+            sources_failed=0,
+            failures=[],
+        )
+    else:
+        try:
+            collection = collect_articles(settings.articles_per_feed)
+        except SourceCollectionError as exc:
+            stats = {
+                "sources_total": exc.result.sources_total,
+                "sources_ok": exc.result.sources_ok,
+                "sources_failed": exc.result.sources_failed,
+                "candidates": 0,
+                "processed": 0,
+                "published": 0,
+                "skipped": 0,
+                "held": 0,
+                "failed": 0,
+                "revisions": 0,
+            }
+            _print_summary(
+                stats,
+                [],
+                exc.result.failures,
+                workflow_failed=True,
+            )
+            raise GlobalWorkflowError("sources", "SourceCollectionError") from None
+
+    candidates = collection.articles
     stats = {
+        "sources_total": collection.sources_total,
+        "sources_ok": collection.sources_ok,
+        "sources_failed": collection.sources_failed,
         "candidates": len(candidates),
         "processed": 0,
         "published": 0,
@@ -175,7 +217,12 @@ def run_daily(
             fatal_failure = GlobalWorkflowError("graph", type(cause).__name__)
             break
 
-    _print_summary(stats, failures, workflow_failed=fatal_failure is not None)
+    _print_summary(
+        stats,
+        failures,
+        collection.failures,
+        workflow_failed=fatal_failure is not None,
+    )
     if fatal_failure:
         raise fatal_failure from None
     return stats

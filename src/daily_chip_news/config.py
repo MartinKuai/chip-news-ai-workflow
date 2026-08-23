@@ -63,7 +63,7 @@ RSS_FEEDS = (
     "https://www.eetimes.com/feed/",
     "https://semiengineering.com/feed/",
     "https://www.servethehome.com/feed/",
-    "https://www.trendforce.com/rss",
+    "https://www.trendforce.com/feed/Semiconductors.html",
     "https://hnrss.org/newest?points=100",
 )
 

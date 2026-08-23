@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import Any, Callable
 
 import feedparser
 import requests
@@ -16,20 +18,77 @@ class SourceError(RuntimeError):
     """Raised when source infrastructure fails; never converted to SKIP."""
 
 
+@dataclass(frozen=True)
+class SourceFailure:
+    """A bounded, log-safe record for one unavailable RSS source."""
+
+    source: str
+    error: str
+
+
+@dataclass(frozen=True)
+class SourceCollectionResult:
+    """Articles and availability statistics from one RSS collection pass."""
+
+    articles: list[Article]
+    sources_total: int
+    sources_ok: int
+    sources_failed: int
+    failures: list[SourceFailure]
+
+
+class SourceCollectionError(SourceError):
+    """Raised when every configured RSS source is unavailable."""
+
+    def __init__(self, result: SourceCollectionResult) -> None:
+        self.result = result
+        super().__init__("All RSS sources are unavailable")
+
+
+def _safe_source_name(value: object) -> str:
+    """Keep source labels single-line and bounded for run summaries."""
+    return " ".join(str(value).split())[:200]
+
+
 def collect_articles(
     articles_per_feed: int,
     *,
     feeds: Iterable[str] = RSS_FEEDS,
-) -> list[Article]:
-    """Collect a small, URL-deduplicated candidate set from RSS feeds."""
+    parser: Callable[[str], Any] = feedparser.parse,
+) -> SourceCollectionResult:
+    """Collect candidates while isolating failures to individual RSS feeds."""
+    feed_urls = list(feeds)
     articles: list[Article] = []
+    failures: list[SourceFailure] = []
+    sources_ok = 0
     seen_urls: set[str] = set()
-    for feed_url in feeds:
-        feed = feedparser.parse(feed_url)
-        if getattr(feed, "bozo", False) and not getattr(feed, "entries", []):
-            raise SourceError(f"RSS source could not be parsed: {feed_url}")
-        source = str(feed.feed.get("title", feed_url))
-        for entry in feed.entries[:articles_per_feed]:
+    for feed_url in feed_urls:
+        try:
+            feed = parser(feed_url)
+        except Exception as exc:
+            failures.append(
+                SourceFailure(_safe_source_name(feed_url), type(exc).__name__)
+            )
+            continue
+
+        entries = list(getattr(feed, "entries", []) or [])
+        feed_metadata = getattr(feed, "feed", {}) or {}
+        source = _safe_source_name(feed_metadata.get("title") or feed_url)
+        status = getattr(feed, "status", None)
+        http_error = isinstance(status, int) and status >= 400
+        if not entries and (getattr(feed, "bozo", False) or http_error):
+            parse_error = getattr(feed, "bozo_exception", None)
+            if parse_error:
+                error_type = type(parse_error).__name__
+            elif http_error:
+                error_type = "HTTPError"
+            else:
+                error_type = "FeedParseError"
+            failures.append(SourceFailure(source, error_type))
+            continue
+
+        sources_ok += 1
+        for entry in entries[:articles_per_feed]:
             url = str(entry.get("link", "")).strip()
             if not url or url in seen_urls:
                 continue
@@ -44,7 +103,17 @@ def collect_articles(
                     ),
                 }
             )
-    return articles
+
+    result = SourceCollectionResult(
+        articles=articles,
+        sources_total=len(feed_urls),
+        sources_ok=sources_ok,
+        sources_failed=len(failures),
+        failures=failures,
+    )
+    if feed_urls and sources_ok == 0:
+        raise SourceCollectionError(result)
+    return result
 
 
 class ArticleExtractor:

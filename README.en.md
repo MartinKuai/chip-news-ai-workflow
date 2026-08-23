@@ -2,116 +2,81 @@
 
 [简体中文](README.md) | **English**
 
-Daily Chip News is an AI content-production workflow for semiconductor sales, AI presales, solution, and applied-AI roles. It does more than ask a model to summarize RSS items: it turns distributed industry sources into evidence-backed Chinese intelligence that is reviewed before publication.
+Daily Chip News is a daily automation workflow for semiconductor industry intelligence.
 
-The current implementation is a complete three-node AI content-automation Micro-Graph. The repository history contains **230+ scheduled GitHub Actions runs**; that number describes the full project history and does not imply that every run used the current architecture. The workflow has passed static/mock validation and one Live E2E using local environment variables; no real credentials are stored in the repository.
+It collects recent items from several industry RSS feeds, extracts the article text, and sends each candidate through three focused AI nodes:
+
+**Researcher → Writer → Reviewer → Telegram**
+
+The Researcher extracts useful facts and supporting evidence. The Writer turns structured research notes into concise Chinese coverage. The Reviewer checks factual support, relevance, and writing quality against a fixed rubric. Approved content is delivered to Telegram by the Publisher. The repository has accumulated more than 230 scheduled GitHub Actions runs.
 
 ## Workflow
 
 ```mermaid
 flowchart TD
-    A[RSS / Industry Sources] --> B[Researcher]
-    B -->|Structured Research Notes| C[Writer]
-    C -->|Draft| D[Reviewer]
-    D -->|PASS| E[Deterministic Publisher]
-    D -->|REJECT below limit| C
-    D -->|REJECT at limit| F[HOLD]
-    E --> G[Telegram]
+    A[RSS Sources] --> B[Source Collection]
+    B --> C[Researcher]
+    C -->|Structured Research Notes| D[Writer]
+    D -->|Draft| E[Reviewer]
+    E -->|PASS| F[Publisher]
+    E -->|REJECT below limit| D
+    E -->|REJECT at limit| G[HOLD]
+    F --> H[Telegram]
 ```
 
-The workflow uses a minimal LangGraph `StateGraph`. It has exactly three AI agent nodes:
+LangGraph `StateGraph` coordinates the three AI nodes, while the deterministic Publisher handles delivery. A draft may be revised twice by default; another rejection moves the item to `HOLD`.
 
-- **Researcher** retrieves candidate article text, determines relevance, extracts evidence, and emits Structured Research Notes only.
-- **Writer** starts with a fresh context on every call and sees only the Editorial Brief, Research Notes, optional Revision Brief, and output schema.
-- **Reviewer** is a QA gate driven by an explicit rubric. It returns `PASS` / `REJECT`, scores, issues, and a concise revision brief; it never rewrites the article.
+## The three nodes
 
-The Publisher is deterministic infrastructure, not a fourth agent. Telegram is called only after Reviewer `PASS`; `SKIP`, `REJECT`, `HOLD`, and infrastructure failures never publish.
+### Researcher
 
-## Why this design
+The Researcher retrieves the candidate article, evaluates it against the editorial scope, and produces Structured Research Notes. Notes include the topic, source, URL, publication date, and evidence-backed claims with confidence values. Semantically irrelevant items return `SKIP`.
 
-A single large prompt mixes retrieval, inference, writing, and self-review. This project keeps the workflow explainable through three boundaries:
+### Writer
 
-1. **Context isolation**: raw article text stops at the Researcher. The Writer never receives source text, RSS history, or the Researcher prompt.
-2. **Structured handoff**: nodes exchange only machine-readable Research Notes, Draft, Review, and Revision Brief objects.
-3. **QA gate with bounded revision**: a rejection sends only the original Research Notes and concise correction requests back to the Writer. Two revisions are allowed by default; another rejection results in `HOLD`.
+Each Writer call receives only the Editorial Brief, Structured Research Notes, output schema, and an optional Revision Brief. Raw article text stays within the Researcher call, and node handoffs remain structured.
 
-The project demonstrates “identify the scenario → design the workflow → build the PoC → run QA” without a database, Redis, vector store, RAG, MCP, Celery, supervisor agent, or unnecessary persistence.
+The Writer returns a headline, summary, key facts, why-it-matters section, and Telegram copy in concise, factual Chinese.
 
-## Data contracts
+### Reviewer
 
-Example Researcher KEEP output:
+The Reviewer applies a fixed rubric covering factual grounding, source support, unsupported claims, commercial relevance, recency, clarity, duplication, tone, length, and format.
 
-```json
-{
-  "decision": "KEEP",
-  "reason": "Relevant to HBM supply",
-  "topic": "HBM supply",
-  "source": "Example Source",
-  "url": "https://example.com/article",
-  "published_at": "2026-08-24",
-  "notes": [
-    {
-      "claim": "A fact supported by the source",
-      "evidence": "Concise evidence summary",
-      "why_it_matters": "Commercial or technical relevance",
-      "confidence": 0.9
-    }
-  ]
-}
-```
+It returns `PASS` or `REJECT`. Rejections include scores, issues, and a concise Revision Brief for the Writer to apply to the original Research Notes.
 
-Writer output:
+## Sources
 
-```json
-{
-  "headline": "...",
-  "summary": "...",
-  "key_facts": ["..."],
-  "why_it_matters": "...",
-  "telegram_copy": "..."
-}
-```
+The daily candidate set currently comes from five feeds:
 
-Reviewer output:
+- [EE Times](https://www.eetimes.com/feed/)
+- [Semiconductor Engineering](https://semiengineering.com/feed/)
+- [ServeTheHome](https://www.servethehome.com/feed/)
+- [TrendForce Semiconductors](https://www.trendforce.com/feed/Semiconductors.html)
+- [Hacker News RSS](https://hnrss.org/newest?points=100)
 
-```json
-{
-  "status": "REJECT",
-  "scores": {"factuality": 9, "relevance": 8, "clarity": 9},
-  "issues": [{"severity": "major", "problem": "A claim lacks source support"}],
-  "revision_brief": ["Remove the unsupported conclusion"]
-}
-```
+Candidate URLs are deduplicated before Jina Reader extracts the article text. If one RSS source is unavailable, the run records its source and error type and continues with the healthy feeds. Collection becomes a run-level failure only when every configured source is unavailable.
 
-The review rubric covers factual grounding, source support, unsupported claims, commercial relevance, recency, clarity, duplication, tone, length, and format.
+## Model routing
 
-## Independent model routing
+Each AI node has its own model setting:
 
-Each node reads its own model setting instead of sharing one global model:
+- `RESEARCHER_MODEL`: suited to high-throughput extraction and structured output.
+- `WRITER_MODEL`: selected for Chinese writing quality.
+- `REVIEWER_MODEL`: selected for fact checking, instruction following, and stable judgment.
 
-- `RESEARCHER_MODEL`: prioritize low cost, high throughput, extraction, and structured output.
-- `WRITER_MODEL`: prioritize language-generation quality.
-- `REVIEWER_MODEL`: prioritize fact checking, instruction following, and stable judgment.
+Choose model names from those currently available to the Gemini account. The three settings may use the same model or different models.
 
-The repository does not assume that any specific Gemini model is currently available. After creating the API key, choose models that are actually available to that account. The three values may be the same, but the code allows them to be genuinely different.
+## Installation and configuration
 
-## Secret boundary
-
-The repository stores variable names and safe placeholders only. Real credentials belong in a local `.env` / system environment or GitHub Repository Secrets. The Gemini client uses the `x-goog-api-key` header instead of a query string. Errors and logs do not print API keys, Telegram tokens, credential-bearing URLs, or the full environment.
-
-GitHub configuration:
-
-- Repository Secret: `GEMINI_API_KEY`
-- Repository Secrets: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
-- Repository Variables: `RESEARCHER_MODEL`, `WRITER_MODEL`, `REVIEWER_MODEL`
-
-## Run locally
+Python 3.11 is recommended:
 
 ```bash
+python -m venv .venv
+.venv\Scripts\activate
 python -m pip install -r requirements.txt
 ```
 
-Copy `.env.example` to `.env` and provide local values:
+Copy `.env.example` to `.env` and provide local settings:
 
 ```env
 GEMINI_API_KEY=your_gemini_api_key
@@ -124,29 +89,61 @@ ARTICLES_PER_FEED=2
 MAX_REVISIONS=2
 ```
 
-Then run:
+Git ignores `.env`. The Gemini API key is sent in the `x-goog-api-key` header. GitHub Actions reads credentials from Repository Secrets and model names from Repository Variables.
+
+## Run locally
 
 ```bash
 python main.py
 ```
 
-Missing secrets or model variables produce a clear configuration error without exposing values. Gemini authentication, quota, unavailable-model, network, and JSON failures never become business `SKIP` decisions.
+For a smaller local smoke test, override the candidate count only for the current process:
 
-## Batch failure isolation
+```powershell
+$env:ARTICLES_PER_FEED = "1"
+python main.py
+```
 
-The daily run isolates each article. Source extraction, JSON parsing, schema validation, or a single transient API failure marks that item `FAILED` and allows later articles to continue:
+## GitHub Actions
+
+`.github/workflows/daily_news.yml` runs every day at 06:55 Beijing time and also supports manual `workflow_dispatch` runs.
+
+Configure these Repository Secrets:
+
+- `GEMINI_API_KEY`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+
+And these Repository Variables:
+
+- `RESEARCHER_MODEL`
+- `WRITER_MODEL`
+- `REVIEWER_MODEL`
+
+## Failure isolation
+
+Failures are isolated at both source and article level:
 
 ```text
+Source A → OK
+Source B → FAILED → record and continue
+Source C → OK
+
 Article A → PASS   → publish
-Article B → FAILED → record stage/error and continue
-Article C → SKIP   → do not publish; continue
+Article B → FAILED → record and continue
+Article C → SKIP   → continue
 Article D → PASS   → publish
 ```
 
-Only run-wide faults fail the workflow: Gemini authentication/authorization, invalid model configuration, or Gemini network/429/5xx failures that persist across two consecutive items after bounded retries (including sustained quota exhaustion). Telegram authentication or target configuration errors are also global. The runner prints one `Run summary` before both normal completion and global failure:
+Article extraction, structured JSON, schema validation, and an isolated transient request failure affect only the current item. Run-level failures include Gemini authentication, invalid model configuration, sustained service unavailability, Telegram authentication or target configuration errors, and complete RSS collection failure.
+
+Every run ends with one summary:
 
 ```text
 Run summary:
+  sources_total: ...
+  sources_ok: ...
+  sources_failed: ...
   candidates: ...
   processed: ...
   published: ...
@@ -157,27 +154,29 @@ Run summary:
   workflow_status: PASS or FAIL
 ```
 
-Failure records contain only a single-line bounded article title, node stage, and exception type. They never include article bodies, prompts, raw model responses, or credentials.
+Source and article failure records contain only the source URL or name, article title, processing stage, and error type.
 
-## Tests and repository structure
+## Tests
 
-Static and mock validation does not require a real Gemini key:
+Unit tests use fake and mock clients, so they do not require live Gemini or Telegram credentials:
 
 ```bash
 python -m compileall .
 python -m unittest discover -s tests
 ```
 
+## Project structure
+
 ```text
 .
 ├─ src/daily_chip_news/
+│  ├─ app.py
 │  ├─ config.py
 │  ├─ gemini.py
-│  ├─ schemas.py
-│  ├─ sources.py
 │  ├─ graph.py
 │  ├─ publisher.py
-│  ├─ app.py
+│  ├─ schemas.py
+│  ├─ sources.py
 │  └─ nodes/
 │     ├─ researcher.py
 │     ├─ writer.py
@@ -190,4 +189,4 @@ python -m unittest discover -s tests
 └─ requirements.txt
 ```
 
-See [`docs/architecture.md`](docs/architecture.md) for state, routing, context, and failure semantics.
+See [`docs/architecture.md`](docs/architecture.md) for state, data contracts, context boundaries, and failure routing.

@@ -2,116 +2,81 @@
 
 **简体中文** | [English](README.en.md)
 
-Daily Chip News 是一个面向半导体销售、AI 售前、解决方案和应用落地岗位的 AI 内容生产 Workflow。它解决的不是“让模型随便总结几条 RSS”，而是把分散的行业来源变成有证据、可审核、达到门槛后才发布的中文情报。
+Daily Chip News 是一个每日运行的半导体行业情报自动化工作流。
 
-当前实现是一个完整的三节点 AI 内容自动化 Micro-Graph。仓库历史拥有 **230+ 次 GitHub Actions scheduled runs**；这是整个项目的历史运行记录，不代表这些运行全部使用当前架构。当前工作流已完成静态/模拟测试及一次使用本地环境变量的 Live E2E，真实凭据未进入仓库。
+它从多个行业 RSS 获取最新内容，提取正文后交给三个职责独立的 AI 节点处理：
+
+**Researcher → Writer → Reviewer → Telegram**
+
+Researcher 提取有价值的事实与来源，Writer 根据结构化研究笔记生成中文内容，Reviewer 按固定标准检查事实、相关性和表达质量。审核通过后，Publisher 将内容推送至 Telegram。仓库历史已累计 230+ 次 GitHub Actions 定时运行。
 
 ## Workflow
 
 ```mermaid
 flowchart TD
-    A[RSS / Industry Sources] --> B[Researcher 研究员]
-    B -->|Structured Research Notes| C[Writer 写手]
-    C -->|Draft| D[Reviewer 审稿人]
-    D -->|PASS| E[Deterministic Publisher]
-    D -->|REJECT 且未达上限| C
-    D -->|REJECT 且达到上限| F[HOLD]
-    E --> G[Telegram]
+    A[RSS Sources] --> B[Source Collection]
+    B --> C[Researcher 研究员]
+    C -->|Structured Research Notes| D[Writer 写手]
+    D -->|Draft| E[Reviewer 审稿人]
+    E -->|PASS| F[Publisher]
+    E -->|REJECT 且未达上限| D
+    E -->|REJECT 且达到上限| G[HOLD]
+    F --> H[Telegram]
 ```
 
-工作流使用 LangGraph 的最小 `StateGraph`。严格只有三个 AI Agent 节点：
+工作流使用 LangGraph `StateGraph` 编排三个 AI 节点，并由确定性的 Publisher 完成发送。默认最多返工两次，达到上限后进入 `HOLD`。
 
-- **Researcher / 研究员**：获取候选文章正文、判断相关性、提取证据，只输出结构化 Research Notes。
-- **Writer / 写手**：每次用 fresh context 写作，只看到 Editorial Brief、Research Notes、可选 Revision Brief 和输出结构。
-- **Reviewer / 审稿人**：依据显式 Rubric 做 QA Gate，只给 `PASS` / `REJECT`、评分、问题和精简返工要求，不代替 Writer 改稿。
+## 三个节点
 
-Publisher 是确定性基础设施，不是第四个 Agent。只有 Reviewer `PASS` 才会调用 Telegram；`SKIP`、`REJECT`、`HOLD` 和基础设施异常都不会发布。
+### Researcher
 
-## 为什么这样设计
+Researcher 获取候选文章正文，判断内容是否符合编辑范围，并输出结构化 Research Notes。笔记包含主题、来源、链接、发布日期，以及带证据与置信度的事实条目。语义无关的文章返回 `SKIP`。
 
-单次大 Prompt 容易把抓取、推断、写作和自我审核混在一起。本项目用三项边界保持结果可解释：
+### Writer
 
-1. **Context isolation**：原始网页正文停留在 Researcher；Writer 永远不接收正文、RSS 历史或 Researcher Prompt。
-2. **Structured handoff**：节点之间只传机器可读的 Research Notes、Draft、Review 和 Revision Brief。
-3. **QA gate + bounded revision**：Reviewer 拒绝后只把原 Research Notes 和精简返工要求交回 Writer；默认最多返工 2 次，仍不通过则 `HOLD`。
+Writer 每次只接收 Editorial Brief、Structured Research Notes、输出结构，以及返工时的 Revision Brief。原始网页正文停留在 Researcher，节点之间通过结构化对象交接。
 
-这让项目体现“识别场景 → 设计工作流 → PoC → QA”，不依赖数据库、Redis、向量库、RAG、MCP、Celery、Supervisor 或额外持久化。
+Writer 输出标题、摘要、关键事实、关注理由和 Telegram 文案，整体风格保持中文、简洁、克制、事实优先。
 
-## 数据契约
+### Reviewer
 
-Researcher 的 KEEP 输出示例：
+Reviewer 根据固定 Rubric 检查 factual grounding、source support、unsupported claims、commercial relevance、recency、clarity、duplication、tone、length 和 format。
 
-```json
-{
-  "decision": "KEEP",
-  "reason": "与 HBM 供应相关",
-  "topic": "HBM supply",
-  "source": "Example Source",
-  "url": "https://example.com/article",
-  "published_at": "2026-08-24",
-  "notes": [
-    {
-      "claim": "原文可以支持的事实",
-      "evidence": "简短证据摘要",
-      "why_it_matters": "对商业或技术决策的意义",
-      "confidence": 0.9
-    }
-  ]
-}
-```
+审核结果为 `PASS` 或 `REJECT`。拒绝时返回评分、问题清单和精简 Revision Brief，由 Writer 根据原 Research Notes 修改。
 
-Writer 输出：
+## 信息来源
 
-```json
-{
-  "headline": "...",
-  "summary": "...",
-  "key_facts": ["..."],
-  "why_it_matters": "...",
-  "telegram_copy": "..."
-}
-```
+当前每天从五类来源收集候选文章：
 
-Reviewer 输出：
+- [EE Times](https://www.eetimes.com/feed/)
+- [Semiconductor Engineering](https://semiengineering.com/feed/)
+- [ServeTheHome](https://www.servethehome.com/feed/)
+- [TrendForce Semiconductors](https://www.trendforce.com/feed/Semiconductors.html)
+- [Hacker News RSS](https://hnrss.org/newest?points=100)
 
-```json
-{
-  "status": "REJECT",
-  "scores": {"factuality": 9, "relevance": 8, "clarity": 9},
-  "issues": [{"severity": "major", "problem": "某项结论缺少来源支持"}],
-  "revision_brief": ["删除缺乏研究笔记支持的结论"]
-}
-```
+候选链接先按 URL 去重，再通过 Jina Reader 提取正文。单个 RSS 不可用时会记录来源和错误类型，其余健康来源继续产生 candidates；仅在所有来源均不可用时终止本次运行。
 
-Reviewer Rubric 覆盖 factual grounding、source support、unsupported claims、commercial relevance、recency、clarity、duplication、tone、length 和 format。
+## Model Routing
 
-## 独立模型路由
+三个节点分别读取自己的模型配置：
 
-三个节点从配置层独立读取模型，不共享单一全局型号：
+- `RESEARCHER_MODEL`：适合高吞吐、信息抽取和结构化输出。
+- `WRITER_MODEL`：侧重中文生成质量。
+- `REVIEWER_MODEL`：侧重事实检查、规则遵循和判断稳定性。
 
-- `RESEARCHER_MODEL`：优先低成本、高吞吐和结构化抽取能力。
-- `WRITER_MODEL`：更重视中文语言生成质量。
-- `REVIEWER_MODEL`：更重视事实检查、规则遵循和判断稳定性。
+具体型号根据 Gemini 账户当前可用模型配置，三个值可以相同，也可以分别设置。
 
-仓库不预设当前一定可用的 Gemini 型号。创建 API key 后，根据该账户实际可用模型填写三个变量；它们可以相同，也可以真正不同。
+## 安装与配置
 
-## Secret 边界
-
-仓库只保存变量名和安全占位值。真实凭证应放在本地 `.env` / 系统环境变量，或 GitHub Repository Secrets 中。Gemini client 使用 `x-goog-api-key` header，不把 key 放入 URL；错误和日志不会输出 key、Telegram token、含凭证的完整 URL或全部环境变量。
-
-GitHub 配置：
-
-- Repository Secret：`GEMINI_API_KEY`
-- Repository Secrets：`TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`
-- Repository Variables：`RESEARCHER_MODEL`、`WRITER_MODEL`、`REVIEWER_MODEL`
-
-## 本地运行
+建议使用 Python 3.11：
 
 ```bash
+python -m venv .venv
+.venv\Scripts\activate
 python -m pip install -r requirements.txt
 ```
 
-复制 `.env.example` 为 `.env`，填入本地值：
+复制 `.env.example` 为 `.env`，填写本地配置：
 
 ```env
 GEMINI_API_KEY=your_gemini_api_key
@@ -124,29 +89,61 @@ ARTICLES_PER_FEED=2
 MAX_REVISIONS=2
 ```
 
-然后运行：
+`.env` 已由 Git 忽略。Gemini API key 通过 `x-goog-api-key` header 发送；GitHub Actions 中的凭证使用 Repository Secrets，模型名称使用 Repository Variables。
+
+## 本地运行
 
 ```bash
 python main.py
 ```
 
-缺少 Secret 或模型变量时，程序会给出不含敏感值的配置错误并以失败状态退出。Gemini 的认证、quota、模型不存在、网络或 JSON 错误不会伪装成业务 `SKIP`。
+减少本地 smoke test 的候选数量时，可只为当前进程设置：
 
-## 批处理失败隔离
+```powershell
+$env:ARTICLES_PER_FEED = "1"
+python main.py
+```
 
-日报按文章隔离执行。一篇文章的正文抓取、JSON 解析、schema 校验或单次瞬态 API 失败会记录为 `FAILED`，后续文章继续运行：
+## GitHub Actions
+
+`.github/workflows/daily_news.yml` 每天北京时间 06:55 定时运行，也支持 `workflow_dispatch` 手动触发。
+
+需要配置以下 Repository Secrets：
+
+- `GEMINI_API_KEY`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+
+以及 Repository Variables：
+
+- `RESEARCHER_MODEL`
+- `WRITER_MODEL`
+- `REVIEWER_MODEL`
+
+## 错误与失败隔离
+
+来源层和文章层分别隔离失败：
 
 ```text
+Source A → OK
+Source B → FAILED → 记录并继续
+Source C → OK
+
 Article A → PASS   → 发布
-Article B → FAILED → 记录 stage/error，继续
-Article C → SKIP   → 不发布，继续
+Article B → FAILED → 记录并继续
+Article C → SKIP   → 继续
 Article D → PASS   → 发布
 ```
 
-只有运行级故障才让整个 workflow 失败，例如 Gemini 认证/权限失败、模型配置错误，或连续两篇文章在有限重试后仍发生 Gemini 网络/429/5xx 故障（包括持续 quota 不可用）。Telegram 的认证或目标配置错误也属于全局故障。无论正常结束还是全局中止，runner 都先输出统一的 `Run summary`：
+正文提取、结构化 JSON、schema 校验或单篇瞬态调用失败只影响当前文章。Gemini 认证、模型配置、持续服务不可用、Telegram 认证/目标配置，以及所有 RSS 均不可用属于运行级故障。
+
+每次运行结束时都会输出统一 summary：
 
 ```text
 Run summary:
+  sources_total: ...
+  sources_ok: ...
+  sources_failed: ...
   candidates: ...
   processed: ...
   published: ...
@@ -157,27 +154,29 @@ Run summary:
   workflow_status: PASS or FAIL
 ```
 
-失败明细只包含经过单行截断的文章标题、节点阶段和异常类型，不输出正文、Prompt、模型原始响应或任何凭证。
+来源和文章失败记录仅包含来源 URL / 名称、文章标题、处理阶段和错误类型。
 
-## 测试与仓库结构
+## 测试
 
-本地静态 / mock 验证不需要真实 Gemini key：
+单元测试使用 fake/mock client，无需真实 Gemini 或 Telegram 凭证：
 
 ```bash
 python -m compileall .
 python -m unittest discover -s tests
 ```
 
+## 项目结构
+
 ```text
 .
 ├─ src/daily_chip_news/
+│  ├─ app.py
 │  ├─ config.py
 │  ├─ gemini.py
-│  ├─ schemas.py
-│  ├─ sources.py
 │  ├─ graph.py
 │  ├─ publisher.py
-│  ├─ app.py
+│  ├─ schemas.py
+│  ├─ sources.py
 │  └─ nodes/
 │     ├─ researcher.py
 │     ├─ writer.py
@@ -190,4 +189,4 @@ python -m unittest discover -s tests
 └─ requirements.txt
 ```
 
-更详细的状态、路由、上下文和失败语义见 [`docs/architecture.md`](docs/architecture.md)。
+状态、数据契约、上下文边界和失败路由详见 [`docs/architecture.md`](docs/architecture.md)。

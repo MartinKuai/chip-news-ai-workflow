@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import unittest
 from contextlib import redirect_stdout
+from unittest.mock import patch
 
 from _support import ARTICLE, SRC  # noqa: F401
 from daily_chip_news.app import GlobalWorkflowError, run_daily
@@ -10,7 +11,13 @@ from daily_chip_news.config import Settings
 from daily_chip_news.gemini import GeminiAPIError, GeminiResponseError
 from daily_chip_news.graph import NodeExecutionError
 from daily_chip_news.publisher import PublisherError
-from daily_chip_news.sources import SourceError
+from daily_chip_news.schemas import SchemaError
+from daily_chip_news.sources import (
+    SourceCollectionError,
+    SourceCollectionResult,
+    SourceError,
+    SourceFailure,
+)
 
 
 def settings() -> Settings:
@@ -126,6 +133,73 @@ class BatchRunnerTests(unittest.TestCase):
         self.assertEqual(1, result["published"])
         self.assertIn("error=SourceError", output)
         self.assertNotIn("source body unavailable", output)
+
+    def test_article_schema_failure_is_item_scoped(self) -> None:
+        items = [article("Article A"), article("Article B")]
+        graph = ScriptedGraph(
+            [
+                NodeExecutionError(
+                    "reviewer", SchemaError("invalid review payload")
+                ),
+                passed(),
+            ]
+        )
+
+        result, output = self.run_with_output(graph, items)
+
+        self.assertEqual(2, result["processed"])
+        self.assertEqual(1, result["failed"])
+        self.assertEqual(1, result["published"])
+        self.assertIn("error=SchemaError", output)
+        self.assertNotIn("invalid review payload", output)
+
+    def test_partial_source_failure_is_reported_without_failing_run(self) -> None:
+        collection = SourceCollectionResult(
+            articles=[article("Article A")],
+            sources_total=5,
+            sources_ok=4,
+            sources_failed=1,
+            failures=[SourceFailure("https://failed.example/rss", "TimeoutError")],
+        )
+        graph = ScriptedGraph([passed()])
+        output = io.StringIO()
+
+        with patch("daily_chip_news.app.collect_articles", return_value=collection):
+            with redirect_stdout(output):
+                result = run_daily(settings(), graph=graph)
+
+        self.assertEqual(4, result["sources_ok"])
+        self.assertEqual(1, result["sources_failed"])
+        self.assertEqual(1, result["published"])
+        self.assertIn("sources_total: 5", output.getvalue())
+        self.assertIn("workflow_status: PASS", output.getvalue())
+
+    def test_all_source_failures_fail_run_after_summary(self) -> None:
+        collection = SourceCollectionResult(
+            articles=[],
+            sources_total=5,
+            sources_ok=0,
+            sources_failed=5,
+            failures=[
+                SourceFailure(f"https://failed-{index}.example/rss", "ValueError")
+                for index in range(5)
+            ],
+        )
+        graph = ScriptedGraph([])
+        output = io.StringIO()
+
+        with patch(
+            "daily_chip_news.app.collect_articles",
+            side_effect=SourceCollectionError(collection),
+        ):
+            with redirect_stdout(output):
+                with self.assertRaises(GlobalWorkflowError) as context:
+                    run_daily(settings(), graph=graph)
+
+        self.assertEqual("sources", context.exception.stage)
+        self.assertEqual([], graph.calls)
+        self.assertIn("sources_failed: 5", output.getvalue())
+        self.assertIn("workflow_status: FAIL", output.getvalue())
 
     def test_consecutive_transient_gemini_failures_trip_global_circuit(self) -> None:
         items = [
