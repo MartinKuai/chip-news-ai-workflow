@@ -1,8 +1,8 @@
-# Daily Chip News V2 架构
+# Daily Chip News 架构
 
 ## Graph
 
-V2 是一个最小 LangGraph `StateGraph`，不是自建 Graph 框架：
+项目使用最小 LangGraph `StateGraph`，不是自建 Graph 框架：
 
 ```text
 START
@@ -123,11 +123,21 @@ Editorial Brief
 - `SKIP`：Researcher 的业务相关性判断；不发布。
 - `PASS`：Reviewer 通过且 Publisher 成功；已发布。
 - `HOLD`：达到返工上限仍被拒；不发布。
-- 异常：基础设施、配置或 schema 失败；任务失败，不发布。
+- `FAILED`：单篇抓取、解析、schema 或瞬态调用失败；记录后继续下一篇。
+- 全局异常：配置、认证、模型、quota 或持续服务故障；输出 summary 后使任务失败。
 
 ## Failure semantics
 
-429 与 5xx 进行有限重试；Gemini 4xx 认证、权限和模型错误直接失败；网络错误在有限次数后失败；JSON 格式错误使用独立异常。任何这类错误都不会被转换成 `SKIP`。Telegram 最终失败也向上抛出，使 GitHub Actions 明确失败。
+每个图节点的异常都会包装为带安全阶段信息的 `NodeExecutionError`：`researcher`、`writer`、`reviewer` 或 `publisher`。批处理 runner 只记录文章标题、阶段和异常类型，不记录异常正文、Prompt、模型响应或凭证。
+
+错误分为两级：
+
+- **单篇错误**：正文抓取失败、Gemini JSON 解析失败、schema 校验失败、单篇 Telegram 瞬态失败，以及有限重试后的单次 Gemini 网络/5xx 故障。该文章计入 `failed`，后续文章继续。
+- **全局错误**：Gemini 非 429 的 4xx 认证、权限或模型错误；Telegram 认证/目标配置错误；未知编程错误；或连续两篇文章在有限重试后仍发生 Gemini 网络/429/5xx 故障。runner 先输出当前 Run summary，再使 workflow 失败。
+
+一次成功完成的图、一次有效的 Gemini 结构化响应，或已经到达 Publisher 的文章都会重置 Gemini 瞬态故障计数。这样单点失败不会停止日报，同时持续服务中断不会被误报为整批成功。任何基础设施错误仍不会转换成 `SKIP`。
+
+统一 summary 包含 `candidates`、`processed`、`published`、`skipped`、`held`、`failed`、`revisions` 和 `workflow_status`。全局中止时 `processed` 可能小于 `candidates`。
 
 ## Secret boundary
 
@@ -151,4 +161,4 @@ Gemini client 没有全局模型；每个 `request_json` 调用都显式传入 `
 
 ## Deliberate exclusions
 
-V2 不引入数据库、Redis、向量数据库、RAG、MCP、Celery、Docker 编排、多 Agent Supervisor 或不必要的持久化框架。图只保留内容自动化 PoC 和 QA 所需的最小状态与路由。
+项目不引入数据库、Redis、向量数据库、RAG、MCP、Celery、Docker 编排、多 Agent Supervisor 或不必要的持久化框架。图只保留内容自动化 PoC 和 QA 所需的最小状态与路由。

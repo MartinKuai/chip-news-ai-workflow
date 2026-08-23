@@ -11,11 +11,24 @@ import requests
 
 
 class GeminiError(RuntimeError):
-    """Base class for Gemini failures that must stop the workflow."""
+    """Base class for Gemini failures; the batch runner decides their scope."""
 
 
 class GeminiAPIError(GeminiError):
     """Raised for network, authentication, quota, model, or server failures."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        global_failure: bool = False,
+        transient: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.global_failure = global_failure
+        self.transient = transient
 
 
 class GeminiResponseError(GeminiError):
@@ -88,7 +101,9 @@ class GeminiClient:
                 )
             except requests.RequestException as exc:
                 if attempt == self._max_attempts:
-                    raise GeminiAPIError("Gemini network request failed") from exc
+                    raise GeminiAPIError(
+                        "Gemini network request failed", transient=True
+                    ) from exc
                 self._sleep(float(attempt))
                 continue
 
@@ -100,7 +115,15 @@ class GeminiClient:
                 self._sleep(float(attempt * 2))
                 continue
 
-            raise GeminiAPIError(f"Gemini API failed with HTTP {response.status_code}")
+            status_code = response.status_code
+            raise GeminiAPIError(
+                f"Gemini API failed with HTTP {status_code}",
+                status_code=status_code,
+                # Authentication and model/configuration errors apply to the run.
+                global_failure=400 <= status_code < 500 and status_code != 429,
+                # Repeated 429/5xx failures are promoted by the batch circuit breaker.
+                transient=status_code == 429 or 500 <= status_code < 600,
+            )
 
         raise GeminiAPIError("Gemini request ended without a result")
 

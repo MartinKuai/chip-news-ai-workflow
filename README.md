@@ -4,7 +4,7 @@
 
 Daily Chip News 是一个面向半导体销售、AI 售前、解决方案和应用落地岗位的 AI 内容生产 Workflow。它解决的不是“让模型随便总结几条 RSS”，而是把分散的行业来源变成有证据、可审核、达到门槛后才发布的中文情报。
 
-代码已经升级为 V2 Micro-Graph。仓库历史拥有 **230+ 次 GitHub Actions scheduled runs**；这是整个项目历史的运行记录，不代表这些运行全部由 V2 产生。V2 仍需在配置新的 Gemini Free Tier API key 和模型变量后完成首次在线验证。
+当前实现是一个完整的三节点 AI 内容自动化 Micro-Graph。仓库历史拥有 **230+ 次 GitHub Actions scheduled runs**；这是整个项目的历史运行记录，不代表这些运行全部使用当前架构。当前工作流已完成静态/模拟测试及一次使用本地环境变量的 Live E2E，真实凭据未进入仓库。
 
 ## Workflow
 
@@ -19,7 +19,7 @@ flowchart TD
     E --> G[Telegram]
 ```
 
-V2 使用 LangGraph 的最小 `StateGraph`。严格只有三个 AI Agent 节点：
+工作流使用 LangGraph 的最小 `StateGraph`。严格只有三个 AI Agent 节点：
 
 - **Researcher / 研究员**：获取候选文章正文、判断相关性、提取证据，只输出结构化 Research Notes。
 - **Writer / 写手**：每次用 fresh context 写作，只看到 Editorial Brief、Research Notes、可选 Revision Brief 和输出结构。
@@ -29,7 +29,7 @@ Publisher 是确定性基础设施，不是第四个 Agent。只有 Reviewer `PA
 
 ## 为什么这样设计
 
-单次大 Prompt 容易把抓取、推断、写作和自我审核混在一起。V2 用三项边界保持结果可解释：
+单次大 Prompt 容易把抓取、推断、写作和自我审核混在一起。本项目用三项边界保持结果可解释：
 
 1. **Context isolation**：原始网页正文停留在 Researcher；Writer 永远不接收正文、RSS 历史或 Researcher Prompt。
 2. **Structured handoff**：节点之间只传机器可读的 Research Notes、Draft、Review 和 Revision Brief。
@@ -130,7 +130,34 @@ MAX_REVISIONS=2
 python main.py
 ```
 
-缺少 Secret 或模型变量时，程序会给出不含敏感值的配置错误并以失败状态退出。Gemini 的认证、quota、模型不存在、网络或 JSON 错误也会显式失败，不会伪装成业务 `SKIP`；Telegram 最终发送失败同样使任务失败。
+缺少 Secret 或模型变量时，程序会给出不含敏感值的配置错误并以失败状态退出。Gemini 的认证、quota、模型不存在、网络或 JSON 错误不会伪装成业务 `SKIP`。
+
+## 批处理失败隔离
+
+日报按文章隔离执行。一篇文章的正文抓取、JSON 解析、schema 校验或单次瞬态 API 失败会记录为 `FAILED`，后续文章继续运行：
+
+```text
+Article A → PASS   → 发布
+Article B → FAILED → 记录 stage/error，继续
+Article C → SKIP   → 不发布，继续
+Article D → PASS   → 发布
+```
+
+只有运行级故障才让整个 workflow 失败，例如 Gemini 认证/权限失败、模型配置错误，或连续两篇文章在有限重试后仍发生 Gemini 网络/429/5xx 故障（包括持续 quota 不可用）。Telegram 的认证或目标配置错误也属于全局故障。无论正常结束还是全局中止，runner 都先输出统一的 `Run summary`：
+
+```text
+Run summary:
+  candidates: ...
+  processed: ...
+  published: ...
+  skipped: ...
+  held: ...
+  failed: ...
+  revisions: ...
+  workflow_status: PASS or FAIL
+```
+
+失败明细只包含经过单行截断的文章标题、节点阶段和异常类型，不输出正文、Prompt、模型原始响应或任何凭证。
 
 ## 测试与仓库结构
 

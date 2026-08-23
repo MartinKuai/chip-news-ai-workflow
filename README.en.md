@@ -4,7 +4,7 @@
 
 Daily Chip News is an AI content-production workflow for semiconductor sales, AI presales, solution, and applied-AI roles. It does more than ask a model to summarize RSS items: it turns distributed industry sources into evidence-backed Chinese intelligence that is reviewed before publication.
 
-The codebase has been upgraded to the V2 Micro-Graph. The repository history contains **230+ scheduled GitHub Actions runs**; that number describes the full project history and does not imply that every run used V2. V2 still needs its first live validation after a new Gemini Free Tier API key and model variables are configured.
+The current implementation is a complete three-node AI content-automation Micro-Graph. The repository history contains **230+ scheduled GitHub Actions runs**; that number describes the full project history and does not imply that every run used the current architecture. The workflow has passed static/mock validation and one Live E2E using local environment variables; no real credentials are stored in the repository.
 
 ## Workflow
 
@@ -19,7 +19,7 @@ flowchart TD
     E --> G[Telegram]
 ```
 
-V2 uses a minimal LangGraph `StateGraph`. It has exactly three AI agent nodes:
+The workflow uses a minimal LangGraph `StateGraph`. It has exactly three AI agent nodes:
 
 - **Researcher** retrieves candidate article text, determines relevance, extracts evidence, and emits Structured Research Notes only.
 - **Writer** starts with a fresh context on every call and sees only the Editorial Brief, Research Notes, optional Revision Brief, and output schema.
@@ -29,7 +29,7 @@ The Publisher is deterministic infrastructure, not a fourth agent. Telegram is c
 
 ## Why this design
 
-A single large prompt mixes retrieval, inference, writing, and self-review. V2 keeps the workflow explainable through three boundaries:
+A single large prompt mixes retrieval, inference, writing, and self-review. This project keeps the workflow explainable through three boundaries:
 
 1. **Context isolation**: raw article text stops at the Researcher. The Writer never receives source text, RSS history, or the Researcher prompt.
 2. **Structured handoff**: nodes exchange only machine-readable Research Notes, Draft, Review, and Revision Brief objects.
@@ -130,7 +130,34 @@ Then run:
 python main.py
 ```
 
-Missing secrets or model variables produce a clear configuration error without exposing values. Gemini authentication, quota, unavailable-model, network, and JSON failures propagate instead of becoming business `SKIP` decisions. A final Telegram delivery failure also fails the task.
+Missing secrets or model variables produce a clear configuration error without exposing values. Gemini authentication, quota, unavailable-model, network, and JSON failures never become business `SKIP` decisions.
+
+## Batch failure isolation
+
+The daily run isolates each article. Source extraction, JSON parsing, schema validation, or a single transient API failure marks that item `FAILED` and allows later articles to continue:
+
+```text
+Article A → PASS   → publish
+Article B → FAILED → record stage/error and continue
+Article C → SKIP   → do not publish; continue
+Article D → PASS   → publish
+```
+
+Only run-wide faults fail the workflow: Gemini authentication/authorization, invalid model configuration, or Gemini network/429/5xx failures that persist across two consecutive items after bounded retries (including sustained quota exhaustion). Telegram authentication or target configuration errors are also global. The runner prints one `Run summary` before both normal completion and global failure:
+
+```text
+Run summary:
+  candidates: ...
+  processed: ...
+  published: ...
+  skipped: ...
+  held: ...
+  failed: ...
+  revisions: ...
+  workflow_status: PASS or FAIL
+```
+
+Failure records contain only a single-line bounded article title, node stage, and exception type. They never include article bodies, prompts, raw model responses, or credentials.
 
 ## Tests and repository structure
 

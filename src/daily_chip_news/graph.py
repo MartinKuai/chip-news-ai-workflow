@@ -18,6 +18,15 @@ from .sources import ArticleExtractor
 GraphNode = Callable[[GraphState], dict[str, Any]]
 
 
+class NodeExecutionError(RuntimeError):
+    """Attach a safe graph stage to an underlying node failure."""
+
+    def __init__(self, stage: str, cause: Exception) -> None:
+        self.stage = stage
+        self.cause = cause
+        super().__init__(f"{stage} failed with {type(cause).__name__}")
+
+
 def build_editorial_graph(
     *,
     researcher: GraphNode,
@@ -31,57 +40,80 @@ def build_editorial_graph(
         raise ValueError("max_revisions cannot be negative")
 
     def research_node(state: GraphState) -> dict[str, Any]:
-        update = researcher(state)
-        notes = update.get("research_notes")
-        if not isinstance(notes, dict):
-            raise SchemaError("Researcher node did not return research_notes")
-        decision = str(notes.get("decision", "")).upper()
-        if decision not in {"KEEP", "SKIP"}:
-            raise SchemaError("Researcher decision must be KEEP or SKIP")
-        return {**update, "status": "SKIP" if decision == "SKIP" else "RESEARCHED"}
+        try:
+            update = researcher(state)
+            notes = update.get("research_notes")
+            if not isinstance(notes, dict):
+                raise SchemaError("Researcher node did not return research_notes")
+            decision = str(notes.get("decision", "")).upper()
+            if decision not in {"KEEP", "SKIP"}:
+                raise SchemaError("Researcher decision must be KEEP or SKIP")
+            return {
+                **update,
+                "status": "SKIP" if decision == "SKIP" else "RESEARCHED",
+            }
+        except NodeExecutionError:
+            raise
+        except Exception as exc:
+            raise NodeExecutionError("researcher", exc) from exc
 
     def writer_node(state: GraphState) -> dict[str, Any]:
-        update = writer(state)
-        if not isinstance(update.get("draft"), dict):
-            raise SchemaError("Writer node did not return a draft")
-        return {**update, "status": "DRAFTED"}
+        try:
+            update = writer(state)
+            if not isinstance(update.get("draft"), dict):
+                raise SchemaError("Writer node did not return a draft")
+            return {**update, "status": "DRAFTED"}
+        except NodeExecutionError:
+            raise
+        except Exception as exc:
+            raise NodeExecutionError("writer", exc) from exc
 
     def review_node(state: GraphState) -> dict[str, Any]:
-        update = reviewer(state)
-        review = update.get("review")
-        if not isinstance(review, dict):
-            raise SchemaError("Reviewer node did not return a review")
-        decision = str(review.get("status", "")).upper()
-        if decision == "PASS":
-            return {
-                **update,
-                "status": "PASS",
-                "revision_brief": [],
-            }
-        if decision != "REJECT":
-            raise SchemaError("Reviewer status must be PASS or REJECT")
+        try:
+            update = reviewer(state)
+            review = update.get("review")
+            if not isinstance(review, dict):
+                raise SchemaError("Reviewer node did not return a review")
+            decision = str(review.get("status", "")).upper()
+            if decision == "PASS":
+                return {
+                    **update,
+                    "status": "PASS",
+                    "revision_brief": [],
+                }
+            if decision != "REJECT":
+                raise SchemaError("Reviewer status must be PASS or REJECT")
 
-        brief = review.get("revision_brief", [])
-        if not isinstance(brief, list) or not brief:
-            raise SchemaError("Reviewer REJECT requires revision_brief")
-        revision_count = int(state.get("revision_count", 0))
-        if revision_count >= max_revisions:
+            brief = review.get("revision_brief", [])
+            if not isinstance(brief, list) or not brief:
+                raise SchemaError("Reviewer REJECT requires revision_brief")
+            revision_count = int(state.get("revision_count", 0))
+            if revision_count >= max_revisions:
+                return {
+                    **update,
+                    "status": "HOLD",
+                    "revision_brief": list(brief),
+                    "revision_count": revision_count,
+                }
             return {
                 **update,
-                "status": "HOLD",
+                "status": "REJECT",
                 "revision_brief": list(brief),
-                "revision_count": revision_count,
+                "revision_count": revision_count + 1,
             }
-        return {
-            **update,
-            "status": "REJECT",
-            "revision_brief": list(brief),
-            "revision_count": revision_count + 1,
-        }
+        except NodeExecutionError:
+            raise
+        except Exception as exc:
+            raise NodeExecutionError("reviewer", exc) from exc
 
     def publish_node(state: GraphState) -> dict[str, Any]:
-        update = publisher(state)
-        return {**update, "published": True, "status": "PASS"}
+        try:
+            update = publisher(state)
+            return {**update, "published": True, "status": "PASS"}
+        except NodeExecutionError:
+            raise
+        except Exception as exc:
+            raise NodeExecutionError("publisher", exc) from exc
 
     def after_researcher(state: GraphState) -> Literal["writer", "end"]:
         return "end" if state["status"] == "SKIP" else "writer"

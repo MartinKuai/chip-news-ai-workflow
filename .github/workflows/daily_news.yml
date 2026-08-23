@@ -1,4 +1,4 @@
-name: Daily Chip News V2
+name: Daily Chip News
 
 on:
   schedule:
@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: daily-chip-news-v2
+  group: chip-news-ai-workflow
   cancel-in-progress: false
 
 jobs:

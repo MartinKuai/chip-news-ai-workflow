@@ -44,11 +44,34 @@ class GeminiClientTests(unittest.TestCase):
 
     def test_authentication_error_is_not_retried(self) -> None:
         session = FakeSession(FakeResponse(401, {}))
-        with self.assertRaisesRegex(GeminiAPIError, "HTTP 401"):
+        with self.assertRaisesRegex(GeminiAPIError, "HTTP 401") as context:
             GeminiClient("secret", session=session, max_attempts=3).request_json(
                 model="model-a", system_instruction="role", payload={}
             )
         self.assertEqual(1, len(session.calls))
+        self.assertTrue(context.exception.global_failure)
+        self.assertFalse(context.exception.transient)
+
+    def test_server_error_is_transient_after_bounded_retries(self) -> None:
+        session = FakeSession(
+            FakeResponse(503, {}), FakeResponse(503, {}), FakeResponse(503, {})
+        )
+        with self.assertRaises(GeminiAPIError) as context:
+            GeminiClient(
+                "secret", session=session, max_attempts=3, sleep=lambda seconds: None
+            ).request_json(model="model-a", system_instruction="role", payload={})
+        self.assertEqual(3, len(session.calls))
+        self.assertFalse(context.exception.global_failure)
+        self.assertTrue(context.exception.transient)
+
+    def test_rate_limit_is_transient_until_batch_circuit_opens(self) -> None:
+        session = FakeSession(FakeResponse(429, {}))
+        with self.assertRaises(GeminiAPIError) as context:
+            GeminiClient("secret", session=session, max_attempts=1).request_json(
+                model="model-a", system_instruction="role", payload={}
+            )
+        self.assertFalse(context.exception.global_failure)
+        self.assertTrue(context.exception.transient)
 
     def test_invalid_json_is_explicit(self) -> None:
         session = FakeSession(

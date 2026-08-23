@@ -12,6 +12,19 @@ from .schemas import GraphState
 class PublisherError(RuntimeError):
     """Raised when an approved item cannot be delivered."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        global_failure: bool = False,
+        transient: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.global_failure = global_failure
+        self.transient = transient
+
 
 class TelegramPublisher:
     def __init__(
@@ -46,8 +59,12 @@ class TelegramPublisher:
             if response.status_code == 200:
                 return
 
+        status_code = response.status_code
         raise PublisherError(
-            f"Telegram delivery failed with HTTP {response.status_code}"
+            f"Telegram delivery failed with HTTP {status_code}",
+            status_code=status_code,
+            global_failure=status_code in {400, 401, 403, 404},
+            transient=status_code == 429 or status_code >= 500,
         )
 
     def _post(self, payload: dict[str, Any]) -> requests.Response:
@@ -57,7 +74,9 @@ class TelegramPublisher:
             )
         except requests.RequestException:
             # Do not include the exception because request URLs contain the bot token.
-            raise PublisherError("Telegram network request failed") from None
+            raise PublisherError(
+                "Telegram network request failed", transient=True
+            ) from None
 
 
 class PublisherNode:
@@ -69,7 +88,10 @@ class PublisherNode:
     def __call__(self, state: GraphState) -> dict[str, Any]:
         review = state.get("review", {})
         if review.get("status") != "PASS" or state.get("status") != "PASS":
-            raise PublisherError("Publisher received an item without Reviewer PASS")
+            raise PublisherError(
+                "Publisher received an item without Reviewer PASS",
+                global_failure=True,
+            )
         draft = state["draft"]
         article = state["article"]
         self._publisher.publish(draft["telegram_copy"], article["url"])

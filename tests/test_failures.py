@@ -4,7 +4,7 @@ import unittest
 
 from _support import ARTICLE, DRAFT, RESEARCH, SRC, review  # noqa: F401
 from daily_chip_news.gemini import GeminiAPIError
-from daily_chip_news.graph import build_editorial_graph
+from daily_chip_news.graph import NodeExecutionError, build_editorial_graph
 from daily_chip_news.publisher import PublisherError
 
 
@@ -30,8 +30,10 @@ class FailureTests(unittest.TestCase):
             publisher=lambda state: {"published": True},
             max_revisions=2,
         )
-        with self.assertRaises(GeminiAPIError):
+        with self.assertRaises(NodeExecutionError) as context:
             graph.invoke(initial_state())
+        self.assertEqual("researcher", context.exception.stage)
+        self.assertIsInstance(context.exception.cause, GeminiAPIError)
 
     def test_publisher_failure_fails_the_graph(self) -> None:
         def publisher(state):
@@ -44,8 +46,10 @@ class FailureTests(unittest.TestCase):
             publisher=publisher,
             max_revisions=2,
         )
-        with self.assertRaises(PublisherError):
+        with self.assertRaises(NodeExecutionError) as context:
             graph.invoke(initial_state())
+        self.assertEqual("publisher", context.exception.stage)
+        self.assertIsInstance(context.exception.cause, PublisherError)
 
 
 if __name__ == "__main__":

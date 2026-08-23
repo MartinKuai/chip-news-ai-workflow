@@ -1,4 +1,4 @@
-"""Command-line entry point for Daily Chip News V2."""
+"""Command-line entry point for Daily Chip News."""
 
 from __future__ import annotations
 
