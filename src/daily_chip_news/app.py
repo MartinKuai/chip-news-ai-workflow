@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any, TypedDict
 
 from dotenv import load_dotenv
@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from .config import ConfigError, Settings
 from .gemini import GeminiAPIError, GeminiResponseError
 from .graph import NodeExecutionError, create_runtime_graph
-from .publisher import PublisherError
+from .publisher import PublisherError, TelegramPublisher
 from .schemas import Article, SchemaError
 from .sources import (
     SourceCollectionError,
@@ -23,26 +23,46 @@ from .sources import (
 
 
 GEMINI_TRANSIENT_FAILURE_THRESHOLD = 2
+AI_STAGES = frozenset({"researcher", "writer", "reviewer"})
 
 
 class GlobalWorkflowError(RuntimeError):
     """A configuration or service failure that invalidates the whole run."""
 
-    def __init__(self, stage: str, error_type: str) -> None:
+    def __init__(
+        self,
+        stage: str,
+        error_type: str,
+        *,
+        status_code: int | None = None,
+    ) -> None:
         self.stage = stage
         self.error_type = error_type
-        super().__init__(f"Global workflow failure at {stage}: {error_type}")
+        self.status_code = status_code
+        status_suffix = f" (HTTP {status_code})" if status_code is not None else ""
+        super().__init__(
+            f"Global workflow failure at {stage}: {error_type}{status_suffix}"
+        )
 
 
 class FailureRecord(TypedDict):
     article: str
     stage: str
     error: str
+    status_code: int | None
 
 
 def _safe_title(article: Article) -> str:
     """Keep summary output single-line and bounded without logging article bodies."""
     return " ".join(article.get("title", "Untitled article").split())[:160]
+
+
+def _safe_status_code(cause: Exception) -> int | None:
+    """Return only a bounded HTTP status code; never expose provider messages."""
+    status_code = getattr(cause, "status_code", None)
+    if isinstance(status_code, int) and 100 <= status_code <= 599:
+        return status_code
+    return None
 
 
 def _record_failure(
@@ -56,6 +76,7 @@ def _record_failure(
             "article": _safe_title(article),
             "stage": stage,
             "error": type(cause).__name__,
+            "status_code": _safe_status_code(cause),
         }
     )
 
@@ -89,10 +110,61 @@ def _print_summary(
     if failures:
         print("Failed items:")
         for failure in failures:
+            status_suffix = (
+                f" | status_code={failure['status_code']}"
+                if failure["status_code"] is not None
+                else ""
+            )
             print(
                 f"  {failure['article']} | stage={failure['stage']} "
-                f"| error={failure['error']}"
+                f"| error={failure['error']}{status_suffix}"
             )
+
+
+def _latest_status_code(failures: list[FailureRecord]) -> int | None:
+    for failure in reversed(failures):
+        if failure["status_code"] is not None:
+            return failure["status_code"]
+    return None
+
+
+def _send_ops_alert(
+    alert_publisher: Callable[[str], None] | None,
+    stats: dict[str, int],
+    failure: GlobalWorkflowError,
+    failures: list[FailureRecord],
+) -> None:
+    """Best-effort deterministic alert delivery; this path never calls Gemini."""
+    if alert_publisher is None:
+        return
+
+    status_code = failure.status_code or _latest_status_code(failures)
+    lines = [
+        "⚠️ Daily Chip News 运行失败",
+        f"Stage: {failure.stage}",
+        f"Error: {failure.error_type}",
+        f"Published: {stats['published']}/{stats['candidates']}",
+        f"Processed: {stats['processed']}/{stats['candidates']}",
+        f"Failed: {stats['failed']}",
+    ]
+    if failure.stage == "summary" and failures:
+        lines.append(f"Last item stage: {failures[-1]['stage']}")
+    if status_code is not None:
+        lines.append(f"HTTP status: {status_code}")
+
+    try:
+        alert_publisher("\n".join(lines))
+    except Exception as exc:
+        # A failed alert must not hide the original workflow failure. Log only
+        # the safe exception type and optional HTTP status.
+        alert_status = _safe_status_code(exc)
+        status_suffix = (
+            f" | status_code={alert_status}" if alert_status is not None else ""
+        )
+        print(
+            f"Operations alert failed | error={type(exc).__name__}{status_suffix}",
+            file=sys.stderr,
+        )
 
 
 def run_daily(
@@ -100,6 +172,7 @@ def run_daily(
     *,
     graph: Any | None = None,
     articles: Iterable[Article] | None = None,
+    alert_publisher: Callable[[str], None] | None = None,
 ) -> dict[str, int]:
     """Process every independent item unless a run-wide failure is detected."""
     runtime_graph = graph or create_runtime_graph(settings)
@@ -133,7 +206,9 @@ def run_daily(
                 exc.result.failures,
                 workflow_failed=True,
             )
-            raise GlobalWorkflowError("sources", "SourceCollectionError") from None
+            fatal_failure = GlobalWorkflowError("sources", "SourceCollectionError")
+            _send_ops_alert(alert_publisher, stats, fatal_failure, [])
+            raise fatal_failure from None
 
     candidates = collection.articles
     stats = {
@@ -150,7 +225,7 @@ def run_daily(
     }
     failures: list[FailureRecord] = []
     fatal_failure: GlobalWorkflowError | None = None
-    consecutive_researcher_transient_failures = 0
+    consecutive_gemini_transient_failures = 0
 
     for article in candidates:
         stats["processed"] += 1
@@ -170,28 +245,33 @@ def run_daily(
             stats["failed"] += 1
             _record_failure(failures, article, exc.stage, cause)
 
-            if (
+            is_ai_transient_failure = (
                 isinstance(cause, GeminiAPIError)
                 and cause.transient
-                and exc.stage == "researcher"
-            ):
-                consecutive_researcher_transient_failures += 1
+                and exc.stage in AI_STAGES
+            )
+            if is_ai_transient_failure:
+                consecutive_gemini_transient_failures += 1
             else:
-                # Only Researcher transient failures can contribute to outage
-                # evidence; every other item outcome breaks that sequence.
-                consecutive_researcher_transient_failures = 0
+                # Only transient Gemini failures in the three AI stages count;
+                # every other item outcome breaks the consecutive sequence.
+                consecutive_gemini_transient_failures = 0
 
             if _is_global_failure(cause):
-                fatal_failure = GlobalWorkflowError(exc.stage, type(cause).__name__)
+                fatal_failure = GlobalWorkflowError(
+                    exc.stage,
+                    type(cause).__name__,
+                    status_code=_safe_status_code(cause),
+                )
             elif (
-                isinstance(cause, GeminiAPIError)
-                and cause.transient
-                and exc.stage == "researcher"
-                and consecutive_researcher_transient_failures
+                is_ai_transient_failure
+                and consecutive_gemini_transient_failures
                 >= GEMINI_TRANSIENT_FAILURE_THRESHOLD
             ):
                 fatal_failure = GlobalWorkflowError(
-                    exc.stage, "GeminiServiceUnavailable"
+                    exc.stage,
+                    "GeminiServiceUnavailable",
+                    status_code=_safe_status_code(cause),
                 )
 
             if fatal_failure:
@@ -204,7 +284,7 @@ def run_daily(
             break
 
         # Any completed graph proves Gemini was available for this item.
-        consecutive_researcher_transient_failures = 0
+        consecutive_gemini_transient_failures = 0
         status = result["status"]
         stats["revisions"] += int(result.get("revision_count", 0))
         if status == "SKIP":
@@ -220,6 +300,13 @@ def run_daily(
             fatal_failure = GlobalWorkflowError("graph", type(cause).__name__)
             break
 
+    if fatal_failure is None and stats["published"] == 0 and stats["failed"] > 0:
+        fatal_failure = GlobalWorkflowError(
+            "summary",
+            "NoArticlesPublished",
+            status_code=_latest_status_code(failures),
+        )
+
     _print_summary(
         stats,
         failures,
@@ -227,6 +314,7 @@ def run_daily(
         workflow_failed=fatal_failure is not None,
     )
     if fatal_failure:
+        _send_ops_alert(alert_publisher, stats, fatal_failure, failures)
         raise fatal_failure from None
     return stats
 
@@ -240,7 +328,11 @@ def main() -> None:
         raise SystemExit(2) from exc
     print("Daily Chip News run started")
     try:
-        run_daily(settings)
+        alert_publisher = TelegramPublisher(
+            settings.telegram_bot_token,
+            settings.telegram_chat_id,
+        ).publish_alert
+        run_daily(settings, alert_publisher=alert_publisher)
     except GlobalWorkflowError as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(1) from None

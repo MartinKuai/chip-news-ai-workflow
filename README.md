@@ -106,7 +106,7 @@ python main.py
 
 ## GitHub Actions
 
-`.github/workflows/daily_news.yml` 每天北京时间 06:55 定时运行，也支持 `workflow_dispatch` 手动触发。
+`.github/workflows/daily_news.yml` 的目标时间是每天北京时间（`Asia/Shanghai`，UTC+08:00）06:55；GitHub cron 使用 `55 22 * * *`（UTC 22:55），也支持 `workflow_dispatch` 手动触发。GitHub 对 scheduled workflow 的启动时间不提供准点保证。
 
 需要配置以下 Repository Secrets：
 
@@ -135,7 +135,7 @@ Article C → SKIP   → 继续
 Article D → PASS   → 发布
 ```
 
-正文提取、结构化 JSON、schema 校验或单篇瞬态调用失败只影响当前文章。只有连续两篇文章在 Researcher 的首次 Gemini 调用阶段，经有限重试仍发生网络、429 或 5xx 失败时，才判定 Gemini 服务级不可用；Writer 和 Reviewer 阶段的瞬态失败按单篇隔离并继续处理。Gemini 认证、权限或模型配置错误、Telegram 认证/目标配置，以及所有 RSS 均不可用，仍属于运行级故障。
+正文提取、结构化 JSON、schema 校验或单篇瞬态调用失败只影响当前文章。Researcher、Writer、Reviewer 任一节点连续两篇文章在有限重试后仍发生 Gemini 网络、429 或 5xx 失败时，判定 Gemini 服务级不可用并终止本次 run；三类 AI 节点之间的连续失败也会计数，成功完成的文章或非 AI 节点失败会打断计数。Gemini 认证、权限或模型配置错误、Telegram 认证/目标配置，以及所有 RSS 均不可用，仍属于运行级故障。若 `published == 0 && failed > 0`，即使没有触发其他全局错误，也会将 workflow 标记为失败。每种运行级失败都会尝试通过确定性的 Telegram Publisher 发送运维告警，不经过 Gemini。
 
 每次运行结束时都会输出统一 summary：
 
@@ -154,7 +154,7 @@ Run summary:
   workflow_status: PASS or FAIL
 ```
 
-来源和文章失败记录仅包含来源 URL / 名称、文章标题、处理阶段和错误类型。
+来源和文章失败记录仅包含来源 URL / 名称、文章标题、处理阶段、错误类型，以及可用时的安全 HTTP status code；不会输出 provider 原始错误消息。
 
 ## 测试
 

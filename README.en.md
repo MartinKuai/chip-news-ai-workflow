@@ -106,7 +106,7 @@ python main.py
 
 ## GitHub Actions
 
-`.github/workflows/daily_news.yml` runs every day at 06:55 Beijing time and also supports manual `workflow_dispatch` runs.
+`.github/workflows/daily_news.yml` targets 06:55 every day in `Asia/Shanghai` (UTC+08:00), represented as `55 22 * * *` in GitHub's UTC cron, and also supports manual `workflow_dispatch` runs. GitHub does not guarantee an exact start time for scheduled workflows.
 
 Configure these Repository Secrets:
 
@@ -135,7 +135,7 @@ Article C → SKIP   → continue
 Article D → PASS   → publish
 ```
 
-Article extraction, structured JSON, schema validation, and an isolated transient request failure affect only the current item. Sustained Gemini unavailability is inferred only when two consecutive articles fail with network, 429, or 5xx errors during the Researcher node's first Gemini call after bounded retries; transient failures in Writer or Reviewer remain item-scoped and processing continues. Gemini authentication, permission, or model-configuration errors, Telegram authentication or target configuration errors, and complete RSS collection failure remain run-level failures.
+Article extraction, structured JSON, schema validation, and an isolated transient request failure affect only the current item. Sustained Gemini unavailability is inferred when any two consecutive articles fail with network, 429, or 5xx errors in the Researcher, Writer, or Reviewer node after bounded retries; the count spans those three AI stages and resets after a successful article or a non-AI failure. Gemini authentication, permission, or model-configuration errors, Telegram authentication or target configuration errors, complete RSS collection failure, and a run with `published == 0 && failed > 0` remain run-level failures. Each run-level failure makes a best-effort operational alert through the deterministic Telegram Publisher without calling Gemini.
 
 Every run ends with one summary:
 
@@ -154,7 +154,7 @@ Run summary:
   workflow_status: PASS or FAIL
 ```
 
-Source and article failure records contain only the source URL or name, article title, processing stage, and error type.
+Source and article failure records contain only the source URL or name, article title, processing stage, error type, and (when available) a safe HTTP status code; provider error messages are not printed.
 
 ## Tests
 

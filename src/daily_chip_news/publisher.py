@@ -41,7 +41,13 @@ class TelegramPublisher:
         self._session = session or requests.Session()
 
     def publish(self, message: str, source_url: str) -> None:
-        final_text = f"{message}\n\n原文：{source_url}"
+        self._deliver(f"{message}\n\n原文：{source_url}")
+
+    def publish_alert(self, message: str) -> None:
+        """Send an operational alert without a Gemini call or source URL."""
+        self._deliver(message)
+
+    def _deliver(self, final_text: str) -> None:
         markdown_payload = {
             "chat_id": self._chat_id,
             "text": final_text,
