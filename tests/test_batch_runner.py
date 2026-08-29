@@ -59,10 +59,15 @@ class ScriptedGraph:
 
 
 class BatchRunnerTests(unittest.TestCase):
-    def run_with_output(self, graph, articles):
+    def run_with_output(self, graph, articles, alert_publisher=None):
         output = io.StringIO()
         with redirect_stdout(output):
-            result = run_daily(settings(), graph=graph, articles=articles)
+            result = run_daily(
+                settings(),
+                graph=graph,
+                articles=articles,
+                alert_publisher=alert_publisher,
+            )
         return result, output.getvalue()
 
     def test_item_failure_does_not_stop_remaining_articles(self) -> None:
@@ -104,7 +109,8 @@ class BatchRunnerTests(unittest.TestCase):
         graph = ScriptedGraph(
             [
                 NodeExecutionError(
-                    "researcher", GeminiAPIError("HTTP 503", transient=True)
+                    "researcher",
+                    GeminiAPIError("provider response is private", status_code=503, transient=True),
                 ),
                 passed(),
                 {"status": "SKIP", "published": False, "revision_count": 0},
@@ -116,6 +122,8 @@ class BatchRunnerTests(unittest.TestCase):
         self.assertEqual(1, result["published"])
         self.assertEqual(1, result["skipped"])
         self.assertIn("workflow_status: PASS", output)
+        self.assertIn("status_code=503", output)
+        self.assertNotIn("provider response is private", output)
 
     def test_article_extraction_failure_is_item_scoped(self) -> None:
         items = [article("Article A"), article("Article B")]
@@ -223,21 +231,42 @@ class BatchRunnerTests(unittest.TestCase):
         self.assertIn("processed: 2", output.getvalue())
         self.assertIn("workflow_status: FAIL", output.getvalue())
 
-    def test_consecutive_reviewer_transient_failures_are_item_scoped(self) -> None:
+    def test_consecutive_gemini_transient_failures_across_ai_stages_trip_circuit(
+        self,
+    ) -> None:
         items = [article("Article A"), article("Article B"), article("Article C")]
-        reviewer_failure = NodeExecutionError(
-            "reviewer", GeminiAPIError("HTTP 503", transient=True)
+        graph = ScriptedGraph(
+            [
+                NodeExecutionError(
+                    "writer", GeminiAPIError("HTTP 503", status_code=503, transient=True)
+                ),
+                NodeExecutionError(
+                    "reviewer", GeminiAPIError("HTTP 429", status_code=429, transient=True)
+                ),
+                passed(),
+            ]
         )
-        graph = ScriptedGraph([reviewer_failure, reviewer_failure, passed()])
+        alerts = []
 
-        result, output = self.run_with_output(graph, items)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            with self.assertRaises(GlobalWorkflowError) as context:
+                run_daily(
+                    settings(),
+                    graph=graph,
+                    articles=items,
+                    alert_publisher=alerts.append,
+                )
 
-        self.assertEqual(3, result["processed"])
-        self.assertEqual(2, result["failed"])
-        self.assertEqual(1, result["published"])
-        self.assertEqual([item["title"] for item in items], graph.calls)
-        self.assertIn("workflow_status: PASS", output)
-        self.assertNotIn("GeminiServiceUnavailable", output)
+        self.assertEqual("GeminiServiceUnavailable", context.exception.error_type)
+        self.assertEqual(429, context.exception.status_code)
+        self.assertEqual(["Article A", "Article B"], graph.calls)
+        self.assertIn("status_code=503", output.getvalue())
+        self.assertIn("status_code=429", output.getvalue())
+        self.assertIn("workflow_status: FAIL", output.getvalue())
+        self.assertEqual(1, len(alerts))
+        self.assertIn("Stage: reviewer", alerts[0])
+        self.assertIn("HTTP status: 429", alerts[0])
 
     def test_writer_transient_failure_is_item_scoped(self) -> None:
         items = [article("Article A"), article("Article B")]
@@ -281,16 +310,17 @@ class BatchRunnerTests(unittest.TestCase):
             ]
         )
 
-        result, output = self.run_with_output(graph, items)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            with self.assertRaises(GlobalWorkflowError) as context:
+                run_daily(settings(), graph=graph, articles=items)
 
-        self.assertEqual(10, result["processed"])
-        self.assertEqual(5, result["published"])
-        self.assertEqual(1, result["skipped"])
-        self.assertEqual(1, result["held"])
-        self.assertEqual(3, result["failed"])
-        self.assertEqual([item["title"] for item in items], graph.calls)
-        self.assertIn("workflow_status: PASS", output)
-        self.assertNotIn("GeminiServiceUnavailable", output)
+        self.assertEqual("GeminiServiceUnavailable", context.exception.error_type)
+        self.assertEqual([item["title"] for item in items[:6]], graph.calls)
+        self.assertIn("processed: 6", output.getvalue())
+        self.assertIn("published: 3", output.getvalue())
+        self.assertIn("failed: 3", output.getvalue())
+        self.assertIn("workflow_status: FAIL", output.getvalue())
 
     def test_publisher_stage_resets_researcher_transient_circuit(self) -> None:
         items = [
@@ -318,6 +348,31 @@ class BatchRunnerTests(unittest.TestCase):
         self.assertEqual(3, result["failed"])
         self.assertEqual(1, result["published"])
         self.assertIn("workflow_status: PASS", output)
+
+    def test_no_published_items_with_failures_fails_and_sends_ops_alert(self) -> None:
+        items = [article("Article A")]
+        graph = ScriptedGraph(
+            [NodeExecutionError("reviewer", SchemaError("invalid review payload"))]
+        )
+        alerts = []
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            with self.assertRaises(GlobalWorkflowError) as context:
+                run_daily(
+                    settings(),
+                    graph=graph,
+                    articles=items,
+                    alert_publisher=alerts.append,
+                )
+
+        self.assertEqual("summary", context.exception.stage)
+        self.assertEqual("NoArticlesPublished", context.exception.error_type)
+        self.assertIn("workflow_status: FAIL", output.getvalue())
+        self.assertEqual(1, len(alerts))
+        self.assertIn("Error: NoArticlesPublished", alerts[0])
+        self.assertIn("Published: 0/1", alerts[0])
+        self.assertIn("Last item stage: reviewer", alerts[0])
 
     def test_authentication_authorization_and_model_failures_are_global(self) -> None:
         cases = [

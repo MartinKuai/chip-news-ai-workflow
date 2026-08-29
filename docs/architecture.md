@@ -71,7 +71,7 @@ Reviewer 接收 Research Notes、Draft、Rubric 和输出结构。Rubric 覆盖 
 
 ### Publisher
 
-Publisher 为确定性发布层。图状态与 `review.status` 同时为 `PASS` 时发送 Telegram。Markdown 请求返回 400 时尝试一次纯文本 fallback；最终发送失败抛出 `PublisherError`。
+Publisher 为确定性发布层。图状态与 `review.status` 同时为 `PASS` 时发送 Telegram。Markdown 请求返回 400 时尝试一次纯文本 fallback；最终发送失败抛出 `PublisherError`。同一个 Publisher 还提供不带原文链接的 `publish_alert`，供运行级失败发送运维告警；该路径不调用 Gemini。
 
 ## Graph State
 
@@ -177,7 +177,7 @@ Reviewer 的完整输出不直接进入下一次 Writer 调用；仅 `revision_b
 
 ### Article level
 
-图节点异常包装为带安全阶段信息的 `NodeExecutionError`：`researcher`、`writer`、`reviewer` 或 `publisher`。正文提取、JSON 解析、schema 校验和单篇瞬态请求失败计入 `failed`，后续文章继续运行；Writer 或 Reviewer 阶段的瞬态 Gemini 失败不会累计服务级不可用计数。
+图节点异常包装为带安全阶段信息的 `NodeExecutionError`：`researcher`、`writer`、`reviewer` 或 `publisher`。正文提取、JSON 解析、schema 校验和单篇瞬态请求失败计入 `failed`，后续文章继续运行；但 Researcher、Writer、Reviewer 任一阶段的连续两次 Gemini 瞬态失败会触发服务级中止，跨这三个 AI 阶段的连续失败也计数，成功完成或非 AI 节点失败会重置计数。
 
 ### Run level
 
@@ -185,17 +185,20 @@ Reviewer 的完整输出不直接进入下一次 Writer 调用；仅 `revision_b
 
 - 所有 RSS 来源均不可用。
 - Gemini 认证、权限或模型配置错误。
-- 连续两篇文章在 Researcher 首次 Gemini 调用阶段、有限重试后仍发生 Gemini 网络、429 或 5xx 错误。
+- Researcher、Writer、Reviewer 任一阶段连续两篇文章在有限重试后仍发生 Gemini 网络、429 或 5xx 错误。
+- `published == 0 && failed > 0`，即没有任何文章发布但至少有一篇文章失败。
 - Telegram 认证或目标配置错误。
 - 未分类的程序运行错误。
 
-全局中止前仍输出当前 Run summary：
+全局中止前仍输出当前 Run summary，并尝试通过确定性的 Telegram Publisher 发送运维告警：
 
 ```text
 sources_total / sources_ok / sources_failed
 candidates / processed / published / skipped / held / failed / revisions
 workflow_status
 ```
+
+失败记录中的 provider 信息只保留异常类型和可用的 HTTP status code，不输出原始响应或异常消息。
 
 ## Model routing
 
