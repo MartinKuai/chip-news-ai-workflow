@@ -9,7 +9,8 @@ from langgraph.graph import END, START, StateGraph
 
 from .config import Settings
 from .gemini import GeminiClient
-from .nodes import ResearcherNode, ReviewerNode, WriterNode
+from .metrics import RunMetrics
+from .nodes import ReviewerNode, WriterNode
 from .publisher import PublisherNode, TelegramPublisher
 from .schemas import GraphState, SchemaError
 from .sources import ArticleExtractor
@@ -29,40 +30,33 @@ class NodeExecutionError(RuntimeError):
 
 def build_editorial_graph(
     *,
-    researcher: GraphNode,
     writer: GraphNode,
     reviewer: GraphNode,
     publisher: GraphNode,
     max_revisions: int,
 ):
-    """Build START -> Researcher -> Writer -> Reviewer with bounded routing."""
+    """Build START -> Writer -> Reviewer with bounded routing."""
     if max_revisions < 0:
         raise ValueError("max_revisions cannot be negative")
-
-    def research_node(state: GraphState) -> dict[str, Any]:
-        try:
-            update = researcher(state)
-            notes = update.get("research_notes")
-            if not isinstance(notes, dict):
-                raise SchemaError("Researcher node did not return research_notes")
-            decision = str(notes.get("decision", "")).upper()
-            if decision not in {"KEEP", "SKIP"}:
-                raise SchemaError("Researcher decision must be KEEP or SKIP")
-            return {
-                **update,
-                "status": "SKIP" if decision == "SKIP" else "RESEARCHED",
-            }
-        except NodeExecutionError:
-            raise
-        except Exception as exc:
-            raise NodeExecutionError("researcher", exc) from exc
 
     def writer_node(state: GraphState) -> dict[str, Any]:
         try:
             update = writer(state)
-            if not isinstance(update.get("draft"), dict):
-                raise SchemaError("Writer node did not return a draft")
-            return {**update, "status": "DRAFTED"}
+            notes = update.get("research_notes")
+            if not isinstance(notes, dict):
+                raise SchemaError("Writer node did not return research_notes")
+            decision = str(notes.get("decision", "")).upper()
+            if decision not in {"KEEP", "SKIP"}:
+                raise SchemaError("Writer decision must be KEEP or SKIP")
+            draft = update.get("draft", {})
+            if not isinstance(draft, dict):
+                raise SchemaError("Writer node did not return a draft object")
+            if decision == "KEEP" and not draft:
+                raise SchemaError("Writer KEEP requires a non-empty draft")
+            return {
+                **update,
+                "status": "SKIP" if decision == "SKIP" else "DRAFTED",
+            }
         except NodeExecutionError:
             raise
         except Exception as exc:
@@ -115,8 +109,8 @@ def build_editorial_graph(
         except Exception as exc:
             raise NodeExecutionError("publisher", exc) from exc
 
-    def after_researcher(state: GraphState) -> Literal["writer", "end"]:
-        return "end" if state["status"] == "SKIP" else "writer"
+    def after_writer(state: GraphState) -> Literal["reviewer", "end"]:
+        return "end" if state["status"] == "SKIP" else "reviewer"
 
     def after_reviewer(state: GraphState) -> Literal["writer", "publisher", "end"]:
         if state["status"] == "PASS":
@@ -128,15 +122,13 @@ def build_editorial_graph(
         raise SchemaError(f"Unexpected graph status after review: {state['status']}")
 
     builder = StateGraph(GraphState)
-    builder.add_node("researcher", research_node)
     builder.add_node("writer", writer_node)
     builder.add_node("reviewer", review_node)
     builder.add_node("publisher", publish_node)
-    builder.add_edge(START, "researcher")
+    builder.add_edge(START, "writer")
     builder.add_conditional_edges(
-        "researcher", after_researcher, {"writer": "writer", "end": END}
+        "writer", after_writer, {"reviewer": "reviewer", "end": END}
     )
-    builder.add_edge("writer", "reviewer")
     builder.add_conditional_edges(
         "reviewer",
         after_reviewer,
@@ -146,15 +138,41 @@ def build_editorial_graph(
     return builder.compile()
 
 
-def create_runtime_graph(settings: Settings):
+def create_runtime_graph(
+    settings: Settings,
+    *,
+    metrics: RunMetrics | None = None,
+    run_deadline: float | None = None,
+):
     """Wire real infrastructure while preserving independent model selection."""
-    client = GeminiClient(settings.gemini_api_key)
+    run_metrics = metrics or RunMetrics()
+    client = GeminiClient(
+        settings.gemini_api_key,
+        timeout=settings.gemini_timeout_seconds,
+        max_attempts=settings.gemini_max_attempts,
+        call_budget_seconds=settings.gemini_call_budget_seconds,
+        structured_output=settings.gemini_structured_output,
+        run_deadline=run_deadline,
+        logger=print,
+        metrics=run_metrics,
+    )
     return build_editorial_graph(
-        researcher=ResearcherNode(
-            client, settings.researcher_model, ArticleExtractor()
+        writer=WriterNode(
+            client,
+            settings.writer_model,
+            ArticleExtractor(),
+            metrics=run_metrics,
+            thinking_level=settings.writer_thinking_level,
+            max_output_tokens=settings.writer_max_output_tokens,
+            max_content_chars=settings.article_content_chars,
         ),
-        writer=WriterNode(client, settings.writer_model),
-        reviewer=ReviewerNode(client, settings.reviewer_model),
+        reviewer=ReviewerNode(
+            client,
+            settings.reviewer_model,
+            metrics=run_metrics,
+            thinking_level=settings.reviewer_thinking_level,
+            max_output_tokens=settings.reviewer_max_output_tokens,
+        ),
         publisher=PublisherNode(
             TelegramPublisher(
                 settings.telegram_bot_token,

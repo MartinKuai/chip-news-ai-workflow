@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -114,6 +115,57 @@ def collect_articles(
     if feed_urls and sources_ok == 0:
         raise SourceCollectionError(result)
     return result
+
+
+_READER_METADATA_PREFIXES = (
+    "Title:",
+    "URL Source:",
+    "Published Time:",
+    "Markdown Content:",
+)
+_MARKDOWN_IMAGE = re.compile(r"^!\[[^\]]*\]\([^)]*\)$")
+_MARKDOWN_RULE = re.compile(r"^(?:-{3,}|\*{3,}|_{3,})$")
+
+
+def clean_extracted_text(raw: str, *, max_chars: int) -> str:
+    """Deterministic cleanup before the model call: drop reader metadata and noise.
+
+    This runs locally, costs no Gemini request and keeps only high-signal lines so
+    the Writer receives dense context instead of raw reader output.
+    """
+    if not raw:
+        return ""
+    lines: list[str] = []
+    header = True
+    for raw_line in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if header:
+            if not stripped:
+                continue
+            if stripped.startswith(_READER_METADATA_PREFIXES):
+                if stripped.startswith("Markdown Content:"):
+                    header = False
+                continue
+            header = False
+        if not stripped:
+            if lines and lines[-1] != "":
+                lines.append("")
+            continue
+        if _MARKDOWN_IMAGE.match(stripped) or _MARKDOWN_RULE.match(stripped):
+            continue
+        if lines and lines[-1] == stripped:
+            continue
+        lines.append(stripped)
+
+    text = "\n".join(lines).strip()
+    if len(text) > max_chars:
+        cut = text[:max_chars]
+        boundary = cut.rfind("\n\n")
+        if boundary > max_chars * 0.6:
+            cut = cut[:boundary]
+        text = cut.rstrip() + "\n[content truncated]"
+    return text
 
 
 class ArticleExtractor:

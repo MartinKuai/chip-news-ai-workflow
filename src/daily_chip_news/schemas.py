@@ -86,6 +86,9 @@ def validate_research_notes(value: Any) -> ResearchNotes:
     if not isinstance(raw_notes, list):
         raise SchemaError("notes must be a list")
     notes: list[ResearchNote] = []
+    if decision == "SKIP":
+        # A SKIP decision is a routing signal; partial notes must not fail the item.
+        raw_notes = []
     for index, item in enumerate(raw_notes):
         note = _mapping(item, f"notes[{index}]")
         try:
@@ -118,6 +121,25 @@ def validate_research_notes(value: Any) -> ResearchNotes:
         ),
         "notes": notes,
     }
+
+
+def validate_writer_output(
+    value: Any,
+    *,
+    source: str,
+    url: str,
+    published_at: str,
+) -> tuple[ResearchNotes, Draft | None]:
+    """Validate the merged research+writing output of one Writer call."""
+    data = _mapping(value, "Writer output")
+    notes_input = dict(data)
+    notes_input["source"] = source
+    notes_input["url"] = url
+    notes_input["published_at"] = published_at
+    notes = validate_research_notes(notes_input)
+    if notes["decision"] == "SKIP":
+        return notes, None
+    return notes, validate_draft(data.get("draft"))
 
 
 def validate_draft(value: Any) -> Draft:

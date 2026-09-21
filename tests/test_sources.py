@@ -3,7 +3,11 @@ from __future__ import annotations
 import unittest
 
 from _support import SRC  # noqa: F401
-from daily_chip_news.sources import SourceCollectionError, collect_articles
+from daily_chip_news.sources import (
+    SourceCollectionError,
+    clean_extracted_text,
+    collect_articles,
+)
 
 
 FEEDS = tuple(f"https://feed-{index}.example/rss" for index in range(5))
@@ -118,6 +122,73 @@ class SourceCollectionTests(unittest.TestCase):
         self.assertEqual(1, result.sources_ok)
         self.assertEqual(0, result.sources_failed)
         self.assertEqual(1, len(result.articles))
+
+
+    def test_trendforce_parser_error_stays_source_scoped(self) -> None:
+        def parser(url: str):
+            if url == FEEDS[3]:
+                raise TypeError("SAXParseException-like parser failure")
+            return FakeFeed(FEEDS.index(url))
+
+        result = collect_articles(1, feeds=FEEDS, parser=parser)
+
+        self.assertEqual(5, result.sources_total)
+        self.assertEqual(4, result.sources_ok)
+        self.assertEqual(1, result.sources_failed)
+        self.assertEqual("TypeError", result.failures[0].error)
+        self.assertEqual(4, len(result.articles))
+
+    def test_malformed_xml_feed_does_not_stop_the_others(self) -> None:
+        feeds = {url: FakeFeed(index) for index, url in enumerate(FEEDS)}
+        feeds[FEEDS[3]] = FakeFeed(
+            3,
+            bozo=True,
+            entries=[],
+            error=ValueError("syntax error: line 1, column 0"),
+        )
+
+        result = collect_articles(1, feeds=FEEDS, parser=feeds.__getitem__)
+
+        self.assertEqual(4, result.sources_ok)
+        self.assertEqual(1, result.sources_failed)
+        self.assertEqual(4, len(result.articles))
+
+
+class CleanExtractedTextTests(unittest.TestCase):
+    def test_reader_metadata_block_is_removed(self) -> None:
+        raw = (
+            "Title: HBM update\n\n"
+            "URL Source: https://example.com/hbm\n\n"
+            "Published Time: 2026-08-24\n\n"
+            "Markdown Content:\n"
+            "First paragraph.\n\n"
+            "Second paragraph.\n"
+        )
+        cleaned = clean_extracted_text(raw, max_chars=1000)
+        self.assertEqual("First paragraph.\n\nSecond paragraph.", cleaned)
+
+    def test_images_rules_and_duplicate_lines_are_dropped(self) -> None:
+        raw = (
+            "Markdown Content:\n"
+            "![cover](https://example.com/cover.png)\n\n"
+            "---\n\n"
+            "Repeated line.\n"
+            "Repeated line.\n\n\n\n"
+            "Tail line.\n"
+        )
+        cleaned = clean_extracted_text(raw, max_chars=1000)
+        self.assertEqual("Repeated line.\n\nTail line.", cleaned)
+
+    def test_long_text_is_truncated_at_a_paragraph_boundary(self) -> None:
+        paragraphs = [f"Paragraph {index} " + "x" * 80 for index in range(40)]
+        cleaned = clean_extracted_text("\n\n".join(paragraphs), max_chars=600)
+        self.assertLessEqual(len(cleaned), 600 + len("\n[content truncated]"))
+        self.assertIn("[content truncated]", cleaned)
+        self.assertNotIn("Paragraph 39", cleaned)
+
+    def test_empty_input_stays_empty(self) -> None:
+        self.assertEqual("", clean_extracted_text("", max_chars=1000))
+        self.assertEqual("", clean_extracted_text("\n\n\n", max_chars=1000))
 
 
 if __name__ == "__main__":

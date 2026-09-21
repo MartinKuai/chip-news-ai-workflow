@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import sys
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,15 @@ ARTICLE = {
     "published_at": "2026-08-24",
 }
 
+NOTES = [
+    {
+        "claim": "A vendor announced a capacity update.",
+        "evidence": "The source directly describes the capacity update.",
+        "why_it_matters": "It may affect supplier discussions.",
+        "confidence": 0.9,
+    }
+]
+
 RESEARCH = {
     "decision": "KEEP",
     "reason": "Relevant supply-chain update",
@@ -24,14 +34,7 @@ RESEARCH = {
     "source": "Example Source",
     "url": "https://example.com/hbm",
     "published_at": "2026-08-24",
-    "notes": [
-        {
-            "claim": "A vendor announced a capacity update.",
-            "evidence": "The source directly describes the capacity update.",
-            "why_it_matters": "It may affect supplier discussions.",
-            "confidence": 0.9,
-        }
-    ],
+    "notes": NOTES,
 }
 
 DRAFT = {
@@ -41,6 +44,35 @@ DRAFT = {
     "why_it_matters": "该动态有助于理解后续供应沟通重点。",
     "telegram_copy": "HBM 供应动态：一家供应商公布了产能更新。",
 }
+
+WRITER_OUTPUT = {
+    "decision": "KEEP",
+    "reason": "Relevant supply-chain update",
+    "topic": "HBM supply",
+    "notes": copy.deepcopy(NOTES),
+    "draft": dict(DRAFT),
+}
+
+SKIP_OUTPUT = {
+    "decision": "SKIP",
+    "reason": "Not in editorial scope",
+    "topic": "",
+    "notes": [],
+    "draft": {},
+}
+
+
+def writer_output(**overrides: Any) -> dict[str, Any]:
+    """Return a fresh valid merged Writer output, with optional overrides."""
+    value = copy.deepcopy(WRITER_OUTPUT)
+    value.update(overrides)
+    return value
+
+
+def skip_output(**overrides: Any) -> dict[str, Any]:
+    value = copy.deepcopy(SKIP_OUTPUT)
+    value.update(overrides)
+    return value
 
 
 def review(status: str) -> dict[str, Any]:
