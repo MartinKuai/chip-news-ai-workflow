@@ -8,8 +8,10 @@ from unittest.mock import patch
 from _support import ARTICLE, SRC  # noqa: F401
 from daily_chip_news.app import run_daily
 from daily_chip_news.config import Settings
+from daily_chip_news.errors import classify_failure, health_event_for
 from daily_chip_news.gemini import GeminiAPIError, GeminiResponseError
 from daily_chip_news.graph import NodeExecutionError
+from daily_chip_news.health import HealthEvent, ServiceHealth
 from daily_chip_news.publisher import PublisherError
 from daily_chip_news.schemas import SchemaError
 from daily_chip_news.sources import (
@@ -62,20 +64,68 @@ def service_error(status_code: int = 503):
 
 
 class ScriptedGraph:
-    def __init__(self, outcomes):
+    """Scripted articles plus the node-level health events the real nodes record.
+
+    One logical AI call records exactly one event: the Writer call, the Reviewer
+    call, and every revision call each get their own event. A failure before the
+    Gemini call (source extraction) records nothing.
+    """
+
+    def __init__(self, outcomes, health=None):
         self.outcomes = list(outcomes)
         self.calls = []
+        self.health = health
 
     def invoke(self, state):
         self.calls.append(state["article"]["title"])
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, Exception):
+            self._record_failure(outcome)
             raise outcome
+        self._record_success(outcome)
         return outcome
+
+    def _success(self) -> None:
+        if self.health is not None:
+            self.health.record(HealthEvent.SUCCESS)
+
+    def _record_success(self, outcome) -> None:
+        self._success()  # Writer call
+        if outcome.get("status") == "SKIP":
+            return
+        self._success()  # Reviewer call
+        for _ in range(int(outcome.get("revision_count", 0))):
+            self._success()  # revision Writer call
+            self._success()  # revision Reviewer call
+
+    def _record_failure(self, exc: Exception) -> None:
+        if self.health is None or not isinstance(exc, NodeExecutionError):
+            return
+        if exc.stage == "reviewer":
+            self._success()  # the Writer call succeeded before the Reviewer failed
+        elif exc.stage == "publisher":
+            self._success()
+            self._success()
+            return
+        info = classify_failure(exc.stage, exc.cause)
+        event = health_event_for(exc.stage, info)
+        if event is not None:
+            self.health.record(event)
 
 
 class BatchRunnerTests(unittest.TestCase):
-    def run_with_output(self, graph, items, *, alert_publisher=None, **settings_kwargs):
+    def run_with_output(
+        self,
+        graph,
+        items,
+        *,
+        alert_publisher=None,
+        health=None,
+        **settings_kwargs,
+    ):
+        service_health = health or ServiceHealth(5, 3)
+        if isinstance(graph, ScriptedGraph):
+            graph.health = service_health
         output = io.StringIO()
         with redirect_stdout(output):
             result = run_daily(
@@ -83,6 +133,7 @@ class BatchRunnerTests(unittest.TestCase):
                 graph=graph,
                 articles=items,
                 alert_publisher=alert_publisher,
+                health=service_health,
             )
         return result, output.getvalue()
 
@@ -156,10 +207,10 @@ class BatchRunnerTests(unittest.TestCase):
         self.assertEqual(6, result["processed"])
         self.assertEqual(2, result["failed"])
         self.assertIn("breaker_triggered: no", output)
-        self.assertIn("health_window: window=[T,S,S,S,S] transient=1/5", output)
+        self.assertIn("health_window: window=[S,S,S,S,S] transient=0/5", output)
         self.assertEqual("PARTIAL_SUCCESS", result["run_outcome"])
 
-    def test_schema_errors_do_not_reset_transient_history(self) -> None:
+    def test_schema_errors_do_not_reset_or_count_as_transient(self) -> None:
         items = articles(5)
         schema_error = NodeExecutionError(
             "reviewer", SchemaError("invalid review payload")
@@ -174,11 +225,29 @@ class BatchRunnerTests(unittest.TestCase):
             ]
         )
         result, output = self.run_with_output(graph, items)
+        self.assertEqual(5, result["processed"])
+        self.assertEqual(0, result["published"])
+        self.assertEqual("FAILED", result["run_outcome"])
+        self.assertIn("SCHEMA_INVALID: 2", output)
+        # Schema errors occupy window slots without erasing the transient
+        # history; per-call granularity then dilutes 3 transients across 10
+        # calls, so the breaker stays closed while the run still fails.
+        self.assertIn("health_window: window=[T,S,N,S,T] transient=2/5", output)
+        self.assertIn("breaker_triggered: no", output)
+
+    def test_writer_side_transient_burst_opens_the_breaker(self) -> None:
+        items = articles(6)
+        writer_error = NodeExecutionError(
+            "writer",
+            GeminiAPIError("HTTP 503", status_code=503, transient=True),
+        )
+        graph = ScriptedGraph([writer_error] * 5 + [passed()])
+        result, output = self.run_with_output(graph, items)
+        self.assertEqual(5, result["processed"])
         self.assertEqual("FAILED", result["run_outcome"])
         self.assertEqual(1, result["exit_code"])
-        self.assertIn("SCHEMA_INVALID: 2", output)
         self.assertIn("Gemini service breaker OPEN", output)
-        self.assertIn("transient=3/5", output)
+        self.assertIn("window=[T,T,T,T,T] transient=5/5 threshold=3", output)
 
     def test_two_transient_failures_never_open_the_breaker(self) -> None:
         items = articles(6)

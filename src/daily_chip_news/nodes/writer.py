@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from ..config import EDITORIAL_BRIEF, EDITORIAL_SCOPE
+from ..errors import record_health_outcome
 from ..gemini import JSONClient
+from ..health import HealthEvent
 from ..metrics import RunMetrics
 from ..schemas import GraphState, validate_writer_output
 from ..sources import SourceError, clean_extracted_text
@@ -108,6 +111,7 @@ class WriterNode:
         extractor,
         *,
         metrics: RunMetrics | None = None,
+        health_recorder: Callable[[HealthEvent], None] | None = None,
         thinking_level: str = "medium",
         max_output_tokens: int = 16384,
         max_content_chars: int = 16000,
@@ -116,11 +120,21 @@ class WriterNode:
         self._model = model
         self._extractor = extractor
         self._metrics = metrics
+        self._health_recorder = health_recorder
         self._thinking_level = thinking_level
         self._max_output_tokens = max_output_tokens
         self._max_content_chars = max_content_chars
 
     def __call__(self, state: GraphState) -> dict[str, Any]:
+        try:
+            update = self._run(state)
+        except Exception as exc:
+            record_health_outcome(self._health_recorder, stage="writer", cause=exc)
+            raise
+        record_health_outcome(self._health_recorder, stage="writer")
+        return update
+
+    def _run(self, state: GraphState) -> dict[str, Any]:
         article = state["article"]
         revision_brief = [
             str(item).strip()

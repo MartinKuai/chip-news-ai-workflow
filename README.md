@@ -164,11 +164,11 @@ SOURCE_ERROR / PUBLISH_ERROR / CONFIG_ERROR / UNEXPECTED_ERROR      文章级或
 熔断使用 rolling-window，而不是"连续两次失败"：
 
 ```text
-最近 GEMINI_HEALTH_WINDOW(5) 个 AI 处理结果中，
+最近 GEMINI_HEALTH_WINDOW(5) 个 AI 逻辑调用结果中（每次 Writer/Reviewer 调用各记一个事件），
 瞬态失败（429 / 5xx / network / timeout）达到 GEMINI_HEALTH_THRESHOLD(3) 即判定服务不可用
 ```
 
-成功完成会正常进入窗口并挤出旧失败；`SchemaError`、`GeminiResponseError` 等文章级错误占窗口位置但不计入瞬态，也不会清空历史。breaker 打开时日志会打印完整窗口，例如：
+成功与失败事件同粒度：一次成功调用记 SUCCESS，一次重试耗尽的瞬态失败记 TRANSIENT，`GeminiResponseError` / `SchemaError` 记 NEUTRAL。成功事件会正常进入窗口并挤出旧失败；NEUTRAL 占窗口位置但不计入瞬态，也不会清空历史。breaker 打开时日志会打印完整窗口，例如：
 
 ```text
 Gemini service breaker OPEN | window=[T,T,S,N,T] transient=3/5 threshold=3 | last=stage=reviewer category=TRANSIENT_SERVER | published=1 | action=stop_processing
@@ -183,7 +183,7 @@ Gemini service breaker OPEN | window=[T,T,S,N,T] transient=3/5 threshold=3 | las
 
 ### JSON 容错
 
-结构化输出优先使用 `responseSchema` 约束；防御性解析顺序为：直接解析 → 提取 fenced ```json → 最多一次"只修格式、不改内容"的 repair 调用 → 仍失败则记为文章级 `GeminiResponseError`。不做字段猜测或语义修复。
+结构化输出优先使用 `responseSchema` 约束；防御性解析顺序为：直接解析 → 提取 fenced ```json → 最多一次"只修格式、不改内容"的 repair 调用（与原调用共享同一 logical-call deadline）→ 仍失败则记为文章级 `GeminiResponseError`。不做字段猜测或语义修复。
 
 ## 错误与失败隔离
 

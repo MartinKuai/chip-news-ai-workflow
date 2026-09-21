@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from ..config import REVIEW_RUBRIC
+from ..errors import record_health_outcome
 from ..gemini import JSONClient
+from ..health import HealthEvent
 from ..metrics import RunMetrics
 from ..schemas import GraphState, validate_review
 
@@ -66,28 +69,36 @@ class ReviewerNode:
         model: str,
         *,
         metrics: RunMetrics | None = None,
+        health_recorder: Callable[[HealthEvent], None] | None = None,
         thinking_level: str = "low",
         max_output_tokens: int = 8192,
     ) -> None:
         self._client = client
         self._model = model
         self._metrics = metrics
+        self._health_recorder = health_recorder
         self._thinking_level = thinking_level
         self._max_output_tokens = max_output_tokens
 
     def __call__(self, state: GraphState) -> dict[str, Any]:
-        result = self._client.request_json(
-            model=self._model,
-            system_instruction=REVIEWER_INSTRUCTION,
-            payload={
-                "research_notes": state["research_notes"],
-                "draft": state["draft"],
-                "rubric": list(REVIEW_RUBRIC),
-                "output_schema": REVIEW_OUTPUT_SCHEMA,
-            },
-            purpose="reviewer",
-            output_schema=REVIEW_OUTPUT_SPEC,
-            thinking_level=self._thinking_level,
-            max_output_tokens=self._max_output_tokens,
-        )
-        return {"review": validate_review(result)}
+        try:
+            result = self._client.request_json(
+                model=self._model,
+                system_instruction=REVIEWER_INSTRUCTION,
+                payload={
+                    "research_notes": state["research_notes"],
+                    "draft": state["draft"],
+                    "rubric": list(REVIEW_RUBRIC),
+                    "output_schema": REVIEW_OUTPUT_SCHEMA,
+                },
+                purpose="reviewer",
+                output_schema=REVIEW_OUTPUT_SPEC,
+                thinking_level=self._thinking_level,
+                max_output_tokens=self._max_output_tokens,
+            )
+            review = validate_review(result)
+        except Exception as exc:
+            record_health_outcome(self._health_recorder, stage="reviewer", cause=exc)
+            raise
+        record_health_outcome(self._health_recorder, stage="reviewer")
+        return {"review": review}

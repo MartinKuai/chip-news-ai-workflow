@@ -140,3 +140,25 @@ def health_event_for(stage: str, info: FailureInfo) -> HealthEvent | None:
     if info.category in AI_ARTICLE_CATEGORIES:
         return HealthEvent.NON_TRANSIENT_FAILURE
     return None
+
+
+def record_health_outcome(
+    recorder,
+    *,
+    stage: str,
+    cause: Exception | None = None,
+) -> None:
+    """Record exactly one health event for one logical AI call.
+
+    ``cause is None`` means the call (including local schema validation)
+    succeeded. Failures that are not Gemini service signals, such as a source
+    extraction error, record nothing.
+    """
+    if recorder is None:
+        return
+    if cause is None:
+        recorder(HealthEvent.SUCCESS)
+        return
+    event = health_event_for(stage, classify_failure(stage, cause))
+    if event is not None:
+        recorder(event)

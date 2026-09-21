@@ -9,6 +9,7 @@ from langgraph.graph import END, START, StateGraph
 
 from .config import Settings
 from .gemini import GeminiClient
+from .health import ServiceHealth
 from .metrics import RunMetrics
 from .nodes import ReviewerNode, WriterNode
 from .publisher import PublisherNode, TelegramPublisher
@@ -142,10 +143,12 @@ def create_runtime_graph(
     settings: Settings,
     *,
     metrics: RunMetrics | None = None,
+    health: ServiceHealth | None = None,
     run_deadline: float | None = None,
 ):
     """Wire real infrastructure while preserving independent model selection."""
     run_metrics = metrics or RunMetrics()
+    health_recorder = health.record if health is not None else None
     client = GeminiClient(
         settings.gemini_api_key,
         timeout=settings.gemini_timeout_seconds,
@@ -162,6 +165,7 @@ def create_runtime_graph(
             settings.writer_model,
             ArticleExtractor(),
             metrics=run_metrics,
+            health_recorder=health_recorder,
             thinking_level=settings.writer_thinking_level,
             max_output_tokens=settings.writer_max_output_tokens,
             max_content_chars=settings.article_content_chars,
@@ -170,6 +174,7 @@ def create_runtime_graph(
             client,
             settings.reviewer_model,
             metrics=run_metrics,
+            health_recorder=health_recorder,
             thinking_level=settings.reviewer_thinking_level,
             max_output_tokens=settings.reviewer_max_output_tokens,
         ),

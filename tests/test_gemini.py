@@ -407,6 +407,34 @@ class GeminiClientTests(unittest.TestCase):
         self.assertEqual(1, metrics.repairs_for("writer"))
         self.assertEqual(0, metrics.repair_success_for("writer"))
 
+    def test_json_repair_shares_the_logical_call_deadline(self) -> None:
+        session = FakeSession(
+            FakeResponse(200, envelope("not json at all")),
+            FakeResponse(200, envelope('{"ok":true}')),
+        )
+        client = make_client(
+            session,
+            call_budget_seconds=100.0,
+            timeout=180.0,
+            now=clock_from([0.0, 0.0, 90.0]),
+        )
+        result = request(client, output_schema=SCHEMA, purpose="writer")
+        self.assertEqual({"ok": True}, result)
+        self.assertEqual(100.0, session.calls[0][1]["timeout"])
+        # The repair call inherits the remaining budget instead of a fresh one.
+        self.assertEqual(10.0, session.calls[1][1]["timeout"])
+
+    def test_json_repair_is_skipped_when_the_shared_deadline_passed(self) -> None:
+        session = FakeSession(FakeResponse(200, envelope("not json at all")))
+        client = make_client(
+            session,
+            call_budget_seconds=100.0,
+            now=clock_from([0.0, 0.0, 500.0]),
+        )
+        with self.assertRaises(GeminiResponseError):
+            request(client, output_schema=SCHEMA, purpose="writer")
+        self.assertEqual(1, len(session.calls))
+
     def test_truncated_output_is_reported_without_repair(self) -> None:
         session = FakeSession(FakeResponse(200, envelope("{\"ok\": tr", "MAX_TOKENS")))
         metrics = RunMetrics()

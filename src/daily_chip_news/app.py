@@ -10,13 +10,9 @@ from typing import Any, TypedDict
 from dotenv import load_dotenv
 
 from .config import ConfigError, Settings
-from .errors import (
-    FailureCategory,
-    classify_failure,
-    health_event_for,
-)
+from .errors import FailureCategory, classify_failure
 from .graph import NodeExecutionError, create_runtime_graph
-from .health import HealthEvent, ServiceHealth
+from .health import ServiceHealth
 from .metrics import RunMetrics
 from .outcomes import RunOutcome, decide_run_outcome, exit_code_for
 from .publisher import TelegramPublisher
@@ -317,18 +313,24 @@ def run_daily(
     articles: Iterable[Article] | None = None,
     alert_publisher: Callable[[str], None] | None = None,
     clock: Callable[[], float] = time.monotonic,
+    health: ServiceHealth | None = None,
 ) -> dict[str, Any]:
     """Process every independent item and return stats plus the run outcome."""
     print(_config_line(settings))
     metrics = RunMetrics()
+    health = health or ServiceHealth(
+        settings.health_window_size, settings.health_failure_threshold
+    )
     deadline = clock() + settings.run_budget_seconds
     runtime_graph = (
         graph
         if graph is not None
-        else create_runtime_graph(settings, metrics=metrics, run_deadline=deadline)
-    )
-    health = ServiceHealth(
-        settings.health_window_size, settings.health_failure_threshold
+        else create_runtime_graph(
+            settings,
+            metrics=metrics,
+            health=health,
+            run_deadline=deadline,
+        )
     )
 
     if articles is not None:
@@ -426,9 +428,7 @@ def run_daily(
             info = classify_failure(exc.stage, cause)
             stats["failed"] += 1
             _record_failure(failures, article, exc.stage, cause, info.category)
-            event = health_event_for(exc.stage, info)
-            if event is not None:
-                health.record(event)
+            # Node-level code records the health event for the failing AI call.
             status_code = _safe_status_code(cause)
             status_suffix = (
                 f" | status_code={status_code}" if status_code is not None else ""
@@ -475,8 +475,8 @@ def run_daily(
             print("Run outcome decision | reason=unexpected-exception -> FAILED")
             break
 
-        # A completed graph proves Gemini was available for this item.
-        health.record(HealthEvent.SUCCESS)
+        # Node-level code already recorded one health event per AI call made
+        # inside this article; the batch runner only aggregates the result.
         status = result["status"]
         stats["revisions"] += int(result.get("revision_count", 0))
         if status == "SKIP":

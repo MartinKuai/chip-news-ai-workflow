@@ -4,8 +4,21 @@ import json
 import unittest
 
 from _support import ARTICLE, DRAFT, RESEARCH, SRC, CaptureClient, review, writer_output  # noqa: F401
+from daily_chip_news.gemini import GeminiAPIError, GeminiResponseError
+from daily_chip_news.health import HealthEvent
 from daily_chip_news.nodes import ReviewerNode, WriterNode
 from daily_chip_news.schemas import SchemaError
+from daily_chip_news.sources import SourceError
+
+
+class ExplodingClient:
+    """Client stub that raises one configured exception on every call."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def request_json(self, **kwargs):
+        raise self._exc
 
 
 def body_extractor(text: str = "Body line.\n" * 40):
@@ -207,6 +220,113 @@ class ReviewerContextTests(unittest.TestCase):
             ["writer-model", "review-model"],
             [call["model"] for call in client.calls],
         )
+
+
+class HealthRecordingTests(unittest.TestCase):
+    """One logical AI call must produce exactly one health event."""
+
+    def test_writer_success_records_one_event(self) -> None:
+        events = []
+        WriterNode(
+            CaptureClient(writer_output()),
+            "writer-model",
+            body_extractor(),
+            health_recorder=events.append,
+        )({"article": ARTICLE, "revision_brief": []})
+        self.assertEqual([HealthEvent.SUCCESS], events)
+
+    def test_reviewer_success_records_one_event(self) -> None:
+        events = []
+        ReviewerNode(
+            CaptureClient(review("PASS")),
+            "review-model",
+            health_recorder=events.append,
+        )({"article": ARTICLE, "research_notes": RESEARCH, "draft": DRAFT})
+        self.assertEqual([HealthEvent.SUCCESS], events)
+
+    def test_writer_transient_exhaustion_records_one_transient_event(self) -> None:
+        events = []
+        node = WriterNode(
+            ExplodingClient(
+                GeminiAPIError("HTTP 503", status_code=503, transient=True)
+            ),
+            "writer-model",
+            body_extractor(),
+            health_recorder=events.append,
+        )
+        with self.assertRaises(GeminiAPIError):
+            node({"article": ARTICLE, "revision_brief": []})
+        self.assertEqual([HealthEvent.TRANSIENT_FAILURE], events)
+
+    def test_reviewer_transient_exhaustion_records_one_transient_event(self) -> None:
+        events = []
+        node = ReviewerNode(
+            ExplodingClient(
+                GeminiAPIError("HTTP 429", status_code=429, transient=True)
+            ),
+            "review-model",
+            health_recorder=events.append,
+        )
+        with self.assertRaises(GeminiAPIError):
+            node({"article": ARTICLE, "research_notes": RESEARCH, "draft": DRAFT})
+        self.assertEqual([HealthEvent.TRANSIENT_FAILURE], events)
+
+    def test_writer_response_error_records_one_neutral_event(self) -> None:
+        events = []
+        node = WriterNode(
+            ExplodingClient(GeminiResponseError("invalid json")),
+            "writer-model",
+            body_extractor(),
+            health_recorder=events.append,
+        )
+        with self.assertRaises(GeminiResponseError):
+            node({"article": ARTICLE, "revision_brief": []})
+        self.assertEqual([HealthEvent.NON_TRANSIENT_FAILURE], events)
+
+    def test_schema_failure_records_exactly_one_neutral_event(self) -> None:
+        events = []
+        broken = writer_output()
+        broken["draft"] = {
+            "headline": "",
+            "summary": "",
+            "key_facts": [],
+            "why_it_matters": "",
+            "telegram_copy": "",
+        }
+        node = WriterNode(
+            CaptureClient(broken),
+            "writer-model",
+            body_extractor(),
+            health_recorder=events.append,
+        )
+        with self.assertRaises(SchemaError):
+            node({"article": ARTICLE, "revision_brief": []})
+        self.assertEqual([HealthEvent.NON_TRANSIENT_FAILURE], events)
+
+    def test_source_extraction_failure_records_no_health_event(self) -> None:
+        events = []
+        node = WriterNode(
+            CaptureClient(writer_output()),
+            "writer-model",
+            body_extractor(""),
+            health_recorder=events.append,
+        )
+        with self.assertRaises(SourceError):
+            node({"article": ARTICLE, "revision_brief": []})
+        self.assertEqual([], events)
+
+    def test_configuration_error_records_no_health_event(self) -> None:
+        events = []
+        node = ReviewerNode(
+            ExplodingClient(
+                GeminiAPIError("HTTP 401", status_code=401, global_failure=True)
+            ),
+            "review-model",
+            health_recorder=events.append,
+        )
+        with self.assertRaises(GeminiAPIError):
+            node({"article": ARTICLE, "research_notes": RESEARCH, "draft": DRAFT})
+        self.assertEqual([], events)
 
 
 if __name__ == "__main__":

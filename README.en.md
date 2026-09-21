@@ -164,11 +164,11 @@ SOURCE_ERROR / PUBLISH_ERROR / CONFIG_ERROR / UNEXPECTED_ERROR       article- or
 The breaker is a rolling window, not a consecutive-failure counter:
 
 ```text
-Among the last GEMINI_HEALTH_WINDOW(5) AI outcomes,
+Among the last GEMINI_HEALTH_WINDOW(5) AI logical calls (one event per Writer/Reviewer call),
 transient failures (429 / 5xx / network / timeout) reaching GEMINI_HEALTH_THRESHOLD(3) mean the service is unavailable
 ```
 
-Successful completions enter the window normally and evict old failures. Article-level errors such as `SchemaError` or `GeminiResponseError` occupy a slot but neither count as transient failures nor erase history. When the breaker opens, the log prints the full window:
+Success and failure events share one granularity: a successful call records SUCCESS, a retry-exhausted transient failure records TRANSIENT, and `GeminiResponseError` / `SchemaError` records NEUTRAL. Successful calls enter the window normally and evict old failures; NEUTRAL events occupy a slot without counting as transient and without erasing history. When the breaker opens, the log prints the full window:
 
 ```text
 Gemini service breaker OPEN | window=[T,T,S,N,T] transient=3/5 threshold=3 | last=stage=reviewer category=TRANSIENT_SERVER | published=1 | action=stop_processing
@@ -183,7 +183,7 @@ Gemini service breaker OPEN | window=[T,T,S,N,T] transient=3/5 threshold=3 | las
 
 ### JSON tolerance
 
-Structured output uses `responseSchema` first. Defensive parsing then runs: direct parse -> fenced json block extraction -> at most one format-only repair call -> otherwise an article-level `GeminiResponseError`. Fields are never guessed and semantics are never rewritten.
+Structured output uses `responseSchema` first. Defensive parsing then runs: direct parse -> fenced json block extraction -> at most one format-only repair call (sharing the original logical-call deadline) -> otherwise an article-level `GeminiResponseError`. Fields are never guessed and semantics are never rewritten.
 
 ## Failure isolation
 

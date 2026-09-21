@@ -191,6 +191,7 @@ UNEXPECTED_ERROR          程序级异常（始终 FAILED）
 取代旧的"连续两次失败"熔断：
 
 - 窗口大小 `GEMINI_HEALTH_WINDOW=5`，阈值 `GEMINI_HEALTH_THRESHOLD=3`。
+- 事件粒度 = logical Gemini call：每次 Writer/Reviewer 调用（含 revision）由节点记录恰好一个事件，成功 SUCCESS / 瞬态 TRANSIENT / 响应或 schema 问题 NON_TRANSIENT，成功与失败同粒度。
 - 只有 `writer` / `reviewer` 两个 AI 阶段的瞬态失败计入阈值。
 - `MODEL_RESPONSE_INVALID` / `MODEL_RESPONSE_TRUNCATED` / `SCHEMA_INVALID` 占窗口位置但不计瞬态，也不清空历史。
 - `SOURCE_ERROR`、`PUBLISH_ERROR` 不进入窗口。
@@ -222,7 +223,7 @@ UNEXPECTED_ERROR          程序级异常（始终 FAILED）
 - **超时**：`GEMINI_TIMEOUT_SECONDS=180` 单次 HTTP 超时；`GEMINI_CALL_BUDGET_SECONDS=240` 限制单次逻辑调用（含 retry）的总时长，deadline 到达即停止重试并抛出瞬态错误。
 - **重试**：最多 `GEMINI_MAX_ATTEMPTS=5` 次。429 优先使用 `Retry-After`（上限 120s）；5xx / network / timeout 使用指数退避 2s→4s→8s→16s，带 jitter，单次 sleep 上限 30s。
 - **日志**：每条 retry 记录 `purpose / attempt / http / retry_after / backoff / reason`，不输出 key、header 或请求体。
-- **JSON 容错**：直接解析 → 提取 fenced json block → 最多一次 `REPAIR_INSTRUCTION` 修复调用（只修格式，`allow_repair=False` 防止递归）→ 仍失败抛 `GeminiResponseError`。截断单独抛 `GeminiTruncatedResponseError`，不做 repair。
+- **JSON 容错**：直接解析 → 提取 fenced json block → 最多一次 `REPAIR_INSTRUCTION` 修复调用（只修格式，`allow_repair=False` 防止递归）→ 仍失败抛 `GeminiResponseError`。截断单独抛 `GeminiTruncatedResponseError`，不做 repair。repair 与原调用共享同一个 logical-call deadline（`min(call_budget, run_deadline)`），不会重新获得完整预算。
 - **thinking 兼容**：模型若以 400 明确拒绝 `thinkingConfig`，本次运行降级为模型默认值（不重复探测），并记录 `thinking_downgrades`。
 
 ## Model routing

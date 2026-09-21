@@ -183,6 +183,11 @@ class GeminiClient:
             level = ""
         if level and clean_model in self._unsupported_thinking:
             level = ""
+        # One logical call owns exactly one deadline: the initial request, every
+        # HTTP retry and the optional JSON repair share it.
+        deadline = self._now() + self._call_budget
+        if self._run_deadline is not None:
+            deadline = min(deadline, self._run_deadline)
         try:
             return self._request_with_retries(
                 model=clean_model,
@@ -193,6 +198,7 @@ class GeminiClient:
                 thinking_level=level,
                 max_output_tokens=max_output_tokens,
                 allow_repair=True,
+                deadline=deadline,
             )
         except _ThinkingConfigRejected:
             self._unsupported_thinking.add(clean_model)
@@ -210,6 +216,7 @@ class GeminiClient:
                 thinking_level="",
                 max_output_tokens=max_output_tokens,
                 allow_repair=True,
+                deadline=deadline,
             )
 
     def _request_with_retries(
@@ -223,6 +230,7 @@ class GeminiClient:
         thinking_level: str,
         max_output_tokens: int | None,
         allow_repair: bool,
+        deadline: float,
     ) -> dict[str, Any]:
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -250,9 +258,6 @@ class GeminiClient:
                 output_schema, thinking_level, max_output_tokens
             ),
         }
-        deadline = self._now() + self._call_budget
-        if self._run_deadline is not None:
-            deadline = min(deadline, self._run_deadline)
         last_error: GeminiAPIError | None = None
 
         for attempt in range(1, self._max_attempts + 1):
@@ -307,6 +312,7 @@ class GeminiClient:
                     thinking_level=thinking_level,
                     max_output_tokens=max_output_tokens,
                     allow_repair=allow_repair,
+                    deadline=deadline,
                 )
 
             if (
@@ -389,6 +395,7 @@ class GeminiClient:
         thinking_level: str,
         max_output_tokens: int | None,
         allow_repair: bool,
+        deadline: float,
     ) -> dict[str, Any]:
         try:
             envelope = response.json()
@@ -427,6 +434,7 @@ class GeminiClient:
                 output_schema=output_schema,
                 purpose=purpose,
                 max_output_tokens=max_output_tokens,
+                deadline=deadline,
             )
             if repaired is not None:
                 self._metrics.record_repair(purpose, succeeded=True)
@@ -444,6 +452,7 @@ class GeminiClient:
         output_schema: dict[str, Any],
         purpose: str,
         max_output_tokens: int | None,
+        deadline: float,
     ) -> dict[str, Any] | None:
         repair_payload = {
             "output_schema": output_schema,
@@ -459,6 +468,7 @@ class GeminiClient:
                 thinking_level="",
                 max_output_tokens=max_output_tokens,
                 allow_repair=False,
+                deadline=deadline,
             )
         except (GeminiAPIError, GeminiResponseError):
             return None
