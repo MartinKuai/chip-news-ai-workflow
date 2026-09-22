@@ -164,9 +164,7 @@ def canonical_url(url: str) -> str:
     """Normalize a URL for deterministic cross-source deduplication."""
     parsed = urlsplit((url or "").strip())
     scheme = (parsed.scheme or "https").lower()
-    netloc = parsed.netloc.lower()
-    if netloc.startswith("www."):
-        netloc = netloc[4:]
+    netloc = parsed.netloc.lower().removeprefix("www.")
     query_pairs = [
         (key, value)
         for key, value in parse_qsl(parsed.query, keep_blank_values=False)
