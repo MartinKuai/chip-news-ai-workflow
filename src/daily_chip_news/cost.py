@@ -39,9 +39,9 @@ class ModelPrice:
 
 
 # Verified against the official Gemini Developer API pricing page on 2026-09-21.
-# The 3.6/3.7 Flash introductory rate is documented both as $3.75 and $4.50 per
-# 1M output tokens; the conservative (higher) figure is used until the Owner
-# confirms the exact rate.
+# The 3.6/3.7 Flash introductory rate runs through 2026-12-31 and is recorded
+# as the official $3.75/1M output figure; budget conservatism comes from the
+# projected worst-case envelope, not from padding the price table.
 PRICING_VERIFIED_ON = date(2026, 9, 21)
 
 PRICING: tuple[ModelPrice, ...] = (
@@ -58,16 +58,16 @@ PRICING: tuple[ModelPrice, ...] = (
         date(2026, 9, 21),
         date(2026, 12, 31),
         0.75,
-        4.50,
-        "introductory rate until 2026-12-31 (conservative 4.50 vs 3.75)",
+        3.75,
+        "introductory rate until 2026-12-31 (official)",
     ),
     ModelPrice(
         "gemini-3.7-flash",
         date(2026, 9, 21),
         date(2026, 12, 31),
         0.75,
-        4.50,
-        "introductory rate until 2026-12-31 (conservative 4.50 vs 3.75)",
+        3.75,
+        "introductory rate until 2026-12-31 (official)",
     ),
     ModelPrice(
         "gemini-3.6-flash",

@@ -187,7 +187,7 @@ class UsageAccountingTests(unittest.TestCase):
         request(client, model="gemini-3.7-flash", purpose="writer")
         # 1_000+500 visible/thinking and 1_500+0 both bill 3_000 output tokens.
         self.assertAlmostEqual(
-            metrics.usage_for("writer").cost_usd, 3_000 * 4.50 / 1_000_000, places=9
+            metrics.usage_for("writer").cost_usd, 3_000 * 3.75 / 1_000_000, places=9
         )
 
     def test_retry_then_success_counts_one_billable_request(self) -> None:

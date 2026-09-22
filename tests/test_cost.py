@@ -28,7 +28,7 @@ class PriceLookupTests(unittest.TestCase):
         self.assertEqual(2.50, lite.output_usd_per_1m)
         flash = lookup_price("gemini-3.6-flash", now=TODAY)
         self.assertEqual(0.75, flash.input_usd_per_1m)
-        self.assertEqual(4.50, flash.output_usd_per_1m)
+        self.assertEqual(3.75, flash.output_usd_per_1m)
 
     def test_unknown_model_fails_closed(self) -> None:
         with self.assertRaises(PricingUnavailableError):
@@ -40,7 +40,7 @@ class PriceLookupTests(unittest.TestCase):
 
     def test_intro_rate_applies_through_the_last_promotional_day(self) -> None:
         record = lookup_price("gemini-3.7-flash", now=date(2026, 12, 31))
-        self.assertEqual(4.50, record.output_usd_per_1m)
+        self.assertEqual(3.75, record.output_usd_per_1m)
 
     def test_post_promotion_rate_replaces_the_intro_rate(self) -> None:
         record = lookup_price("gemini-3.7-flash", now=date(2027, 1, 1))
@@ -89,8 +89,8 @@ class CostMathTests(unittest.TestCase):
         price = self.price()
         visible_only = output_cost_usd(1_000, 0, price)
         with_thinking = output_cost_usd(1_000, 500, price)
-        self.assertAlmostEqual(0.0045, visible_only, places=9)
-        self.assertAlmostEqual(0.00675, with_thinking, places=9)
+        self.assertAlmostEqual(0.00375, visible_only, places=9)
+        self.assertAlmostEqual(0.005625, with_thinking, places=9)
 
     def test_projected_cost_uses_the_output_ceiling_and_input_margin(self) -> None:
         price = lookup_price("gemini-3.5-flash-lite", now=TODAY)
@@ -139,7 +139,7 @@ class UsageMetadataTests(unittest.TestCase):
         self.assertEqual(700, totals.candidate_tokens)
         self.assertEqual(300, totals.thought_tokens)
         self.assertEqual(1, totals.billable_requests)
-        expected = 2_000 * 0.75 / 1_000_000 + 1_000 * 4.50 / 1_000_000
+        expected = 2_000 * 0.75 / 1_000_000 + 1_000 * 3.75 / 1_000_000
         self.assertAlmostEqual(expected, totals.cost_usd, places=9)
 
     def test_missing_thinking_tokens_count_as_zero(self) -> None:

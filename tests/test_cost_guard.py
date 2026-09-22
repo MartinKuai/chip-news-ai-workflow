@@ -76,7 +76,7 @@ class CostGuardTests(unittest.TestCase):
             prompt_tokens=0,
             max_output_tokens=125,
         )
-        self.assertAlmostEqual(125 * 4.50 / 1_000_000, reservation.projected_cost_usd, places=12)
+        self.assertAlmostEqual(125 * 3.75 / 1_000_000, reservation.projected_cost_usd, places=12)
 
     def test_unknown_pricing_fails_closed(self) -> None:
         guard = self.make_guard()
