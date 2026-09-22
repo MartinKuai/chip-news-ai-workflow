@@ -25,19 +25,22 @@ class GraphTests(unittest.TestCase):
         keep: bool = True,
         max_revisions: int = 1,
     ):
-        calls = {"writer": 0, "reviewer": 0, "publisher": 0}
+        calls = {"researcher": 0, "writer": 0, "reviewer": 0, "publisher": 0}
 
-        def writer(state):
-            calls["writer"] += 1
+        def researcher(state):
+            calls["researcher"] += 1
             if keep:
                 return {
                     "research_notes": dict(RESEARCH),
-                    "draft": dict(DRAFT),
-                    "status": "DRAFTED",
+                    "status": "RESEARCHED",
                 }
             skipped = dict(RESEARCH)
             skipped.update({"decision": "SKIP", "notes": [], "topic": ""})
-            return {"research_notes": skipped, "draft": {}, "status": "SKIP"}
+            return {"research_notes": skipped, "status": "SKIP"}
+
+        def writer(state):
+            calls["writer"] += 1
+            return {"draft": dict(DRAFT), "status": "DRAFTED"}
 
         scripted = list(decisions)
 
@@ -50,6 +53,7 @@ class GraphTests(unittest.TestCase):
             return {"published": True}
 
         graph = build_editorial_graph(
+            researcher=researcher,
             writer=writer,
             reviewer=reviewer,
             publisher=publisher,
@@ -61,10 +65,12 @@ class GraphTests(unittest.TestCase):
     def invoke(graph):
         return graph.invoke(initial_state())
 
-    def test_writer_skip_does_not_call_reviewer(self) -> None:
+    def test_researcher_skip_does_not_call_writer_or_reviewer(self) -> None:
         graph, calls = self.make_graph([], keep=False)
         result = self.invoke(graph)
         self.assertEqual("SKIP", result["status"])
+        self.assertEqual(1, calls["researcher"])
+        self.assertEqual(0, calls["writer"])
         self.assertEqual(0, calls["reviewer"])
         self.assertEqual(0, calls["publisher"])
 
@@ -73,15 +79,17 @@ class GraphTests(unittest.TestCase):
         result = self.invoke(graph)
         self.assertEqual("PASS", result["status"])
         self.assertTrue(result["published"])
+        self.assertEqual(1, calls["researcher"])
         self.assertEqual(1, calls["writer"])
         self.assertEqual(1, calls["reviewer"])
         self.assertEqual(1, calls["publisher"])
 
-    def test_reject_routes_back_to_writer_once(self) -> None:
+    def test_reject_routes_back_to_writer_without_researching_again(self) -> None:
         graph, calls = self.make_graph(["REJECT", "PASS"], max_revisions=1)
         result = self.invoke(graph)
         self.assertEqual("PASS", result["status"])
         self.assertEqual(1, result["revision_count"])
+        self.assertEqual(1, calls["researcher"])
         self.assertEqual(2, calls["writer"])
         self.assertEqual(2, calls["reviewer"])
         self.assertEqual(1, calls["publisher"])
@@ -92,6 +100,7 @@ class GraphTests(unittest.TestCase):
         self.assertEqual("HOLD", result["status"])
         self.assertEqual(1, result["revision_count"])
         self.assertFalse(result["published"])
+        self.assertEqual(1, calls["researcher"])
         self.assertEqual(2, calls["writer"])
         self.assertEqual(2, calls["reviewer"])
         self.assertEqual(0, calls["publisher"])
@@ -104,6 +113,7 @@ class GraphTests(unittest.TestCase):
         self.assertEqual("PASS", result["status"])
         self.assertEqual(2, result["revision_count"])
         self.assertEqual(3, calls["writer"])
+        self.assertEqual(1, calls["researcher"])
 
     def test_no_infinite_writer_reviewer_loop(self) -> None:
         graph, calls = self.make_graph(["REJECT"] * 6, max_revisions=2)
@@ -111,13 +121,15 @@ class GraphTests(unittest.TestCase):
         self.assertEqual("HOLD", result["status"])
         self.assertEqual(3, calls["writer"])
         self.assertEqual(3, calls["reviewer"])
+        self.assertEqual(1, calls["researcher"])
 
-    def test_writer_keep_without_draft_fails_the_article(self) -> None:
-        def writer(state):
-            return {"research_notes": dict(RESEARCH), "draft": {}}
-
+    def test_writer_without_draft_fails_the_article(self) -> None:
         graph = build_editorial_graph(
-            writer=writer,
+            researcher=lambda state: {
+                "research_notes": dict(RESEARCH),
+                "status": "RESEARCHED",
+            },
+            writer=lambda state: {"draft": {}},
             reviewer=lambda state: {"review": review("PASS")},
             publisher=lambda state: {"published": True},
             max_revisions=1,
@@ -126,6 +138,20 @@ class GraphTests(unittest.TestCase):
             self.invoke(graph)
         self.assertEqual("writer", context.exception.stage)
         self.assertIsInstance(context.exception.cause, SchemaError)
+
+    def test_invalid_researcher_decision_fails_the_article(self) -> None:
+        graph = build_editorial_graph(
+            researcher=lambda state: {
+                "research_notes": dict(RESEARCH, decision="MAYBE"),
+            },
+            writer=lambda state: {"draft": dict(DRAFT)},
+            reviewer=lambda state: {"review": review("PASS")},
+            publisher=lambda state: {"published": True},
+            max_revisions=1,
+        )
+        with self.assertRaises(NodeExecutionError) as context:
+            self.invoke(graph)
+        self.assertEqual("researcher", context.exception.stage)
 
 
 if __name__ == "__main__":

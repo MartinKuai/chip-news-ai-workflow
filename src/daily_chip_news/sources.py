@@ -6,7 +6,10 @@ import re
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import feedparser
 import requests
@@ -125,6 +128,121 @@ _READER_METADATA_PREFIXES = (
 )
 _MARKDOWN_IMAGE = re.compile(r"^!\[[^\]]*\]\([^)]*\)$")
 _MARKDOWN_RULE = re.compile(r"^(?:-{3,}|\*{3,}|_{3,})$")
+
+_TRACKING_QUERY_PREFIXES = ("utm_", "fbclid", "gclid", "mc_cid", "mc_eid")
+_JUNK_TITLE_SUBSTRINGS = (
+    "advertisement",
+    "sponsored",
+    "we're hiring",
+    "we are hiring",
+    "job opening",
+    "招聘",
+    "广告",
+    "newsletter",
+)
+_JUNK_TITLE_EXACT = frozenset(
+    {
+        "home",
+        "about",
+        "about us",
+        "contact",
+        "contact us",
+        "subscribe",
+        "newsletter",
+        "sign in",
+        "log in",
+        "privacy policy",
+        "terms of service",
+        "rss",
+    }
+)
+_JUNK_URL_PATTERNS = ("/jobs/", "/careers/", "/advertise", "/subscribe", "/newsletter")
+_MIN_TITLE_LENGTH = 6
+
+
+def canonical_url(url: str) -> str:
+    """Normalize a URL for deterministic cross-source deduplication."""
+    parsed = urlsplit((url or "").strip())
+    scheme = (parsed.scheme or "https").lower()
+    netloc = parsed.netloc.lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    query_pairs = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=False)
+        if not key.lower().startswith(_TRACKING_QUERY_PREFIXES)
+    ]
+    path = parsed.path.rstrip("/") or "/"
+    return urlunsplit((scheme, netloc, path, urlencode(sorted(query_pairs)), ""))
+
+
+def _recency_key(value: str) -> float:
+    text = (value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return parsedate_to_datetime(text).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _looks_like_junk(article: Article) -> bool:
+    title = str(article.get("title", "")).strip().lower()
+    url = str(article.get("url", "")).lower()
+    if len(title) < _MIN_TITLE_LENGTH:
+        return True
+    if title in _JUNK_TITLE_EXACT:
+        return True
+    if any(pattern in title for pattern in _JUNK_TITLE_SUBSTRINGS):
+        return True
+    return any(pattern in url for pattern in _JUNK_URL_PATTERNS)
+
+
+def select_candidates(
+    articles: Iterable[Article],
+    *,
+    limit: int,
+    max_per_source: int | None = None,
+) -> list[Article]:
+    """Deterministic, zero-Gemini candidate control.
+
+    Canonical-URL dedupe, obvious junk removal, then round-robin source
+    diversity with recency ordering inside each source.
+    """
+    if limit < 1:
+        return []
+    grouped: dict[str, list[Article]] = {}
+    seen: set[str] = set()
+    for article in articles:
+        key = canonical_url(article.get("url", ""))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        if _looks_like_junk(article):
+            continue
+        source = str(article.get("source", "")).strip() or "unknown"
+        grouped.setdefault(source, []).append(article)
+
+    queues: list[list[Article]] = []
+    for items in grouped.values():
+        items.sort(key=lambda item: _recency_key(item.get("published_at", "")), reverse=True)
+        queues.append(items[:max_per_source] if max_per_source else items)
+
+    selected: list[Article] = []
+    while queues and len(selected) < limit:
+        next_round: list[list[Article]] = []
+        for queue in queues:
+            if len(selected) >= limit:
+                break
+            selected.append(queue.pop(0))
+            if queue:
+                next_round.append(queue)
+        queues = next_round
+    return selected
 
 
 def clean_extracted_text(raw: str, *, max_chars: int) -> str:

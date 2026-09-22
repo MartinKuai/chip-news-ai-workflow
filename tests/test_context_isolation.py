@@ -3,12 +3,11 @@ from __future__ import annotations
 import json
 import unittest
 
-from _support import ARTICLE, DRAFT, RESEARCH, SRC, CaptureClient, review, writer_output  # noqa: F401
+from _support import ARTICLE, DRAFT, RESEARCH, SRC, CaptureClient, research_output, review  # noqa: F401
 from daily_chip_news.gemini import GeminiAPIError, GeminiResponseError
 from daily_chip_news.health import HealthEvent
-from daily_chip_news.nodes import ReviewerNode, WriterNode
+from daily_chip_news.nodes import ResearcherNode, ReviewerNode, WriterNode
 from daily_chip_news.schemas import SchemaError
-from daily_chip_news.sources import SourceError
 
 
 class ExplodingClient:
@@ -21,68 +20,61 @@ class ExplodingClient:
         raise self._exc
 
 
-def body_extractor(text: str = "Body line.\n" * 40):
-    def extractor(url: str) -> str:
-        return text
+class ContextBoundaryTests(unittest.TestCase):
+    def test_researcher_is_the_only_node_that_sees_the_raw_article(self) -> None:
+        client = CaptureClient(research_output(), DRAFT, review("PASS"))
+        researcher = ResearcherNode(
+            client, "researcher-model", lambda url: "Body line.\n" * 30
+        )
+        research_update = researcher({"article": ARTICLE})
+        self.assertIn("raw_content", client.calls[0]["payload"])
 
-    return extractor
+        writer = WriterNode(client, "writer-model")
+        draft_update = writer({"article": ARTICLE, **research_update})
+        writer_payload = client.calls[1]["payload"]
+        self.assertEqual(
+            {
+                "editorial_brief",
+                "research_notes",
+                "revision_brief",
+                "output_schema",
+            },
+            set(writer_payload),
+        )
+        self.assertNotIn("raw_content", json.dumps(writer_payload))
 
+        ReviewerNode(client, "review-model")(
+            {"article": ARTICLE, **research_update, **draft_update}
+        )
+        reviewer_payload = client.calls[2]["payload"]
+        self.assertEqual(
+            {"research_notes", "draft", "rubric", "output_schema"},
+            set(reviewer_payload),
+        )
+        self.assertNotIn("raw_content", json.dumps(reviewer_payload))
 
-class WriterContextTests(unittest.TestCase):
-    def test_compose_payload_is_allow_listed_and_deterministically_cleaned(self) -> None:
-        client = CaptureClient(writer_output())
-        writer = WriterNode(client, "writer-model", body_extractor())
-        update = writer(
+    def test_writer_compose_payload_has_no_previous_draft_or_raw_text(self) -> None:
+        client = CaptureClient(DRAFT)
+        WriterNode(client, "writer-model")(
             {
                 "article": ARTICLE,
+                "research_notes": RESEARCH,
                 "revision_brief": [],
-                "raw_article": "must not leak",
                 "raw_content": "must not leak",
+                "raw_article": "must not leak",
                 "review": {"must": "not leak"},
             }
         )
         payload = client.calls[0]["payload"]
-        self.assertEqual(
-            {
-                "mode",
-                "article_metadata",
-                "raw_content",
-                "editorial_scope",
-                "editorial_brief",
-                "output_schema",
-            },
-            set(payload),
-        )
-        self.assertEqual("compose", payload["mode"])
-        self.assertEqual("Body line.", payload["raw_content"].splitlines()[0])
-        self.assertEqual("DRAFTED", update["status"])
+        self.assertNotIn("previous_draft", payload)
         serialized = json.dumps(payload)
         self.assertNotIn("must not leak", serialized)
-        for forbidden in ("raw_article", "researcher_prompt"):
+        for forbidden in ("raw_content", "raw_article", "reviewer"):
             self.assertNotIn(forbidden, serialized)
 
-    def test_writer_strips_reader_metadata_before_the_model_call(self) -> None:
-        raw = (
-            "Title: HBM update\n\n"
-            "URL Source: https://example.com/hbm\n\n"
-            "Markdown Content:\n"
-            "Body line.\n" * 1
-        )
-        client = CaptureClient(writer_output())
-        WriterNode(client, "writer-model", body_extractor(raw))(
-            {"article": ARTICLE, "revision_brief": []}
-        )
-        content = client.calls[0]["payload"]["raw_content"]
-        self.assertNotIn("Title:", content)
-        self.assertNotIn("URL Source:", content)
-        self.assertIn("Body line.", content)
-
-    def test_revise_payload_reuses_notes_without_refetching_the_source(self) -> None:
-        def exploding_extractor(url: str) -> str:
-            raise AssertionError("revision must not refetch the source")
-
-        client = CaptureClient(writer_output())
-        writer = WriterNode(client, "writer-model", exploding_extractor)
+    def test_writer_revision_uses_previous_draft_and_keeps_notes(self) -> None:
+        client = CaptureClient(DRAFT)
+        writer = WriterNode(client, "writer-model")
         writer(
             {
                 "article": ARTICLE,
@@ -95,34 +87,21 @@ class WriterContextTests(unittest.TestCase):
         payload = client.calls[0]["payload"]
         self.assertEqual(
             {
-                "mode",
-                "article_metadata",
-                "research_notes",
-                "previous_draft",
-                "revision_brief",
                 "editorial_brief",
+                "research_notes",
+                "revision_brief",
                 "output_schema",
+                "previous_draft",
             },
             set(payload),
         )
-        self.assertEqual("revise", payload["mode"])
         self.assertEqual(DRAFT, payload["previous_draft"])
+        self.assertEqual(RESEARCH, payload["research_notes"])
         self.assertNotIn("raw_content", json.dumps(payload))
 
-    def test_revision_cannot_change_the_research_notes(self) -> None:
-        altered = writer_output()
-        altered["topic"] = "changed topic"
-        altered["notes"] = [
-            {
-                "claim": "A brand new unsupported claim.",
-                "evidence": "Invented during revision.",
-                "why_it_matters": "Should never replace the original notes.",
-                "confidence": 0.4,
-            }
-        ]
-        client = CaptureClient(altered)
-        writer = WriterNode(client, "writer-model", body_extractor())
-        update = writer(
+    def test_writer_does_not_change_research_notes(self) -> None:
+        client = CaptureClient(DRAFT)
+        update = WriterNode(client, "writer-model")(
             {
                 "article": ARTICLE,
                 "research_notes": RESEARCH,
@@ -130,74 +109,50 @@ class WriterContextTests(unittest.TestCase):
                 "revision_brief": ["缩短标题"],
             }
         )
-        self.assertEqual(RESEARCH, update["research_notes"])
+        self.assertNotIn("research_notes", update)
+        self.assertEqual(DRAFT, update["draft"])
 
-    def test_writer_output_decision_skip_routes_to_skip(self) -> None:
-        from _support import skip_output
-
-        client = CaptureClient(skip_output())
-        update = WriterNode(client, "writer-model", body_extractor())(
-            {"article": ARTICLE, "revision_brief": []}
+    def test_three_nodes_route_to_three_models(self) -> None:
+        client = CaptureClient(research_output(), DRAFT, review("PASS"))
+        research_update = ResearcherNode(
+            client, "researcher-model", lambda url: "x" * 300
+        )({"article": ARTICLE})
+        draft_update = WriterNode(client, "writer-model")(
+            {"article": ARTICLE, **research_update}
         )
-        self.assertEqual("SKIP", update["status"])
-        self.assertEqual({}, update["draft"])
-        self.assertEqual("SKIP", update["research_notes"]["decision"])
+        ReviewerNode(client, "review-model")(
+            {"article": ARTICLE, **research_update, **draft_update}
+        )
+        self.assertEqual(
+            ["researcher-model", "writer-model", "review-model"],
+            [call["model"] for call in client.calls],
+        )
 
-    def test_writer_requests_quality_oriented_generation_settings(self) -> None:
-        client = CaptureClient(writer_output())
-        WriterNode(
+    def test_node_generation_settings_differ_by_role(self) -> None:
+        client = CaptureClient(research_output(), DRAFT, review("PASS"))
+        research_update = ResearcherNode(
+            client,
+            "researcher-model",
+            lambda url: "x" * 300,
+            thinking_level="low",
+            max_output_tokens=3072,
+        )({"article": ARTICLE})
+        draft_update = WriterNode(
             client,
             "writer-model",
-            body_extractor(),
-            thinking_level="medium",
-            max_output_tokens=16384,
-        )({"article": ARTICLE, "revision_brief": []})
-        call = client.calls[0]
-        self.assertEqual("writer", call["purpose"])
-        self.assertEqual("medium", call["thinking_level"])
-        self.assertEqual(16384, call["max_output_tokens"])
-        self.assertIsNotNone(call["output_schema"])
-        self.assertEqual("writer-model", call["model"])
-
-    def test_writer_makes_exactly_one_call_for_a_valid_article(self) -> None:
-        client = CaptureClient(writer_output())
-        WriterNode(client, "writer-model", body_extractor())(
-            {"article": ARTICLE, "revision_brief": []}
-        )
-        self.assertEqual(1, len(client.calls))
-
-    def test_empty_cleaned_content_is_a_source_error(self) -> None:
-        from daily_chip_news.sources import SourceError
-
-        client = CaptureClient(writer_output())
-        writer = WriterNode(client, "writer-model", body_extractor(""))
-        with self.assertRaises(SourceError):
-            writer({"article": ARTICLE, "revision_brief": []})
-        self.assertEqual([], client.calls)
-
-    def test_content_is_truncated_by_the_configured_budget(self) -> None:
-        client = CaptureClient(writer_output())
-        writer = WriterNode(
-            client, "writer-model", body_extractor("x" * 5000), max_content_chars=2000
-        )
-        writer({"article": ARTICLE, "revision_brief": []})
-        content = client.calls[0]["payload"]["raw_content"]
-        self.assertLessEqual(len(content), 2000 + len("\n[content truncated]"))
-        self.assertIn("[content truncated]", content)
-
-
-class ReviewerContextTests(unittest.TestCase):
-    def test_reviewer_uses_lower_reasoning_and_its_own_schema(self) -> None:
-        client = CaptureClient(review("PASS"))
+            thinking_level="low",
+            max_output_tokens=2560,
+        )({"article": ARTICLE, **research_update})
         ReviewerNode(
-            client, "review-model", thinking_level="low", max_output_tokens=8192
-        )({"article": ARTICLE, "research_notes": RESEARCH, "draft": DRAFT})
-        call = client.calls[0]
-        self.assertEqual("reviewer", call["purpose"])
-        self.assertEqual("low", call["thinking_level"])
-        self.assertEqual(8192, call["max_output_tokens"])
-        self.assertIsNotNone(call["output_schema"])
-        self.assertEqual("review-model", call["model"])
+            client,
+            "review-model",
+            thinking_level="low",
+            max_output_tokens=1024,
+        )({"article": ARTICLE, **research_update, **draft_update})
+        self.assertEqual(
+            [("researcher", 3072), ("writer", 2560), ("reviewer", 1024)],
+            [(call["purpose"], call["max_output_tokens"]) for call in client.calls],
+        )
 
     def test_reviewer_cannot_pass_below_qa_threshold(self) -> None:
         weak_pass = review("PASS")
@@ -208,19 +163,6 @@ class ReviewerContextTests(unittest.TestCase):
                 {"article": ARTICLE, "research_notes": RESEARCH, "draft": DRAFT}
             )
 
-    def test_writer_and_reviewer_keep_separate_model_routing(self) -> None:
-        client = CaptureClient(writer_output(), review("PASS"))
-        writer_update = WriterNode(client, "writer-model", body_extractor())(
-            {"article": ARTICLE, "revision_brief": []}
-        )
-        ReviewerNode(client, "review-model")(
-            {"article": ARTICLE, **writer_update}
-        )
-        self.assertEqual(
-            ["writer-model", "review-model"],
-            [call["model"] for call in client.calls],
-        )
-
 
 class HealthRecordingTests(unittest.TestCase):
     """One logical AI call must produce exactly one health event."""
@@ -228,11 +170,10 @@ class HealthRecordingTests(unittest.TestCase):
     def test_writer_success_records_one_event(self) -> None:
         events = []
         WriterNode(
-            CaptureClient(writer_output()),
+            CaptureClient(DRAFT),
             "writer-model",
-            body_extractor(),
             health_recorder=events.append,
-        )({"article": ARTICLE, "revision_brief": []})
+        )({"article": ARTICLE, "research_notes": RESEARCH, "revision_brief": []})
         self.assertEqual([HealthEvent.SUCCESS], events)
 
     def test_reviewer_success_records_one_event(self) -> None:
@@ -251,11 +192,10 @@ class HealthRecordingTests(unittest.TestCase):
                 GeminiAPIError("HTTP 503", status_code=503, transient=True)
             ),
             "writer-model",
-            body_extractor(),
             health_recorder=events.append,
         )
         with self.assertRaises(GeminiAPIError):
-            node({"article": ARTICLE, "revision_brief": []})
+            node({"article": ARTICLE, "research_notes": RESEARCH, "revision_brief": []})
         self.assertEqual([HealthEvent.TRANSIENT_FAILURE], events)
 
     def test_reviewer_transient_exhaustion_records_one_transient_event(self) -> None:
@@ -276,44 +216,24 @@ class HealthRecordingTests(unittest.TestCase):
         node = WriterNode(
             ExplodingClient(GeminiResponseError("invalid json")),
             "writer-model",
-            body_extractor(),
             health_recorder=events.append,
         )
         with self.assertRaises(GeminiResponseError):
-            node({"article": ARTICLE, "revision_brief": []})
+            node({"article": ARTICLE, "research_notes": RESEARCH, "revision_brief": []})
         self.assertEqual([HealthEvent.NON_TRANSIENT_FAILURE], events)
 
     def test_schema_failure_records_exactly_one_neutral_event(self) -> None:
         events = []
-        broken = writer_output()
-        broken["draft"] = {
-            "headline": "",
-            "summary": "",
-            "key_facts": [],
-            "why_it_matters": "",
-            "telegram_copy": "",
-        }
+        broken = dict(DRAFT)
+        broken["headline"] = ""
         node = WriterNode(
             CaptureClient(broken),
             "writer-model",
-            body_extractor(),
             health_recorder=events.append,
         )
         with self.assertRaises(SchemaError):
-            node({"article": ARTICLE, "revision_brief": []})
+            node({"article": ARTICLE, "research_notes": RESEARCH, "revision_brief": []})
         self.assertEqual([HealthEvent.NON_TRANSIENT_FAILURE], events)
-
-    def test_source_extraction_failure_records_no_health_event(self) -> None:
-        events = []
-        node = WriterNode(
-            CaptureClient(writer_output()),
-            "writer-model",
-            body_extractor(""),
-            health_recorder=events.append,
-        )
-        with self.assertRaises(SourceError):
-            node({"article": ARTICLE, "revision_brief": []})
-        self.assertEqual([], events)
 
     def test_configuration_error_records_no_health_event(self) -> None:
         events = []

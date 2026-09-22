@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from _support import SRC  # noqa: F401
+from daily_chip_news.cost_guard import CostGuardExceeded, CostGuardStopReason
 from daily_chip_news.errors import (
     AI_STAGES,
     FailureCategory,
@@ -85,13 +86,24 @@ class ClassifyFailureTests(unittest.TestCase):
         self.assertIs(FailureCategory.PUBLISH_ERROR, info.category)
         self.assertIsNone(health_event_for("publisher", info))
 
+    def test_cost_guard_stop_is_expected_and_never_touches_health(self) -> None:
+        info = classify_failure(
+            "researcher",
+            CostGuardExceeded(CostGuardStopReason.RUN_BUDGET, "over budget"),
+        )
+        self.assertIs(FailureCategory.COST_GUARD, info.category)
+        self.assertTrue(info.stop_run)
+        self.assertFalse(info.force_failed)
+        self.assertFalse(info.transient)
+        self.assertIsNone(health_event_for("researcher", info))
+
     def test_unknown_exception_forces_failed(self) -> None:
         info = classify_failure("graph", TypeError("bug"))
         self.assertIs(FailureCategory.UNEXPECTED_ERROR, info.category)
         self.assertTrue(info.force_failed)
 
     def test_health_window_only_covers_ai_stages(self) -> None:
-        self.assertEqual({"writer", "reviewer"}, set(AI_STAGES))
+        self.assertEqual({"researcher", "writer", "reviewer"}, set(AI_STAGES))
 
 
 if __name__ == "__main__":

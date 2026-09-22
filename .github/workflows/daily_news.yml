@@ -5,9 +5,22 @@ on:
     # GitHub Actions cron is UTC: 22:55 UTC = 06:55 Asia/Shanghai (UTC+08:00) next day.
     - cron: "55 22 * * *"
   workflow_dispatch:
+    inputs:
+      # Manual runs default to a very small paid budget; the code enforces a
+      # hard maximum of $0.10 and never bypasses the rolling 30-day budget.
+      paid_budget_usd:
+        description: "Max paid Gemini spend for this manual run, in USD (hard max 0.10)"
+        required: false
+        default: "0.05"
+      ledger_anchor_usd:
+        description: "Optional recovery only: re-anchor rolling spend after a lost ledger"
+        required: false
+        default: ""
 
 permissions:
   contents: read
+  # Required to read the previous run's cost ledger artifact.
+  actions: read
 
 concurrency:
   group: chip-news-ai-workflow
@@ -36,22 +49,54 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run Writer -> Reviewer workflow
+      - name: Prepare cost ledger
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          COST_LEDGER_PATH: .cost/ledger.jsonl
+          RUN_MODE: ${{ github.event_name == 'schedule' && 'scheduled' || 'manual' }}
+          MANUAL_RUN_BUDGET_USD: ${{ inputs.paid_budget_usd }}
+          LEDGER_ANCHOR_USD: ${{ inputs.ledger_anchor_usd }}
+          LEDGER_ANCHOR_NOTE: "workflow_dispatch recovery by ${{ github.actor }}"
+        run: python scripts/ledger_prepare.py
+
+      - name: Run Researcher -> Writer -> Reviewer workflow
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          RESEARCHER_MODEL: ${{ vars.RESEARCHER_MODEL }}
           WRITER_MODEL: ${{ vars.WRITER_MODEL }}
           REVIEWER_MODEL: ${{ vars.REVIEWER_MODEL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ARTICLES_PER_FEED: "2"
           MAX_REVISIONS: "1"
+          RUN_MODE: ${{ github.event_name == 'schedule' && 'scheduled' || 'manual' }}
+          MANUAL_RUN_BUDGET_USD: ${{ inputs.paid_budget_usd }}
+          COST_LEDGER_PATH: .cost/ledger.jsonl
+          COST_LEDGER_REQUIRED: "1"
           # Optional tuning lives in the code defaults; set them here only when
           # a change is needed:
-          # WRITER_THINKING_LEVEL=medium | REVIEWER_THINKING_LEVEL=low
-          # WRITER_MAX_OUTPUT_TOKENS=16384 | REVIEWER_MAX_OUTPUT_TOKENS=8192
-          # ARTICLE_CONTENT_CHARS=16000
+          # RESEARCHER_THINKING_LEVEL=low | WRITER_THINKING_LEVEL=low
+          # REVIEWER_THINKING_LEVEL=low
+          # RESEARCHER_MAX_OUTPUT_TOKENS=3072 | WRITER_MAX_OUTPUT_TOKENS=2560
+          # REVIEWER_MAX_OUTPUT_TOKENS=1024
+          # ARTICLE_CONTENT_CHARS=12000 | MAX_CANDIDATES_PER_RUN=6
           # GEMINI_TIMEOUT_SECONDS=180 | GEMINI_MAX_ATTEMPTS=5
           # GEMINI_CALL_BUDGET_SECONDS=240 | GEMINI_STRUCTURED_OUTPUT=1
           # GEMINI_HEALTH_WINDOW=5 | GEMINI_HEALTH_THRESHOLD=3
+          # GEMINI_ROLLING_30D_BUDGET_USD=7.50 | SCHEDULED_RUN_BUDGET_USD=0.20
           # RUN_BUDGET_SECONDS=2100
         run: python main.py
+
+      - name: Upload cost ledger
+        # Always upload: a failed or interrupted run must still persist every
+        # reservation it made, otherwise the rolling budget would undercount.
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gemini-cost-ledger
+          path: .cost/ledger.jsonl
+          retention-days: 45
+          overwrite: true
+          if-no-files-found: warn

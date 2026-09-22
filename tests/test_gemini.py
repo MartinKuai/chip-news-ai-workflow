@@ -7,6 +7,11 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 from _support import SRC  # noqa: F401
+from daily_chip_news.cost_guard import (
+    CostGuard,
+    CostGuardExceeded,
+    CostGuardStopReason,
+)
 from daily_chip_news.gemini import (
     GeminiAPIError,
     GeminiClient,
@@ -25,14 +30,30 @@ SCHEMA = {
 }
 
 
-def envelope(text: str, finish: str = "STOP") -> dict:
-    return {
+def envelope(text: str, finish: str = "STOP", usage: dict | None = None) -> dict:
+    value = {
         "candidates": [
             {
                 "content": {"parts": [{"text": text}]},
                 "finishReason": finish,
             }
         ]
+    }
+    if usage is not None:
+        value["usageMetadata"] = usage
+    return value
+
+
+def usage_metadata(
+    prompt: int,
+    candidate: int,
+    thought: int = 0,
+) -> dict:
+    return {
+        "promptTokenCount": prompt,
+        "candidatesTokenCount": candidate,
+        "thoughtsTokenCount": thought,
+        "totalTokenCount": prompt + candidate + thought,
     }
 
 
@@ -50,12 +71,21 @@ class FakeResponse:
 
 
 class FakeSession:
-    def __init__(self, *responses):
+    def __init__(self, *responses, count_tokens: int = 1_000, count_responses=None):
         self.responses = list(responses)
+        self.count_tokens = count_tokens
+        self.count_responses = list(count_responses or [])
         self.calls = []
 
     def post(self, url, **kwargs):
         self.calls.append((url, kwargs))
+        if ":countTokens" in url:
+            if self.count_responses:
+                response = self.count_responses.pop(0)
+                if isinstance(response, Exception):
+                    raise response
+                return response
+            return FakeResponse(200, {"totalTokens": self.count_tokens})
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -119,6 +149,288 @@ class JsonParsingTests(unittest.TestCase):
     def test_arrays_and_empty_text_are_rejected(self) -> None:
         self.assertIsNone(parse_json_object("[1,2]"))
         self.assertIsNone(parse_json_object(""))
+
+
+class UsageAccountingTests(unittest.TestCase):
+    def test_usage_metadata_is_accounted_per_purpose(self) -> None:
+        metrics = RunMetrics()
+        session = FakeSession(
+            FakeResponse(200, envelope('{"ok":true}', usage=usage_metadata(1_000, 200, 100)))
+        )
+        request(
+            make_client(session, metrics=metrics),
+            model="gemini-3.5-flash-lite",
+            purpose="researcher",
+        )
+        totals = metrics.usage_for("researcher")
+        self.assertEqual(1_000, totals.prompt_tokens)
+        self.assertEqual(200, totals.candidate_tokens)
+        self.assertEqual(100, totals.thought_tokens)
+        self.assertEqual(1_300, totals.total_tokens)
+        self.assertEqual(1, totals.billable_requests)
+        expected = 1_000 * 0.30 / 1_000_000 + 300 * 2.50 / 1_000_000
+        self.assertAlmostEqual(expected, totals.cost_usd, places=9)
+        self.assertAlmostEqual(expected, metrics.gemini_usage.cost_usd, places=9)
+
+    def test_thinking_tokens_are_billed_as_output(self) -> None:
+        metrics = RunMetrics()
+        session = FakeSession(
+            FakeResponse(
+                200, envelope('{"ok":true}', usage=usage_metadata(0, 1_000, 500))
+            ),
+            FakeResponse(
+                200, envelope('{"ok":true}', usage=usage_metadata(0, 1_500, 0))
+            ),
+        )
+        client = make_client(session, metrics=metrics)
+        request(client, model="gemini-3.7-flash", purpose="writer")
+        request(client, model="gemini-3.7-flash", purpose="writer")
+        # 1_000+500 visible/thinking and 1_500+0 both bill 3_000 output tokens.
+        self.assertAlmostEqual(
+            metrics.usage_for("writer").cost_usd, 3_000 * 4.50 / 1_000_000, places=9
+        )
+
+    def test_retry_then_success_counts_one_billable_request(self) -> None:
+        metrics = RunMetrics()
+        session = FakeSession(
+            FakeResponse(503, {}),
+            FakeResponse(
+                200, envelope('{"ok":true}', usage=usage_metadata(500, 100))
+            ),
+        )
+        request(
+            make_client(session, metrics=metrics, max_attempts=3),
+            model="gemini-3.5-flash-lite",
+            purpose="researcher",
+        )
+        self.assertEqual(1, metrics.usage_for("researcher").billable_requests)
+        self.assertEqual(1, metrics.gemini_requests - 1)  # one 503 + one 200
+
+    def test_each_successful_call_is_billed_separately(self) -> None:
+        metrics = RunMetrics()
+        session = FakeSession(
+            FakeResponse(
+                200, envelope('{"ok":true}', usage=usage_metadata(100, 10))
+            ),
+            FakeResponse(
+                200, envelope('{"ok":true}', usage=usage_metadata(200, 20))
+            ),
+        )
+        client = make_client(session, metrics=metrics)
+        request(client, model="gemini-3.5-flash-lite", purpose="researcher")
+        request(client, model="gemini-3.5-flash-lite", purpose="researcher")
+        totals = metrics.usage_for("researcher")
+        self.assertEqual(300, totals.prompt_tokens)
+        self.assertEqual(2, totals.billable_requests)
+
+    def test_json_repair_response_is_billed_separately(self) -> None:
+        metrics = RunMetrics()
+        session = FakeSession(
+            FakeResponse(
+                200, envelope("not json", usage=usage_metadata(400, 50))
+            ),
+            FakeResponse(
+                200, envelope('{"ok":true}', usage=usage_metadata(500, 60))
+            ),
+        )
+        request(
+            make_client(session, metrics=metrics),
+            model="gemini-3.6-flash",
+            purpose="writer",
+            output_schema=SCHEMA,
+        )
+        totals = metrics.usage_for("writer")
+        self.assertEqual(2, totals.billable_requests)
+        self.assertEqual(900, totals.prompt_tokens)
+        self.assertEqual(110, totals.candidate_tokens)
+
+    def test_missing_usage_metadata_is_flagged_without_fabricating_cost(self) -> None:
+        metrics = RunMetrics()
+        session = FakeSession(FakeResponse(200, envelope('{"ok":true}')))
+        request(
+            make_client(session, metrics=metrics),
+            model="gemini-3.5-flash-lite",
+            purpose="researcher",
+        )
+        self.assertEqual(1, metrics.usage_missing_responses)
+        self.assertEqual(0, metrics.gemini_usage.billable_requests)
+        self.assertEqual(0.0, metrics.gemini_usage.cost_usd)
+
+    def test_unpriced_model_is_flagged_without_fabricating_cost(self) -> None:
+        metrics = RunMetrics()
+        session = FakeSession(
+            FakeResponse(
+                200, envelope('{"ok":true}', usage=usage_metadata(100, 10))
+            )
+        )
+        request(
+            make_client(session, metrics=metrics),
+            model="gemini-9.9-unpriced",
+            purpose="writer",
+        )
+        self.assertEqual(1, metrics.pricing_unknown_requests)
+        self.assertEqual(0.0, metrics.gemini_usage.cost_usd)
+
+
+class CostGuardClientTests(unittest.TestCase):
+    """The guard must authorize every billable attempt before it is sent."""
+
+    def make_guard(self, **overrides) -> CostGuard:
+        values = {"run_budget_usd": 0.20, "rolling_budget_usd": 7.50}
+        values.update(overrides)
+        return CostGuard(**values)
+
+    def test_count_tokens_precedes_generation_with_the_same_input(self) -> None:
+        session = FakeSession(
+            FakeResponse(
+                200, envelope('{"ok":true}', usage=usage_metadata(4_000, 100))
+            ),
+            count_tokens=4_000,
+        )
+        guard = self.make_guard()
+        result = request(
+            make_client(session, cost_guard=guard),
+            model="gemini-3.5-flash-lite",
+            purpose="researcher",
+            max_output_tokens=3_072,
+        )
+        self.assertEqual({"ok": True}, result)
+        self.assertIn(":countTokens", session.calls[0][0])
+        self.assertIn(":generateContent", session.calls[1][0])
+        count_body = session.calls[0][1]["json"]
+        generate_body = session.calls[1][1]["json"]
+        self.assertEqual(
+            count_body["systemInstruction"], generate_body["systemInstruction"]
+        )
+        self.assertEqual(count_body["contents"], generate_body["contents"])
+        expected = 4_000 * 0.30 / 1_000_000 + 100 * 2.50 / 1_000_000
+        self.assertAlmostEqual(expected, guard.run_spend_usd, places=9)
+        self.assertAlmostEqual(expected, guard.rolling_spend_usd, places=9)
+
+    def test_run_budget_blocks_before_any_generation_request(self) -> None:
+        session = FakeSession(
+            FakeResponse(200, envelope('{"ok":true}')), count_tokens=1_000_000
+        )
+        guard = self.make_guard(run_budget_usd=0.0001)
+        with self.assertRaises(CostGuardExceeded) as context:
+            request(
+                make_client(session, cost_guard=guard),
+                model="gemini-3.5-flash-lite",
+                purpose="researcher",
+                max_output_tokens=3_072,
+            )
+        self.assertIs(CostGuardStopReason.RUN_BUDGET, context.exception.reason)
+        self.assertEqual(1, len(session.calls))
+        self.assertIn(":countTokens", session.calls[0][0])
+        self.assertEqual(0.0, guard.run_spend_usd)
+
+    def test_rolling_budget_blocks_before_any_generation_request(self) -> None:
+        session = FakeSession(
+            FakeResponse(200, envelope('{"ok":true}')), count_tokens=100_000
+        )
+        guard = self.make_guard(rolling_spend_usd=7.4999)
+        with self.assertRaises(CostGuardExceeded) as context:
+            request(
+                make_client(session, cost_guard=guard),
+                model="gemini-3.5-flash-lite",
+                purpose="researcher",
+                max_output_tokens=3_072,
+            )
+        self.assertIs(CostGuardStopReason.ROLLING_BUDGET, context.exception.reason)
+        self.assertEqual(1, len(session.calls))
+
+    def test_unknown_pricing_fails_closed_before_any_network_call(self) -> None:
+        session = FakeSession(FakeResponse(200, envelope('{"ok":true}')))
+        guard = self.make_guard()
+        with self.assertRaises(CostGuardExceeded) as context:
+            request(
+                make_client(session, cost_guard=guard),
+                model="gemini-9.9-unknown",
+                purpose="writer",
+                max_output_tokens=2_560,
+            )
+        self.assertIs(CostGuardStopReason.PRICING, context.exception.reason)
+        self.assertEqual(0, len(session.calls))
+
+    def test_count_tokens_failure_fails_closed_without_generation(self) -> None:
+        session = FakeSession(
+            FakeResponse(200, envelope('{"ok":true}')),
+            count_responses=[FakeResponse(503, {})],
+        )
+        guard = self.make_guard()
+        with self.assertRaises(CostGuardExceeded) as context:
+            request(
+                make_client(session, cost_guard=guard),
+                model="gemini-3.5-flash-lite",
+                purpose="researcher",
+                max_output_tokens=3_072,
+            )
+        self.assertIs(CostGuardStopReason.COUNT_TOKENS, context.exception.reason)
+        self.assertEqual(1, len(session.calls))
+
+    def test_retry_releases_the_failed_attempt_and_reconciles_the_success(self) -> None:
+        events = []
+        session = FakeSession(
+            FakeResponse(503, {}),
+            FakeResponse(
+                200, envelope('{"ok":true}', usage=usage_metadata(4_000, 100))
+            ),
+            count_tokens=4_000,
+        )
+        guard = self.make_guard(recorder=lambda event, res, usage: events.append(event))
+        request(
+            make_client(session, cost_guard=guard, max_attempts=3),
+            model="gemini-3.5-flash-lite",
+            purpose="researcher",
+            max_output_tokens=3_072,
+        )
+        expected = 4_000 * 0.30 / 1_000_000 + 100 * 2.50 / 1_000_000
+        self.assertAlmostEqual(expected, guard.run_spend_usd, places=9)
+        self.assertEqual(["reservation", "release", "reservation", "reconcile"], events)
+
+    def test_timeout_keeps_the_reservation_charged(self) -> None:
+        events = []
+        session = FakeSession(requests.Timeout("slow"), count_tokens=4_000)
+        guard = self.make_guard(recorder=lambda event, res, usage: events.append(event))
+        with self.assertRaises(GeminiAPIError):
+            request(
+                make_client(session, cost_guard=guard, max_attempts=1),
+                model="gemini-3.5-flash-lite",
+                purpose="researcher",
+                max_output_tokens=3_072,
+            )
+        projected = 4_000 * 1.05 * 0.30 / 1_000_000 + 3_072 * 2.50 / 1_000_000
+        self.assertAlmostEqual(projected, guard.run_spend_usd, places=9)
+        self.assertEqual(["reservation", "reconcile"], events)
+
+    def test_json_repair_is_authorized_as_its_own_billable_call(self) -> None:
+        events = []
+        session = FakeSession(
+            FakeResponse(200, envelope("not json", usage=usage_metadata(4_000, 50))),
+            FakeResponse(
+                200, envelope('{"ok":true}', usage=usage_metadata(500, 60))
+            ),
+            count_tokens=4_000,
+        )
+        guard = self.make_guard(recorder=lambda event, res, usage: events.append(event))
+        request(
+            make_client(session, cost_guard=guard),
+            model="gemini-3.5-flash-lite",
+            purpose="researcher",
+            max_output_tokens=3_072,
+            output_schema=SCHEMA,
+        )
+        expected = (
+            4_000 * 0.30 / 1_000_000
+            + 50 * 2.50 / 1_000_000
+            + 500 * 0.30 / 1_000_000
+            + 60 * 2.50 / 1_000_000
+        )
+        self.assertAlmostEqual(expected, guard.run_spend_usd, places=9)
+        # The nested repair reservation/reconcile completes before the outer one.
+        self.assertEqual(
+            ["reservation", "reservation", "reconcile", "reconcile"], events
+        )
 
 
 class GeminiClientTests(unittest.TestCase):

@@ -7,6 +7,7 @@ from daily_chip_news.sources import (
     SourceCollectionError,
     clean_extracted_text,
     collect_articles,
+    select_candidates,
 )
 
 
@@ -189,6 +190,97 @@ class CleanExtractedTextTests(unittest.TestCase):
     def test_empty_input_stays_empty(self) -> None:
         self.assertEqual("", clean_extracted_text("", max_chars=1000))
         self.assertEqual("", clean_extracted_text("\n\n\n", max_chars=1000))
+
+
+class CandidateSelectionTests(unittest.TestCase):
+    def article(
+        self,
+        index: int,
+        *,
+        source: str = "Source A",
+        title: str | None = None,
+        url: str | None = None,
+        published: str = "Mon, 21 Sep 2026 10:00:00 +0000",
+    ) -> dict[str, str]:
+        return {
+            "title": title or f"Semiconductor story number {index}",
+            "source": source,
+            "url": url or f"https://example.com/story-{index}",
+            "published_at": published,
+        }
+
+    def test_limit_caps_the_selection(self) -> None:
+        items = [self.article(index) for index in range(10)]
+        selected = select_candidates(items, limit=6)
+        self.assertEqual(6, len(selected))
+
+    def test_canonical_dedupe_ignores_tracking_params_and_fragments(self) -> None:
+        items = [
+            self.article(
+                1, url="https://www.example.com/story?utm_source=rss#section"
+            ),
+            self.article(2, url="https://example.com/story"),
+            self.article(3, url="https://example.com/story?fbclid=abc"),
+        ]
+        selected = select_candidates(items, limit=6)
+        self.assertEqual(1, len(selected))
+
+    def test_obvious_junk_is_removed(self) -> None:
+        items = [
+            self.article(1, title="Advertisement: buy this now"),
+            self.article(2, title="We're hiring engineers now"),
+            self.article(3, title="Hi"),
+            self.article(4, title="Home"),
+            self.article(5, url="https://example.com/jobs/123"),
+            self.article(6),
+        ]
+        selected = select_candidates(items, limit=6)
+        self.assertEqual(1, len(selected))
+        self.assertEqual("https://example.com/story-6", selected[0]["url"])
+
+    def test_short_but_real_titles_survive(self) -> None:
+        items = [
+            self.article(1, title="HBM 量产"),
+            self.article(2, title="Intel cuts jobs"),
+        ]
+        selected = select_candidates(items, limit=6)
+        self.assertEqual(2, len(selected))
+
+    def test_round_robin_preserves_source_diversity(self) -> None:
+        items = [
+            self.article(1, source="Source A"),
+            self.article(2, source="Source A"),
+            self.article(3, source="Source A"),
+            self.article(4, source="Source B"),
+            self.article(5, source="Source B"),
+            self.article(6, source="Source B"),
+        ]
+        selected = select_candidates(items, limit=4)
+        self.assertEqual(
+            ["Source A", "Source B", "Source A", "Source B"],
+            [item["source"] for item in selected],
+        )
+
+    def test_recency_orders_within_a_source(self) -> None:
+        items = [
+            self.article(1, published="Mon, 21 Sep 2026 08:00:00 +0000"),
+            self.article(2, published="Mon, 21 Sep 2026 12:00:00 +0000"),
+            self.article(3, published="Mon, 21 Sep 2026 10:00:00 +0000"),
+        ]
+        selected = select_candidates(items, limit=1)
+        self.assertEqual("https://example.com/story-2", selected[0]["url"])
+
+    def test_zero_limit_selects_nothing(self) -> None:
+        items = [self.article(1)]
+        self.assertEqual([], select_candidates(items, limit=0))
+
+    def test_selection_is_deterministic(self) -> None:
+        items = [self.article(index) for index in range(8)]
+        first = select_candidates(items, limit=6)
+        second = select_candidates(items, limit=6)
+        self.assertEqual(
+            [item["url"] for item in first], [item["url"] for item in second]
+        )
 
 
 if __name__ == "__main__":

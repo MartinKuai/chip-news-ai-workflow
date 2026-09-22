@@ -48,10 +48,24 @@ class DecisionTests(unittest.TestCase):
     def test_program_fault_forces_failed_even_after_publishing(self) -> None:
         self.assertIs(RunOutcome.FAILED, self.decide(published=2, force_failed=True))
 
+    def test_cost_guard_stop_is_not_an_infrastructure_failure(self) -> None:
+        self.assertIs(
+            RunOutcome.COST_GUARD_STOPPED,
+            self.decide(published=0, failed=1, cost_guard_stopped=True),
+        )
+        self.assertEqual(0, exit_code_for(RunOutcome.COST_GUARD_STOPPED))
+
+    def test_program_fault_wins_over_a_cost_guard_stop(self) -> None:
+        self.assertIs(
+            RunOutcome.FAILED,
+            self.decide(published=1, cost_guard_stopped=True, force_failed=True),
+        )
+
     def test_exit_codes_match_github_semantics(self) -> None:
         self.assertEqual(0, exit_code_for(RunOutcome.SUCCESS))
         self.assertEqual(0, exit_code_for(RunOutcome.PARTIAL_SUCCESS))
         self.assertEqual(0, exit_code_for(RunOutcome.EMPTY_SUCCESS))
+        self.assertEqual(0, exit_code_for(RunOutcome.COST_GUARD_STOPPED))
         self.assertEqual(1, exit_code_for(RunOutcome.FAILED))
 
 

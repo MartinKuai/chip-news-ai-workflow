@@ -11,6 +11,7 @@ class RunOutcome(str, Enum):
     SUCCESS = "SUCCESS"
     PARTIAL_SUCCESS = "PARTIAL_SUCCESS"
     EMPTY_SUCCESS = "EMPTY_SUCCESS"
+    COST_GUARD_STOPPED = "COST_GUARD_STOPPED"
     FAILED = "FAILED"
 
 
@@ -25,10 +26,15 @@ def decide_run_outcome(
     breaker_opened: bool,
     budget_exceeded: bool,
     force_failed: bool,
+    cost_guard_stopped: bool = False,
 ) -> RunOutcome:
     """Decide the run outcome without mixing article failures and workflow failures."""
     if force_failed:
         return RunOutcome.FAILED
+    if cost_guard_stopped:
+        # Protecting the budget is an expected operational state: GitHub Actions
+        # must not paint it as an infrastructure failure.
+        return RunOutcome.COST_GUARD_STOPPED
     if published > 0:
         if failed > 0 or breaker_opened or budget_exceeded:
             return RunOutcome.PARTIAL_SUCCESS

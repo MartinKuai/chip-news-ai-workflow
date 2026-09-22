@@ -123,25 +123,6 @@ def validate_research_notes(value: Any) -> ResearchNotes:
     }
 
 
-def validate_writer_output(
-    value: Any,
-    *,
-    source: str,
-    url: str,
-    published_at: str,
-) -> tuple[ResearchNotes, Draft | None]:
-    """Validate the merged research+writing output of one Writer call."""
-    data = _mapping(value, "Writer output")
-    notes_input = dict(data)
-    notes_input["source"] = source
-    notes_input["url"] = url
-    notes_input["published_at"] = published_at
-    notes = validate_research_notes(notes_input)
-    if notes["decision"] == "SKIP":
-        return notes, None
-    return notes, validate_draft(data.get("draft"))
-
-
 def validate_draft(value: Any) -> Draft:
     data = _mapping(value, "Writer output")
     facts = data.get("key_facts")

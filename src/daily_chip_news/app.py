@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from collections.abc import Callable, Iterable
+from pathlib import Path
 from typing import Any, TypedDict
 
 from dotenv import load_dotenv
 
 from .config import ConfigError, Settings
+from .cost_guard import CostGuard, CostGuardExceeded
 from .errors import FailureCategory, classify_failure
 from .graph import NodeExecutionError, create_runtime_graph
 from .health import ServiceHealth
+from .ledger import CostLedger, LedgerCorruptError, LedgerReadError
 from .metrics import RunMetrics
 from .outcomes import RunOutcome, decide_run_outcome, exit_code_for
 from .publisher import TelegramPublisher
@@ -21,6 +25,7 @@ from .sources import (
     SourceCollectionError,
     SourceCollectionResult,
     collect_articles,
+    select_candidates,
 )
 
 
@@ -95,6 +100,14 @@ def _stage_failures(failures: list[FailureRecord], stage: str) -> int:
     return sum(1 for failure in failures if failure["stage"] == stage)
 
 
+def _usage_line(usage: Any) -> str:
+    return (
+        f"prompt={usage.prompt_tokens} candidate={usage.candidate_tokens} "
+        f"thought={usage.thought_tokens} requests={usage.billable_requests} "
+        f"cost_usd={usage.cost_usd:.6f}"
+    )
+
+
 def _latest_status_code(failures: list[FailureRecord]) -> int | None:
     for failure in reversed(failures):
         if failure["status_code"] is not None:
@@ -105,11 +118,14 @@ def _latest_status_code(failures: list[FailureRecord]) -> int | None:
 def _config_line(settings: Settings) -> str:
     return (
         "Daily Chip News config"
+        f" | researcher_model={settings.researcher_model}"
         f" | writer_model={settings.writer_model}"
         f" | reviewer_model={settings.reviewer_model}"
+        f" | researcher_thinking={settings.researcher_thinking_level or 'default'}"
         f" | writer_thinking={settings.writer_thinking_level or 'default'}"
         f" | reviewer_thinking={settings.reviewer_thinking_level or 'default'}"
-        f" | max_output_tokens={settings.writer_max_output_tokens}"
+        f" | max_output_tokens={settings.researcher_max_output_tokens}"
+        f"/{settings.writer_max_output_tokens}"
         f"/{settings.reviewer_max_output_tokens}"
         f" | request_timeout={settings.gemini_timeout_seconds:.0f}s"
         f" | max_attempts={settings.gemini_max_attempts}"
@@ -118,6 +134,9 @@ def _config_line(settings: Settings) -> str:
         f"/{settings.health_failure_threshold}"
         f" | max_revisions={settings.max_revisions}"
         f" | run_budget={settings.run_budget_seconds:.0f}s"
+        f" | run_mode={settings.run_mode}"
+        f" | run_budget_usd={settings.run_budget_usd:.4f}"
+        f" | rolling_30d_budget_usd={settings.gemini_rolling_30d_budget_usd:.2f}"
     )
 
 
@@ -129,10 +148,13 @@ def _print_summary(
     outcome: RunOutcome,
     metrics: RunMetrics,
     health: ServiceHealth,
+    cost_guard: CostGuard,
+    ledger: CostLedger | None,
     breaker_opened: bool,
     budget_exceeded: bool,
 ) -> None:
     categories = _failure_categories(failures)
+    researcher_failures = _stage_failures(failures, "researcher")
     writer_failures = _stage_failures(failures, "writer")
     reviewer_failures = _stage_failures(failures, "reviewer")
     writer_calls = stats["processed"] + stats["revisions"]
@@ -144,6 +166,8 @@ def _print_summary(
     print(f"  sources_total: {stats['sources_total']}")
     print(f"  sources_ok: {stats['sources_ok']}")
     print(f"  sources_failed: {stats['sources_failed']}")
+    print(f"  discovered: {stats['discovered']}")
+    print(f"  selected: {stats['selected']}")
     print(f"  candidates: {stats['candidates']}")
     print(f"  processed: {stats['processed']}")
     print(f"  published: {stats['published']}")
@@ -181,7 +205,8 @@ def _print_summary(
     print(f"  failed: {stats['sources_failed']}")
 
     print("Articles:")
-    print(f"  discovered: {stats['candidates']}")
+    print(f"  discovered: {stats['discovered']}")
+    print(f"  selected: {stats['selected']}")
     print(f"  eligible: {stats['eligible']}")
     print(f"  processed: {stats['processed']}")
     print(f"  published: {stats['published']}")
@@ -210,6 +235,43 @@ def _print_summary(
     print(f"  breaker_triggered: {'yes' if breaker_opened else 'no'}")
     print(f"  health_window: {health.snapshot()}")
 
+    print("Gemini Cost:")
+    print(f"  prompt_tokens: {metrics.gemini_usage.prompt_tokens}")
+    print(f"  candidate_tokens: {metrics.gemini_usage.candidate_tokens}")
+    print(f"  thought_tokens: {metrics.gemini_usage.thought_tokens}")
+    print(f"  total_tokens: {metrics.gemini_usage.total_tokens}")
+    print(
+        "  successful_billable_requests: "
+        f"{metrics.gemini_usage.billable_requests}"
+    )
+    print(f"  estimated_cost_usd: {metrics.gemini_usage.cost_usd:.6f}")
+    print(f"  run_budget_usd: {cost_guard.run_budget_usd:.6f}")
+    print(f"  run_spend_usd: {cost_guard.run_spend_usd:.6f}")
+    print(f"  remaining_run_budget_usd: {cost_guard.remaining_run_budget_usd:.6f}")
+    rolling_spend = (
+        ledger.rolling_spend_usd()
+        if ledger is not None
+        else cost_guard.rolling_spend_usd
+    )
+    print(f"  rolling_30d_spend_usd: {rolling_spend:.6f}")
+    print(f"  rolling_30d_budget_usd: {cost_guard.rolling_budget_usd:.2f}")
+    print(
+        "  remaining_30d_budget_usd: "
+        f"{max(0.0, cost_guard.rolling_budget_usd - rolling_spend):.6f}"
+    )
+    print(
+        f"  cost_guard_triggered: {'yes' if cost_guard.state.triggered else 'no'}"
+    )
+    print(f"  cost_guard_reason: {cost_guard.state.reason or 'none'}")
+    print(f"  usage_missing_responses: {metrics.usage_missing_responses}")
+    print(f"  pricing_unknown_requests: {metrics.pricing_unknown_requests}")
+
+    print("Researcher:")
+    print(f"  calls: {stats['processed']}")
+    print(f"  success: {max(0, stats['processed'] - researcher_failures)}")
+    print(f"  failures: {researcher_failures}")
+    print(f"  usage: {_usage_line(metrics.usage_for('researcher'))}")
+
     print("Writer:")
     print(f"  calls: {writer_calls}")
     print(f"  success: {max(0, writer_calls - writer_failures)}")
@@ -217,12 +279,14 @@ def _print_summary(
     print(f"  failures: {writer_failures}")
     print(f"  json_repair_attempts: {metrics.repairs_for('writer')}")
     print(f"  json_repair_success: {metrics.repair_success_for('writer')}")
+    print(f"  usage: {_usage_line(metrics.usage_for('writer'))}")
 
     print("Reviewer:")
     print(f"  calls: {reviewer_calls}")
     print(f"  success: {max(0, reviewer_calls - reviewer_failures)}")
     print(f"  rejected: {stats['held']}")
     print(f"  failures: {reviewer_failures}")
+    print(f"  usage: {_usage_line(metrics.usage_for('reviewer'))}")
 
 
 def _alert_lines(
@@ -234,6 +298,7 @@ def _alert_lines(
     breaker_opened: bool,
     fatal_failure: GlobalWorkflowError | None,
     status_code: int | None,
+    cost_guard_reason: str | None = None,
 ) -> list[str]:
     lines = [
         title,
@@ -255,6 +320,8 @@ def _alert_lines(
         lines.append(f"Categories: {summary}")
     if breaker_opened:
         lines.append("Breaker: open")
+    if cost_guard_reason:
+        lines.append(f"Cost guard: {cost_guard_reason}")
     if status_code is not None:
         lines.append(f"HTTP status: {status_code}")
     return lines
@@ -295,6 +362,8 @@ def _empty_stats() -> dict[str, int]:
         "sources_total": 0,
         "sources_ok": 0,
         "sources_failed": 0,
+        "discovered": 0,
+        "selected": 0,
         "candidates": 0,
         "eligible": 0,
         "processed": 0,
@@ -314,6 +383,7 @@ def run_daily(
     alert_publisher: Callable[[str], None] | None = None,
     clock: Callable[[], float] = time.monotonic,
     health: ServiceHealth | None = None,
+    cost_guard: CostGuard | None = None,
 ) -> dict[str, Any]:
     """Process every independent item and return stats plus the run outcome."""
     print(_config_line(settings))
@@ -321,6 +391,105 @@ def run_daily(
     health = health or ServiceHealth(
         settings.health_window_size, settings.health_failure_threshold
     )
+
+    # --- rolling cost ledger (fail closed when it cannot be trusted) -------
+    ledger_path_raw = os.environ.get("COST_LEDGER_PATH", "").strip()
+    ledger_required = os.environ.get("COST_LEDGER_REQUIRED", "0").strip() == "1"
+    run_id = os.environ.get("GITHUB_RUN_ID", "local")
+    ledger: CostLedger | None = None
+    ledger_error = ""
+    ledger_path: Path | None = None
+    if ledger_path_raw:
+        ledger_path = Path(ledger_path_raw)
+        try:
+            if ledger_path.exists():
+                ledger = CostLedger.load(ledger_path)
+                print(
+                    "Cost ledger loaded | "
+                    f"entries={len(ledger.entries)} "
+                    f"| rolling_30d_spend_usd={ledger.rolling_spend_usd():.6f}"
+                )
+            elif ledger_required:
+                # The prepare step always creates the ledger; a missing file in
+                # CI means artifact storage lost it, so fail closed.
+                raise LedgerReadError(
+                    f"required cost ledger is missing at {ledger_path}"
+                )
+            else:
+                ledger = CostLedger.empty()
+                print("Cost ledger initialized | reason=no ledger file yet")
+        except (LedgerCorruptError, LedgerReadError) as exc:
+            ledger = None
+            ledger_error = str(exc)
+    elif ledger_required:
+        ledger_error = "COST_LEDGER_REQUIRED=1 but COST_LEDGER_PATH is not set"
+
+    if ledger_error:
+        print(
+            f"Cost ledger unavailable: {ledger_error} | action=fail_closed",
+            file=sys.stderr,
+        )
+        stats = _empty_stats()
+        fatal_failure = GlobalWorkflowError(
+            "ledger", "LedgerUnavailable", force_failed=True
+        )
+        report_guard = CostGuard(
+            run_budget_usd=settings.run_budget_usd,
+            rolling_budget_usd=settings.gemini_rolling_30d_budget_usd,
+        )
+        print("Run outcome decision | reason=cost-ledger-unavailable -> FAILED")
+        _print_summary(
+            stats,
+            [],
+            [],
+            outcome=RunOutcome.FAILED,
+            metrics=metrics,
+            health=health,
+            cost_guard=report_guard,
+            ledger=None,
+            breaker_opened=False,
+            budget_exceeded=False,
+        )
+        _send_alert(
+            alert_publisher,
+            _alert_lines(
+                "⚠️ Daily Chip News 运行失败",
+                RunOutcome.FAILED,
+                stats,
+                [],
+                breaker_opened=False,
+                fatal_failure=fatal_failure,
+                status_code=None,
+            ),
+        )
+        return _final_result(stats, RunOutcome.FAILED)
+
+    def record_cost_event(event, reservation, usage) -> None:
+        if ledger is None or ledger_path is None:
+            return
+        ledger.record_guard_event(
+            event, reservation, usage, run_id=run_id, mode=settings.run_mode
+        )
+        ledger.save(ledger_path)
+
+    guard = cost_guard or CostGuard(
+        run_budget_usd=settings.run_budget_usd,
+        rolling_budget_usd=settings.gemini_rolling_30d_budget_usd,
+        rolling_spend_usd=ledger.rolling_spend_usd() if ledger is not None else 0.0,
+        recorder=record_cost_event if ledger is not None else None,
+    )
+
+    def finalize_ledger() -> None:
+        if ledger is None or ledger_path is None:
+            return
+        ledger.resolve_run_open(run_id=run_id, actual_cost_usd=guard.run_spend_usd)
+        ledger.save(ledger_path)
+        print(
+            "Cost ledger finalized | "
+            f"run_id={run_id} | run_spend_usd={guard.run_spend_usd:.6f} "
+            f"| rolling_30d_spend_usd={ledger.rolling_spend_usd():.6f}"
+        )
+
     deadline = clock() + settings.run_budget_seconds
     runtime_graph = (
         graph
@@ -329,6 +498,7 @@ def run_daily(
             settings,
             metrics=metrics,
             health=health,
+            cost_guard=guard,
             run_deadline=deadline,
         )
     )
@@ -356,6 +526,7 @@ def run_daily(
             fatal_failure = GlobalWorkflowError(
                 "sources", "SourceCollectionError", force_failed=True
             )
+            finalize_ledger()
             print("Run outcome decision | reason=all-sources-unavailable -> FAILED")
             _print_summary(
                 stats,
@@ -364,6 +535,8 @@ def run_daily(
                 outcome=RunOutcome.FAILED,
                 metrics=metrics,
                 health=health,
+                cost_guard=guard,
+                ledger=ledger,
                 breaker_opened=False,
                 budget_exceeded=False,
             )
@@ -381,11 +554,21 @@ def run_daily(
             )
             return _final_result(stats, RunOutcome.FAILED)
 
-    candidates = collection.articles
+    candidates = select_candidates(
+        collection.articles, limit=settings.max_candidates_per_run
+    )
+    print(
+        "Candidate control | "
+        f"discovered={len(collection.articles)} "
+        f"| selected={len(candidates)} "
+        f"| limit={settings.max_candidates_per_run}"
+    )
     stats = {
         "sources_total": collection.sources_total,
         "sources_ok": collection.sources_ok,
         "sources_failed": collection.sources_failed,
+        "discovered": len(collection.articles),
+        "selected": len(candidates),
         "candidates": len(candidates),
         "eligible": 0,
         "processed": 0,
@@ -399,6 +582,7 @@ def run_daily(
     fatal_failure: GlobalWorkflowError | None = None
     breaker_opened = False
     budget_exceeded = False
+    cost_guard_stopped = False
     started = clock()
 
     for article in candidates:
@@ -439,16 +623,35 @@ def run_daily(
                 f"{status_suffix}"
             )
             if info.stop_run:
+                if info.category is FailureCategory.COST_GUARD:
+                    cost_guard_stopped = True
+                    if not guard.state.triggered and isinstance(
+                        cause, CostGuardExceeded
+                    ):
+                        guard.state.triggered = True
+                        guard.state.reason = cause.reason.value
+                        guard.state.details = dict(cause.details)
                 fatal_failure = GlobalWorkflowError(
                     exc.stage,
                     type(cause).__name__,
                     status_code=status_code,
                     force_failed=info.force_failed,
                 )
-                print(
-                    "Run outcome decision | reason=stop-run-failure "
-                    f"| stage={exc.stage} | category={info.category.value}"
-                )
+                if cost_guard_stopped:
+                    print(
+                        "Cost guard stopped the run | "
+                        f"reason={guard.state.reason or 'unknown'} "
+                        f"| details={guard.state.details} "
+                        f"| run_spend_usd={guard.run_spend_usd:.6f} "
+                        f"| rolling_30d_spend_usd={guard.rolling_spend_usd:.6f} "
+                        f"| published={stats['published']} "
+                        "| action=stop_processing"
+                    )
+                else:
+                    print(
+                        "Run outcome decision | reason=stop-run-failure "
+                        f"| stage={exc.stage} | category={info.category.value}"
+                    )
                 break
             if health.is_open:
                 breaker_opened = True
@@ -509,15 +712,18 @@ def run_daily(
         breaker_opened=breaker_opened,
         budget_exceeded=budget_exceeded,
         force_failed=bool(fatal_failure and fatal_failure.force_failed),
+        cost_guard_stopped=cost_guard_stopped,
     )
     print(
         "Run outcome decision | "
         f"published={stats['published']} | failed={stats['failed']} "
         f"| breaker={'open' if breaker_opened else 'closed'} "
         f"| budget_exceeded={'yes' if budget_exceeded else 'no'} "
+        f"| cost_guard_stopped={'yes' if cost_guard_stopped else 'no'} "
         f"| force_failed={'yes' if fatal_failure and fatal_failure.force_failed else 'no'} "
         f"-> {outcome.value} (exit {exit_code_for(outcome)})"
     )
+    finalize_ledger()
     _print_summary(
         stats,
         failures,
@@ -525,6 +731,8 @@ def run_daily(
         outcome=outcome,
         metrics=metrics,
         health=health,
+        cost_guard=guard,
+        ledger=ledger,
         breaker_opened=breaker_opened,
         budget_exceeded=budget_exceeded,
     )
@@ -544,6 +752,20 @@ def run_daily(
                 breaker_opened=breaker_opened,
                 fatal_failure=failure,
                 status_code=failure.status_code or _latest_status_code(failures),
+            ),
+        )
+    elif outcome is RunOutcome.COST_GUARD_STOPPED:
+        _send_alert(
+            alert_publisher,
+            _alert_lines(
+                "⚠️ Daily Chip News 成本保护停止",
+                outcome,
+                stats,
+                failures,
+                breaker_opened=breaker_opened,
+                fatal_failure=fatal_failure,
+                status_code=None,
+                cost_guard_reason=guard.state.reason,
             ),
         )
     elif outcome is RunOutcome.PARTIAL_SUCCESS:

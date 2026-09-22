@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import sys
 from pathlib import Path
 from typing import Any
@@ -45,32 +44,15 @@ DRAFT = {
     "telegram_copy": "HBM 供应动态：一家供应商公布了产能更新。",
 }
 
-WRITER_OUTPUT = {
-    "decision": "KEEP",
-    "reason": "Relevant supply-chain update",
-    "topic": "HBM supply",
-    "notes": copy.deepcopy(NOTES),
-    "draft": dict(DRAFT),
-}
 
-SKIP_OUTPUT = {
-    "decision": "SKIP",
-    "reason": "Not in editorial scope",
-    "topic": "",
-    "notes": [],
-    "draft": {},
-}
-
-
-def writer_output(**overrides: Any) -> dict[str, Any]:
-    """Return a fresh valid merged Writer output, with optional overrides."""
-    value = copy.deepcopy(WRITER_OUTPUT)
-    value.update(overrides)
-    return value
-
-
-def skip_output(**overrides: Any) -> dict[str, Any]:
-    value = copy.deepcopy(SKIP_OUTPUT)
+def research_output(**overrides: Any) -> dict[str, Any]:
+    """Researcher output without provenance (the node injects it)."""
+    value = {
+        "decision": "KEEP",
+        "reason": "Relevant supply-chain update",
+        "topic": "HBM supply",
+        "notes": [dict(note) for note in NOTES],
+    }
     value.update(overrides)
     return value
 

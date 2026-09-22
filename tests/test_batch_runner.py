@@ -3,15 +3,19 @@ from __future__ import annotations
 import io
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from _support import ARTICLE, SRC  # noqa: F401
 from daily_chip_news.app import run_daily
 from daily_chip_news.config import Settings
+from daily_chip_news.cost_guard import CostGuardExceeded, CostGuardStopReason
 from daily_chip_news.errors import classify_failure, health_event_for
 from daily_chip_news.gemini import GeminiAPIError, GeminiResponseError
 from daily_chip_news.graph import NodeExecutionError
 from daily_chip_news.health import HealthEvent, ServiceHealth
+from daily_chip_news.ledger import CostLedger
 from daily_chip_news.publisher import PublisherError
 from daily_chip_news.schemas import SchemaError
 from daily_chip_news.sources import (
@@ -25,6 +29,7 @@ from daily_chip_news.sources import (
 def settings(**overrides) -> Settings:
     values = {
         "gemini_api_key": "test-key",
+        "researcher_model": "researcher-model",
         "writer_model": "writer-model",
         "reviewer_model": "review-model",
         "telegram_bot_token": "test-token",
@@ -56,18 +61,22 @@ def skipped():
     return {"status": "SKIP", "published": False, "revision_count": 0}
 
 
-def service_error(status_code: int = 503):
+def service_error(stage: str = "researcher", status_code: int = 503):
     return NodeExecutionError(
-        "reviewer",
+        stage,
         GeminiAPIError("HTTP error", status_code=status_code, transient=True),
     )
+
+
+def schema_error(stage: str = "researcher"):
+    return NodeExecutionError(stage, SchemaError("invalid payload"))
 
 
 class ScriptedGraph:
     """Scripted articles plus the node-level health events the real nodes record.
 
-    One logical AI call records exactly one event: the Writer call, the Reviewer
-    call, and every revision call each get their own event. A failure before the
+    One logical AI call records exactly one event: Researcher, Writer, Reviewer
+    and every revision call each get their own event. A failure before the first
     Gemini call (source extraction) records nothing.
     """
 
@@ -90,9 +99,10 @@ class ScriptedGraph:
             self.health.record(HealthEvent.SUCCESS)
 
     def _record_success(self, outcome) -> None:
-        self._success()  # Writer call
+        self._success()  # Researcher call
         if outcome.get("status") == "SKIP":
             return
+        self._success()  # Writer call
         self._success()  # Reviewer call
         for _ in range(int(outcome.get("revision_count", 0))):
             self._success()  # revision Writer call
@@ -101,9 +111,13 @@ class ScriptedGraph:
     def _record_failure(self, exc: Exception) -> None:
         if self.health is None or not isinstance(exc, NodeExecutionError):
             return
-        if exc.stage == "reviewer":
-            self._success()  # the Writer call succeeded before the Reviewer failed
+        if exc.stage == "writer":
+            self._success()  # the Researcher call succeeded first
+        elif exc.stage == "reviewer":
+            self._success()
+            self._success()
         elif exc.stage == "publisher":
+            self._success()
             self._success()
             self._success()
             return
@@ -152,7 +166,7 @@ class BatchRunnerTests(unittest.TestCase):
     ) -> None:
         items = articles(5)
         graph = ScriptedGraph(
-            [passed(), passed(), passed(), service_error(), service_error(429)]
+            [passed(), passed(), passed(), service_error(), service_error(status_code=429)]
         )
         result, output = self.run_with_output(graph, items)
         self.assertEqual(5, result["processed"])
@@ -212,15 +226,12 @@ class BatchRunnerTests(unittest.TestCase):
 
     def test_schema_errors_do_not_reset_or_count_as_transient(self) -> None:
         items = articles(5)
-        schema_error = NodeExecutionError(
-            "reviewer", SchemaError("invalid review payload")
-        )
         graph = ScriptedGraph(
             [
                 service_error(),
-                schema_error,
+                schema_error(),
                 service_error(),
-                schema_error,
+                schema_error(),
                 service_error(),
             ]
         )
@@ -229,19 +240,34 @@ class BatchRunnerTests(unittest.TestCase):
         self.assertEqual(0, result["published"])
         self.assertEqual("FAILED", result["run_outcome"])
         self.assertIn("SCHEMA_INVALID: 2", output)
-        # Schema errors occupy window slots without erasing the transient
-        # history; per-call granularity then dilutes 3 transients across 10
-        # calls, so the breaker stays closed while the run still fails.
-        self.assertIn("health_window: window=[T,S,N,S,T] transient=2/5", output)
-        self.assertIn("breaker_triggered: no", output)
+        # NEUTRAL schema events do not count toward the threshold, but they also
+        # never reset the transient history, so the three transients still open
+        # the breaker.
+        self.assertIn("health_window: window=[T,N,T,N,T] transient=3/5", output)
+        self.assertIn("breaker_triggered: yes", output)
 
-    def test_writer_side_transient_burst_opens_the_breaker(self) -> None:
+    def test_schema_errors_alone_never_open_the_breaker(self) -> None:
         items = articles(6)
-        writer_error = NodeExecutionError(
-            "writer",
-            GeminiAPIError("HTTP 503", status_code=503, transient=True),
+        graph = ScriptedGraph(
+            [
+                service_error(),
+                service_error(),
+                schema_error(),
+                schema_error(),
+                schema_error(),
+                passed(),
+            ]
         )
-        graph = ScriptedGraph([writer_error] * 5 + [passed()])
+        result, output = self.run_with_output(graph, items)
+        self.assertEqual(6, result["processed"])
+        self.assertEqual(5, result["failed"])
+        self.assertEqual(1, result["published"])
+        self.assertIn("breaker_triggered: no", output)
+        self.assertEqual("PARTIAL_SUCCESS", result["run_outcome"])
+
+    def test_researcher_side_transient_burst_opens_the_breaker(self) -> None:
+        items = articles(6)
+        graph = ScriptedGraph([service_error()] * 5 + [passed()])
         result, output = self.run_with_output(graph, items)
         self.assertEqual(5, result["processed"])
         self.assertEqual("FAILED", result["run_outcome"])
@@ -269,7 +295,7 @@ class BatchRunnerTests(unittest.TestCase):
     def test_all_candidates_skipped_is_empty_success_exit_0(self) -> None:
         items = articles(2)
         graph = ScriptedGraph([skipped(), skipped()])
-        result, output = self.run_with_output(graph, items)
+        result, _ = self.run_with_output(graph, items)
         self.assertEqual(0, result["published"])
         self.assertEqual(0, result["failed"])
         self.assertEqual("EMPTY_SUCCESS", result["run_outcome"])
@@ -319,7 +345,7 @@ class BatchRunnerTests(unittest.TestCase):
         graph = ScriptedGraph(
             [
                 NodeExecutionError(
-                    "writer", SourceError("source body unavailable")
+                    "researcher", SourceError("source body unavailable")
                 ),
                 passed(),
             ]
@@ -374,7 +400,7 @@ class BatchRunnerTests(unittest.TestCase):
                 passed(),
             ]
         )
-        result, output = self.run_with_output(graph, items)
+        result, _ = self.run_with_output(graph, items)
         self.assertEqual(["Article 0"], graph.calls)
         self.assertEqual("FAILED", result["run_outcome"])
         self.assertEqual(1, result["exit_code"])
@@ -498,6 +524,31 @@ class BatchRunnerTests(unittest.TestCase):
         self.assertEqual(0, result["exit_code"])
         self.assertIn("Run budget reached", output.getvalue())
 
+    def test_cost_guard_stop_is_exit_0_with_alert_and_no_health_damage(self) -> None:
+        items = articles(3)
+        stop = NodeExecutionError(
+            "researcher",
+            CostGuardExceeded(CostGuardStopReason.RUN_BUDGET, "over budget"),
+        )
+        graph = ScriptedGraph([passed(), stop, passed()])
+        alerts = []
+        result, output = self.run_with_output(
+            graph, items, alert_publisher=alerts.append
+        )
+        self.assertEqual(1, result["published"])
+        self.assertEqual("COST_GUARD_STOPPED", result["run_outcome"])
+        self.assertEqual(0, result["exit_code"])
+        self.assertIn("cost_guard_triggered: yes", output)
+        self.assertIn("cost_guard_reason: run_budget", output)
+        self.assertIn("COST_GUARD: 1", output)
+        # Budget protection is not a Gemini service failure.
+        self.assertIn("breaker_triggered: no", output)
+        self.assertIn("health_window: window=[S,S,S] transient=0/3", output)
+        self.assertEqual(1, len(alerts))
+        self.assertIn("成本保护停止", alerts[0])
+        self.assertIn("Cost guard: run_budget", alerts[0])
+        self.assertEqual(["Article 0", "Article 1"], graph.calls)
+
     def test_summary_reports_grouped_sections(self) -> None:
         items = articles(3)
         graph = ScriptedGraph([passed(), skipped(), service_error()])
@@ -514,8 +565,108 @@ class BatchRunnerTests(unittest.TestCase):
             "breaker_triggered:",
             "health_window:",
             "failure_categories:",
+            "estimated_cost_usd:",
+            "run_budget_usd:",
+            "remaining_run_budget_usd:",
+            "rolling_30d_budget_usd:",
+            "remaining_30d_budget_usd:",
+            "cost_guard_triggered:",
+            "cost_guard_reason:",
         ):
             self.assertIn(field, output)
+
+
+class CostLedgerIntegrationTests(unittest.TestCase):
+    """The run must persist and trust the rolling ledger."""
+
+    def run_with_env(self, graph, items, env):
+        output = io.StringIO()
+        with patch.dict("os.environ", env, clear=False):
+            with redirect_stdout(output):
+                result = run_daily(
+                    settings(),
+                    graph=graph,
+                    articles=items,
+                    alert_publisher=None,
+                )
+        return result, output.getvalue()
+
+    def test_required_ledger_missing_fails_closed_without_processing(self) -> None:
+        with TemporaryDirectory() as directory:
+            missing = str(Path(directory) / "ledger.jsonl")
+            graph = ScriptedGraph([passed()])
+            result, output = self.run_with_env(
+                graph,
+                articles(1),
+                {"COST_LEDGER_PATH": missing, "COST_LEDGER_REQUIRED": "1"},
+            )
+        self.assertEqual([], graph.calls)
+        self.assertEqual("FAILED", result["run_outcome"])
+        self.assertEqual(1, result["exit_code"])
+        self.assertIn("cost-ledger-unavailable", output)
+
+    def test_corrupt_ledger_fails_closed_without_processing(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            path.write_text("not a ledger", encoding="utf-8")
+            graph = ScriptedGraph([passed()])
+            result, output = self.run_with_env(
+                graph,
+                articles(1),
+                {"COST_LEDGER_PATH": str(path), "COST_LEDGER_REQUIRED": "1"},
+            )
+        self.assertEqual([], graph.calls)
+        self.assertEqual("FAILED", result["run_outcome"])
+        self.assertIn("cost-ledger-unavailable", output)
+
+    def test_missing_ledger_without_requirement_initializes_and_finalizes(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            graph = ScriptedGraph([passed()])
+            result, output = self.run_with_env(
+                graph,
+                articles(1),
+                {"COST_LEDGER_PATH": str(path), "COST_LEDGER_REQUIRED": "0"},
+            )
+            self.assertTrue(path.exists())
+            ledger = CostLedger.load(path)
+        self.assertEqual("SUCCESS", result["run_outcome"])
+        self.assertIn("Cost ledger initialized", output)
+        self.assertIn("Cost ledger finalized", output)
+        self.assertEqual(0.0, ledger.rolling_spend_usd())
+
+    def test_run_open_reservation_is_resolved_even_when_sources_fail(self) -> None:
+        collection = SourceCollectionResult(
+            articles=[],
+            sources_total=5,
+            sources_ok=0,
+            sources_failed=5,
+            failures=[SourceFailure("https://failed.example/rss", "ValueError")],
+        )
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.jsonl"
+            prepared = CostLedger.empty()
+            prepared.append_run_open(
+                run_id="local", projected_cost_usd=0.05, mode="manual"
+            )
+            prepared.save(path)
+            graph = ScriptedGraph([])
+            output = io.StringIO()
+            with patch.dict(
+                "os.environ",
+                {"COST_LEDGER_PATH": str(path), "COST_LEDGER_REQUIRED": "1"},
+                clear=False,
+            ):
+                with patch(
+                    "daily_chip_news.app.collect_articles",
+                    side_effect=SourceCollectionError(collection),
+                ):
+                    with redirect_stdout(output):
+                        result = run_daily(settings(), graph=graph)
+            ledger = CostLedger.load(path)
+        self.assertEqual("FAILED", result["run_outcome"])
+        # The prepared run_open reservation must not linger at its full value.
+        self.assertEqual(0.0, ledger.rolling_spend_usd())
 
 
 if __name__ == "__main__":

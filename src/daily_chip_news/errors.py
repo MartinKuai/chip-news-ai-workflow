@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+from .cost_guard import CostGuardExceeded
 from .gemini import GeminiAPIError, GeminiResponseError, GeminiTruncatedResponseError
 from .health import HealthEvent
 from .publisher import PublisherError
@@ -25,6 +26,7 @@ class FailureCategory(str, Enum):
     SOURCE_ERROR = "SOURCE_ERROR"
     PUBLISH_ERROR = "PUBLISH_ERROR"
     CONFIG_ERROR = "CONFIG_ERROR"
+    COST_GUARD = "COST_GUARD"
     UNEXPECTED_ERROR = "UNEXPECTED_ERROR"
 
 
@@ -44,7 +46,7 @@ AI_ARTICLE_CATEGORIES = frozenset(
     }
 )
 
-AI_STAGES = frozenset({"writer", "reviewer"})
+AI_STAGES = frozenset({"researcher", "writer", "reviewer"})
 
 
 @dataclass(frozen=True)
@@ -61,6 +63,15 @@ class FailureInfo:
 
 def classify_failure(stage: str, cause: Exception) -> FailureInfo:
     """Map a node exception to one category and its run-level routing flags."""
+    if isinstance(cause, CostGuardExceeded):
+        # Budget protection is an expected operational stop: it must not be
+        # retried and must never look like a Gemini service failure.
+        return FailureInfo(
+            FailureCategory.COST_GUARD,
+            transient=False,
+            stop_run=True,
+            force_failed=False,
+        )
     if isinstance(cause, GeminiTruncatedResponseError):
         return FailureInfo(
             FailureCategory.MODEL_RESPONSE_TRUNCATED,
