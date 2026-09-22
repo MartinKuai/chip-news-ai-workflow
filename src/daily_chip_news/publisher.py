@@ -1,4 +1,4 @@
-"""Deterministic Telegram publishing, outside the three AI agents."""
+"""Deterministic Telegram publishing, outside the AI nodes."""
 
 from __future__ import annotations
 
@@ -33,12 +33,16 @@ class TelegramPublisher:
         chat_id: str,
         *,
         timeout: float = 15.0,
+        enabled: bool = True,
         session: requests.Session | None = None,
+        logger: Any = print,
     ) -> None:
         self._url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         self._chat_id = chat_id
         self._timeout = timeout
+        self._enabled = enabled
         self._session = session or requests.Session()
+        self._logger = logger
 
     def publish(self, message: str, source_url: str) -> None:
         self._deliver(f"{message}\n\n原文：{source_url}")
@@ -48,6 +52,12 @@ class TelegramPublisher:
         self._deliver(message)
 
     def _deliver(self, final_text: str) -> None:
+        if not self._enabled:
+            self._log(
+                f"Telegram delivery skipped | reason=publish-disabled "
+                f"| chars={len(final_text)}"
+            )
+            return
         markdown_payload = {
             "chat_id": self._chat_id,
             "text": final_text,
@@ -75,14 +85,16 @@ class TelegramPublisher:
 
     def _post(self, payload: dict[str, Any]) -> requests.Response:
         try:
-            return self._session.post(
-                self._url, json=payload, timeout=self._timeout
-            )
+            return self._session.post(self._url, json=payload, timeout=self._timeout)
         except requests.RequestException:
             # Do not include the exception because request URLs contain the bot token.
             raise PublisherError(
                 "Telegram network request failed", transient=True
             ) from None
+
+    def _log(self, message: str) -> None:
+        if self._logger is not None:
+            self._logger(message)
 
 
 class PublisherNode:
@@ -99,6 +111,6 @@ class PublisherNode:
                 global_failure=True,
             )
         draft = state["draft"]
-        article = state["article"]
-        self._publisher.publish(draft["telegram_copy"], article["url"])
+        candidate = state["candidate"]
+        self._publisher.publish(draft["telegram_copy"], candidate["url"])
         return {"published": True, "status": "PASS"}

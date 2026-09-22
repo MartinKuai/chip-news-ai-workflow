@@ -4,4 +4,4 @@ from .researcher import ResearcherNode
 from .reviewer import ReviewerNode
 from .writer import WriterNode
 
-__all__ = ["ResearcherNode", "WriterNode", "ReviewerNode"]
+__all__ = ["ResearcherNode", "ReviewerNode", "WriterNode"]

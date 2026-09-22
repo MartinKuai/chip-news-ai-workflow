@@ -1,4 +1,4 @@
-"""Gemini REST client: bounded retries, structured output and defensive decoding."""
+"""Unified Gemini client: serialization, bounded retries, decoding and repair."""
 
 from __future__ import annotations
 
@@ -6,24 +6,18 @@ import json
 import random
 import re
 import time
+from collections.abc import Callable
 from email.utils import parsedate_to_datetime
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 from urllib.parse import quote
 
 import requests
 
-from .cost import (
-    PricingUnavailableError,
-    UsageTotals,
-    lookup_price,
-    usage_totals_from_metadata,
-)
-from .cost_guard import CostGuard, CostGuardExceeded, CostGuardStopReason, Reservation
 from .metrics import RunMetrics
 
 
 class GeminiError(RuntimeError):
-    """Base class for Gemini failures; the batch runner decides their scope."""
+    """Base class for Gemini failures; the runner decides their scope."""
 
 
 class GeminiAPIError(GeminiError):
@@ -79,6 +73,7 @@ REPAIR_INSTRUCTION = """
 
 _FENCED_JSON = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 _THINKING_FIELDS = ("thinkingconfig", "thinking_level", "thinkinglevel")
+_API_ROOT = "https://generativelanguage.googleapis.com/v1beta/models/"
 
 
 def retry_after_seconds(value: str | None, *, now: float | None = None) -> float | None:
@@ -130,11 +125,10 @@ class GeminiClient:
         max_attempts: int = 5,
         max_backoff: float = 30.0,
         backoff_base: float = 2.0,
-        call_budget_seconds: float = 300.0,
+        call_budget_seconds: float = 240.0,
         retry_after_cap: float = 120.0,
         structured_output: bool = True,
         run_deadline: float | None = None,
-        cost_guard: CostGuard | None = None,
         session: requests.Session | None = None,
         sleep: Callable[[float], None] = time.sleep,
         random_fn: Callable[[float, float], float] = random.uniform,
@@ -163,7 +157,6 @@ class GeminiClient:
         self._retry_after_cap = retry_after_cap
         self._structured_output = structured_output
         self._run_deadline = run_deadline
-        self._cost_guard = cost_guard
         self._session = session or requests.Session()
         self._sleep = sleep
         self._random = random_fn
@@ -241,10 +234,7 @@ class GeminiClient:
         allow_repair: bool,
         deadline: float,
     ) -> dict[str, Any]:
-        url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{quote(model, safe='-._')}:generateContent"
-        )
+        url = f"{_API_ROOT}{quote(model, safe='-._')}:generateContent"
         headers = {
             "Content-Type": "application/json",
             "x-goog-api-key": self._api_key,
@@ -268,31 +258,17 @@ class GeminiClient:
             ),
         }
         last_error: GeminiAPIError | None = None
-        prompt_tokens: int | None = None
-        if self._cost_guard is not None:
-            # Fail fast on unknown or expired pricing before any network call.
-            self._cost_guard.price_for(model)
-            prompt_tokens = self._count_tokens(
-                model=model, body=body, deadline=deadline, purpose=purpose
-            )
 
         for attempt in range(1, self._max_attempts + 1):
             remaining = deadline - self._now()
             if remaining <= 0:
                 self._log(
                     f"Gemini deadline reached | purpose={purpose or 'n/a'} "
-                    f"| attempt={attempt}/{self._max_attempts} | reason=call-budget-exhausted"
+                    f"| attempt={attempt}/{self._max_attempts} "
+                    "| reason=call-budget-exhausted"
                 )
                 raise last_error or GeminiAPIError(
                     "Gemini request deadline reached", transient=True
-                )
-            reservation: Reservation | None = None
-            if self._cost_guard is not None:
-                reservation = self._cost_guard.authorize(
-                    model=model,
-                    purpose=purpose,
-                    prompt_tokens=prompt_tokens or 0,
-                    max_output_tokens=max_output_tokens,
                 )
             self._metrics.gemini_requests += 1
             try:
@@ -304,9 +280,6 @@ class GeminiClient:
                 )
             except requests.RequestException:
                 self._metrics.transient_network += 1
-                if reservation is not None:
-                    # Ambiguous outcome: the provider may already have billed it.
-                    self._cost_guard.keep(reservation)
                 last_error = GeminiAPIError(
                     "Gemini network request failed", transient=True
                 )
@@ -329,7 +302,7 @@ class GeminiClient:
 
             if response.status_code == 200:
                 self._metrics.gemini_success += 1
-                data, usage = self._decode(
+                return self._decode(
                     response,
                     model=model,
                     system_instruction=system_instruction,
@@ -341,24 +314,17 @@ class GeminiClient:
                     allow_repair=allow_repair,
                     deadline=deadline,
                 )
-                if reservation is not None:
-                    self._cost_guard.reconcile(reservation, usage)
-                return data
 
             if (
                 response.status_code == 400
                 and thinking_level
                 and self._mentions_thinking_config(response)
             ):
-                if reservation is not None:
-                    self._cost_guard.release(reservation)
                 raise _ThinkingConfigRejected()
 
             status_code = response.status_code
             retryable = status_code == 429 or 500 <= status_code < 600
             if retryable:
-                if reservation is not None:
-                    self._cost_guard.release(reservation)
                 if status_code == 429:
                     self._metrics.transient_rate_limit += 1
                 else:
@@ -386,8 +352,6 @@ class GeminiClient:
                 )
                 raise last_error
 
-            if reservation is not None:
-                self._cost_guard.release(reservation)
             self._log(
                 f"Gemini request failed | purpose={purpose or 'n/a'} "
                 f"| attempt={attempt}/{self._max_attempts} | http={status_code} "
@@ -403,65 +367,6 @@ class GeminiClient:
         raise last_error or GeminiAPIError(
             "Gemini request ended without a result", transient=True
         )
-
-    def _count_tokens(
-        self,
-        *,
-        model: str,
-        body: dict[str, Any],
-        deadline: float,
-        purpose: str,
-    ) -> int:
-        """Return the exact input token count for this request, or fail closed."""
-        url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{quote(model, safe='-._')}:countTokens"
-        )
-        count_body = {
-            "systemInstruction": body["systemInstruction"],
-            "contents": body["contents"],
-        }
-        remaining = deadline - self._now()
-        if remaining <= 0:
-            raise CostGuardExceeded(
-                CostGuardStopReason.COUNT_TOKENS,
-                "no time budget left for countTokens",
-                details={"model": model, "purpose": purpose},
-            )
-        try:
-            response = self._session.post(
-                url,
-                headers={"Content-Type": "application/json", "x-goog-api-key": self._api_key},
-                json=count_body,
-                timeout=max(1.0, min(self._timeout, remaining)),
-            )
-        except requests.RequestException as exc:
-            raise CostGuardExceeded(
-                CostGuardStopReason.COUNT_TOKENS,
-                "countTokens request failed",
-                details={"model": model, "purpose": purpose},
-            ) from exc
-        if response.status_code != 200:
-            raise CostGuardExceeded(
-                CostGuardStopReason.COUNT_TOKENS,
-                f"countTokens returned HTTP {response.status_code}",
-                details={"model": model, "purpose": purpose},
-            )
-        try:
-            total = response.json().get("totalTokens")
-        except (ValueError, AttributeError, TypeError) as exc:
-            raise CostGuardExceeded(
-                CostGuardStopReason.COUNT_TOKENS,
-                "countTokens response was unreadable",
-                details={"model": model, "purpose": purpose},
-            ) from exc
-        if not isinstance(total, int) or isinstance(total, bool) or total <= 0:
-            raise CostGuardExceeded(
-                CostGuardStopReason.COUNT_TOKENS,
-                "countTokens returned no usable totalTokens",
-                details={"model": model, "purpose": purpose},
-            )
-        return total
 
     def _generation_config(
         self,
@@ -491,16 +396,14 @@ class GeminiClient:
         max_output_tokens: int | None,
         allow_repair: bool,
         deadline: float,
-    ) -> tuple[dict[str, Any], UsageTotals | None]:
+    ) -> dict[str, Any]:
         try:
             envelope = response.json()
         except (ValueError, TypeError) as exc:
             self._metrics.response_invalid += 1
-            self._metrics.usage_missing_responses += 1
             raise GeminiResponseError(
                 "Gemini returned an unreadable structured response"
             ) from exc
-        usage = self._account_usage(envelope, model=model, purpose=purpose)
         try:
             candidate = envelope["candidates"][0]
             finish_reason = str(candidate.get("finishReason", "") or "").upper()
@@ -524,7 +427,7 @@ class GeminiClient:
 
         parsed = parse_json_object(str(text))
         if parsed is not None:
-            return parsed, usage
+            return parsed
 
         if allow_repair and output_schema:
             self._log(
@@ -541,39 +444,11 @@ class GeminiClient:
             )
             if repaired is not None:
                 self._metrics.record_repair(purpose, succeeded=True)
-                return repaired, usage
+                return repaired
             self._metrics.record_repair(purpose, succeeded=False)
 
         self._metrics.response_invalid += 1
         raise GeminiResponseError("Gemini returned invalid structured JSON output")
-
-    def _account_usage(
-        self,
-        envelope: Any,
-        *,
-        model: str,
-        purpose: str,
-    ) -> UsageTotals | None:
-        """Attribute one successful 200 response to the run's token/cost ledger."""
-        metadata = None
-        if isinstance(envelope, dict):
-            metadata = envelope.get("usageMetadata")
-        if metadata is None:
-            self._metrics.usage_missing_responses += 1
-            return None
-        try:
-            price = lookup_price(model)
-        except PricingUnavailableError:
-            # Pricing is enforced before every request; this is a safety net so
-            # an unpriced response never fabricates a cost.
-            self._metrics.pricing_unknown_requests += 1
-            return None
-        totals = usage_totals_from_metadata(metadata, price)
-        if totals is None:
-            self._metrics.usage_missing_responses += 1
-            return None
-        self._metrics.record_usage(purpose, totals)
-        return totals
 
     def _repair_json(
         self,
@@ -585,6 +460,7 @@ class GeminiClient:
         max_output_tokens: int | None,
         deadline: float,
     ) -> dict[str, Any] | None:
+        """Repair is a normal model call: same serialization, retries and deadline."""
         repair_payload = {
             "output_schema": output_schema,
             "invalid_output": text[:12000],
@@ -621,9 +497,7 @@ class GeminiClient:
             delay = min(retry_after, self._retry_after_cap)
         else:
             reason = "exponential-backoff"
-            delay = min(
-                self._backoff_base * (2 ** (attempt - 1)), self._max_backoff
-            )
+            delay = min(self._backoff_base * (2 ** (attempt - 1)), self._max_backoff)
         sleep_for = max(0.0, min(delay * self._random(0.7, 1.0), remaining))
         self._metrics.gemini_retries += 1
         self._log(
@@ -645,11 +519,7 @@ class GeminiClient:
         retry_after: float | None,
         deadline: float,
     ) -> None:
-        reason = (
-            "deadline-reached"
-            if self._now() >= deadline
-            else "attempts-exhausted"
-        )
+        reason = "deadline-reached" if self._now() >= deadline else "attempts-exhausted"
         self._log(
             f"Gemini gave up | purpose={purpose or 'n/a'} "
             f"| attempts={attempt}/{self._max_attempts} "

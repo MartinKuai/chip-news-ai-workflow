@@ -3,69 +3,63 @@ from __future__ import annotations
 import unittest
 
 from _support import SRC  # noqa: F401
-from daily_chip_news.outcomes import RunOutcome, decide_run_outcome, exit_code_for
+
+from daily_chip_news.outcomes import (
+    CandidateStatus,
+    RunOutcome,
+    decide_run_outcome,
+    exit_code_for,
+)
 
 
-class DecisionTests(unittest.TestCase):
-    def decide(self, **overrides) -> RunOutcome:
-        arguments = {
-            "published": 0,
-            "failed": 0,
-            "breaker_opened": False,
-            "budget_exceeded": False,
-            "force_failed": False,
-        }
-        arguments.update(overrides)
-        return decide_run_outcome(**arguments)
+class CandidateStatusTests(unittest.TestCase):
+    def test_statuses_are_the_simple_three(self) -> None:
+        self.assertEqual(
+            ["PUBLISHED", "SKIPPED", "FAILED"],
+            [status.value for status in CandidateStatus],
+        )
 
-    def test_five_successful_articles_are_success(self) -> None:
-        self.assertIs(RunOutcome.SUCCESS, self.decide(published=5))
 
-    def test_partial_failures_after_publishing_are_partial_success(self) -> None:
+class RunOutcomeTests(unittest.TestCase):
+    def test_success_requires_no_failures_and_no_early_stop(self) -> None:
+        outcome = decide_run_outcome(published=3, failed=0, stopped_early=False)
+        self.assertIs(RunOutcome.SUCCESS, outcome)
+
+    def test_all_skipped_is_still_success(self) -> None:
+        outcome = decide_run_outcome(published=0, failed=0, stopped_early=False)
+        self.assertIs(RunOutcome.SUCCESS, outcome)
+
+    def test_partial_success_needs_something_published(self) -> None:
         self.assertIs(
             RunOutcome.PARTIAL_SUCCESS,
-            self.decide(published=3, failed=2),
+            decide_run_outcome(published=1, failed=2, stopped_early=False),
         )
-
-    def test_breaker_after_publishing_is_partial_success(self) -> None:
         self.assertIs(
             RunOutcome.PARTIAL_SUCCESS,
-            self.decide(published=1, failed=2, breaker_opened=True),
+            decide_run_outcome(published=1, failed=0, stopped_early=True),
         )
 
-    def test_no_failures_and_nothing_published_is_empty_success(self) -> None:
-        self.assertIs(RunOutcome.EMPTY_SUCCESS, self.decide())
-
-    def test_budget_exceeded_without_publication_is_failed(self) -> None:
+    def test_failed_when_nothing_published_with_failures(self) -> None:
         self.assertIs(
             RunOutcome.FAILED,
-            self.decide(published=0, budget_exceeded=True),
+            decide_run_outcome(published=0, failed=1, stopped_early=False),
         )
-
-    def test_system_failures_without_publication_are_failed(self) -> None:
-        self.assertIs(RunOutcome.FAILED, self.decide(published=0, failed=2))
-
-    def test_program_fault_forces_failed_even_after_publishing(self) -> None:
-        self.assertIs(RunOutcome.FAILED, self.decide(published=2, force_failed=True))
-
-    def test_cost_guard_stop_is_not_an_infrastructure_failure(self) -> None:
-        self.assertIs(
-            RunOutcome.COST_GUARD_STOPPED,
-            self.decide(published=0, failed=1, cost_guard_stopped=True),
-        )
-        self.assertEqual(0, exit_code_for(RunOutcome.COST_GUARD_STOPPED))
-
-    def test_program_fault_wins_over_a_cost_guard_stop(self) -> None:
         self.assertIs(
             RunOutcome.FAILED,
-            self.decide(published=1, cost_guard_stopped=True, force_failed=True),
+            decide_run_outcome(published=0, failed=0, stopped_early=True),
         )
 
-    def test_exit_codes_match_github_semantics(self) -> None:
+    def test_force_failed_overrides_published_items(self) -> None:
+        self.assertIs(
+            RunOutcome.FAILED,
+            decide_run_outcome(
+                published=4, failed=0, stopped_early=False, force_failed=True
+            ),
+        )
+
+    def test_exit_codes(self) -> None:
         self.assertEqual(0, exit_code_for(RunOutcome.SUCCESS))
         self.assertEqual(0, exit_code_for(RunOutcome.PARTIAL_SUCCESS))
-        self.assertEqual(0, exit_code_for(RunOutcome.EMPTY_SUCCESS))
-        self.assertEqual(0, exit_code_for(RunOutcome.COST_GUARD_STOPPED))
         self.assertEqual(1, exit_code_for(RunOutcome.FAILED))
 
 

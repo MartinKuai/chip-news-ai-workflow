@@ -1,4 +1,4 @@
-"""Small data contracts shared by the graph and its nodes."""
+"""Data contracts shared by the pipeline stages and the graph nodes."""
 
 from __future__ import annotations
 
@@ -9,11 +9,15 @@ class SchemaError(RuntimeError):
     """Raised when an AI node violates its structured output contract."""
 
 
-class Article(TypedDict):
+class Candidate(TypedDict, total=False):
+    """One news candidate produced by source selection."""
+
+    id: str
     title: str
-    source: str
     url: str
+    source: str
     published_at: str
+    metadata: dict[str, Any]
 
 
 class ResearchNote(TypedDict):
@@ -23,6 +27,18 @@ class ResearchNote(TypedDict):
     confidence: float
 
 
+class Entities(TypedDict):
+    companies: list[str]
+    products: list[str]
+    models: list[str]
+    events: list[str]
+
+
+class KeyNumber(TypedDict):
+    label: str
+    value: str
+
+
 class ResearchNotes(TypedDict):
     decision: str
     reason: str
@@ -30,6 +46,9 @@ class ResearchNotes(TypedDict):
     source: str
     url: str
     published_at: str
+    entities: Entities
+    key_numbers: list[KeyNumber]
+    gaps: list[str]
     notes: list[ResearchNote]
 
 
@@ -54,7 +73,7 @@ class Review(TypedDict):
 
 
 class GraphState(TypedDict, total=False):
-    article: Article
+    candidate: Candidate
     research_notes: ResearchNotes
     draft: Draft
     review: Review
@@ -74,6 +93,44 @@ def _text(value: Any, label: str, *, allow_empty: bool = False) -> str:
     if not isinstance(value, str) or (not allow_empty and not value.strip()):
         raise SchemaError(f"{label} must be a non-empty string")
     return value.strip()
+
+
+def _text_list(value: Any, label: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise SchemaError(f"{label} must be a list")
+    return [_text(item, f"{label} item") for item in value]
+
+
+def _entities(value: Any) -> Entities:
+    """Entities are a research aid, so a missing block degrades to empty lists."""
+    if value is None:
+        value = {}
+    data = _mapping(value, "entities")
+    return {
+        "companies": _text_list(data.get("companies"), "entities.companies"),
+        "products": _text_list(data.get("products"), "entities.products"),
+        "models": _text_list(data.get("models"), "entities.models"),
+        "events": _text_list(data.get("events"), "entities.events"),
+    }
+
+
+def _key_numbers(value: Any) -> list[KeyNumber]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise SchemaError("key_numbers must be a list")
+    numbers: list[KeyNumber] = []
+    for index, item in enumerate(value):
+        entry = _mapping(item, f"key_numbers[{index}]")
+        numbers.append(
+            {
+                "label": _text(entry.get("label"), f"key_numbers[{index}].label"),
+                "value": _text(entry.get("value"), f"key_numbers[{index}].value"),
+            }
+        )
+    return numbers
 
 
 def validate_research_notes(value: Any) -> ResearchNotes:
@@ -119,6 +176,9 @@ def validate_research_notes(value: Any) -> ResearchNotes:
         "published_at": _text(
             data.get("published_at", ""), "published_at", allow_empty=True
         ),
+        "entities": _entities(data.get("entities")),
+        "key_numbers": _key_numbers(data.get("key_numbers")),
+        "gaps": _text_list(data.get("gaps"), "gaps"),
         "notes": notes,
     }
 
@@ -140,8 +200,8 @@ def validate_draft(value: Any) -> Draft:
 def validate_review(value: Any) -> Review:
     data = _mapping(value, "Reviewer output")
     status = _text(data.get("status"), "status").upper()
-    if status not in {"PASS", "REJECT"}:
-        raise SchemaError("review status must be PASS or REJECT")
+    if status not in {"PASS", "REVISE", "REJECT"}:
+        raise SchemaError("review status must be PASS, REVISE or REJECT")
 
     raw_scores = _mapping(data.get("scores"), "scores")
     scores: dict[str, int] = {}
@@ -170,14 +230,13 @@ def validate_review(value: Any) -> Review:
             }
         )
 
-    raw_brief = data.get("revision_brief", [])
-    if not isinstance(raw_brief, list):
-        raise SchemaError("revision_brief must be a list")
-    brief = [_text(item, "revision_brief item") for item in raw_brief]
+    brief = _text_list(data.get("revision_brief"), "revision_brief")
     if status == "PASS" and brief:
         raise SchemaError("PASS must have an empty revision_brief")
-    if status == "REJECT" and not brief:
-        raise SchemaError("REJECT requires a concise revision_brief")
+    if status == "REVISE" and not brief:
+        raise SchemaError("REVISE requires a concise revision_brief")
+    if status == "REJECT" and not issues:
+        raise SchemaError("REJECT requires at least one issue")
     if status == "PASS" and (
         scores["factuality"] < 8
         or scores["relevance"] < 8

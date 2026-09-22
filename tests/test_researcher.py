@@ -1,204 +1,161 @@
 from __future__ import annotations
 
-import json
 import unittest
 
-from _support import ARTICLE, SRC, CaptureClient, research_output  # noqa: F401
-from daily_chip_news.gemini import GeminiAPIError, GeminiResponseError
-from daily_chip_news.health import HealthEvent
+from _support import CANDIDATE, SRC, CaptureClient, research_output  # noqa: F401
+
+from daily_chip_news.config import NodeProfile
+from daily_chip_news.errors import record_health_outcome
+from daily_chip_news.gemini import GeminiAPIError
+from daily_chip_news.health import HealthEvent, ServiceHealth
 from daily_chip_news.nodes import ResearcherNode
 from daily_chip_news.schemas import SchemaError
 from daily_chip_news.sources import SourceError
 
-
-def body_extractor(text: str = "Body line.\n" * 40):
-    def extractor(url: str) -> str:
-        return text
-
-    return extractor
+BODY = "Body paragraph about HBM capacity.\n\n" * 40
 
 
-class ExplodingClient:
-    def __init__(self, exc: Exception) -> None:
-        self._exc = exc
-
-    def request_json(self, **kwargs):
-        raise self._exc
+def extractor(url: str) -> str:
+    return BODY
 
 
-class ResearcherPayloadTests(unittest.TestCase):
-    def test_payload_is_allow_listed_and_cleaned(self) -> None:
+def node(client, **kwargs) -> ResearcherNode:
+    profile = kwargs.pop("profile", NodeProfile(model="researcher-model"))
+    return ResearcherNode(client, profile, kwargs.pop("extractor", extractor), **kwargs)
+
+
+def state() -> dict:
+    return {"candidate": dict(CANDIDATE), "status": "NEW"}
+
+
+class ResearcherKeepTests(unittest.TestCase):
+    def test_keep_returns_notes_with_deterministic_provenance(self) -> None:
         client = CaptureClient(research_output())
-        node = ResearcherNode(client, "researcher-model", body_extractor())
-        update = node({"article": ARTICLE})
-        payload = client.calls[0]["payload"]
-        self.assertEqual(
-            {
-                "article_metadata",
-                "raw_content",
-                "editorial_scope",
-                "output_schema",
-            },
-            set(payload),
-        )
-        self.assertEqual("Body line.", payload["raw_content"].splitlines()[0])
+        update = node(client)(state())
+        notes = update["research_notes"]
         self.assertEqual("RESEARCHED", update["status"])
-        serialized = json.dumps(payload)
-        self.assertNotIn("raw_article", serialized)
+        self.assertEqual("KEEP", notes["decision"])
+        self.assertEqual(CANDIDATE["source"], notes["source"])
+        self.assertEqual(CANDIDATE["url"], notes["url"])
+        self.assertEqual(CANDIDATE["published_at"], notes["published_at"])
+        self.assertEqual(1, len(notes["notes"]))
 
-    def test_reader_metadata_is_stripped_before_the_model_call(self) -> None:
-        raw = (
-            "Title: HBM update\n\n"
-            "URL Source: https://example.com/hbm\n\n"
-            "Markdown Content:\n"
-            "Body line.\n"
+    def test_research_adds_entities_numbers_and_gaps(self) -> None:
+        client = CaptureClient(
+            research_output(
+                entities={
+                    "companies": ["Vendor"],
+                    "products": [],
+                    "models": [],
+                    "events": [],
+                },
+                key_numbers=[{"label": "capacity", "value": "50%"}],
+                gaps=["台积电未回应"],
+            )
         )
-        client = CaptureClient(research_output())
-        ResearcherNode(client, "researcher-model", body_extractor(raw))(
-            {"article": ARTICLE}
+        notes = node(client)(state())["research_notes"]
+        self.assertEqual(["Vendor"], notes["entities"]["companies"])
+        self.assertEqual("50%", notes["key_numbers"][0]["value"])
+        self.assertEqual(["台积电未回应"], notes["gaps"])
+
+    def test_optional_research_blocks_degrade_to_empty(self) -> None:
+        client = CaptureClient(
+            research_output(entities=None, key_numbers=None, gaps=None)
         )
-        content = client.calls[0]["payload"]["raw_content"]
-        self.assertNotIn("Title:", content)
-        self.assertNotIn("URL Source:", content)
-        self.assertIn("Body line.", content)
+        notes = node(client)(state())["research_notes"]
+        self.assertEqual([], notes["entities"]["companies"])
+        self.assertEqual([], notes["key_numbers"])
+        self.assertEqual([], notes["gaps"])
 
-    def test_content_is_truncated_by_the_configured_budget(self) -> None:
+    def test_request_uses_the_article_body_scope_and_profile(self) -> None:
         client = CaptureClient(research_output())
-        ResearcherNode(
-            client,
-            "researcher-model",
-            body_extractor("x" * 5000),
-            max_content_chars=2000,
-        )({"article": ARTICLE})
-        content = client.calls[0]["payload"]["raw_content"]
-        self.assertLessEqual(len(content), 2000 + len("\n[content truncated]"))
-        self.assertIn("[content truncated]", content)
-
-    def test_generation_settings_are_quality_bounded(self) -> None:
-        client = CaptureClient(research_output())
-        ResearcherNode(
-            client,
-            "researcher-model",
-            body_extractor(),
+        profile = NodeProfile(
+            model="researcher-model",
             thinking_level="low",
             max_output_tokens=3072,
-        )({"article": ARTICLE})
+        )
+        node(client, profile=profile)(state())
         call = client.calls[0]
-        self.assertEqual("researcher", call["purpose"])
+        self.assertEqual("researcher-model", call["model"])
         self.assertEqual("low", call["thinking_level"])
         self.assertEqual(3072, call["max_output_tokens"])
-        self.assertIsNotNone(call["output_schema"])
-        self.assertEqual("researcher-model", call["model"])
-
-    def test_makes_exactly_one_logical_call(self) -> None:
-        client = CaptureClient(research_output())
-        ResearcherNode(client, "researcher-model", body_extractor())(
-            {"article": ARTICLE}
+        self.assertEqual("researcher", call["purpose"])
+        self.assertEqual(
+            CANDIDATE["title"], call["payload"]["article_metadata"]["title"]
         )
-        self.assertEqual(1, len(client.calls))
+        self.assertIn("HBM capacity", call["payload"]["raw_content"])
+        self.assertTrue(call["payload"]["editorial_scope"])
 
-
-class ResearcherContractTests(unittest.TestCase):
-    def test_provenance_is_injected_deterministically(self) -> None:
+    def test_article_body_is_capped_before_the_model_call(self) -> None:
         client = CaptureClient(research_output())
-        node = ResearcherNode(client, "researcher-model", body_extractor())
-        update = node({"article": ARTICLE})
-        notes = update["research_notes"]
-        self.assertEqual(ARTICLE["source"], notes["source"])
-        self.assertEqual(ARTICLE["url"], notes["url"])
-        self.assertEqual(ARTICLE["published_at"], notes["published_at"])
+        node(client, max_content_chars=2000)(
+            {"candidate": dict(CANDIDATE), "status": "NEW"}
+        )
+        content = client.calls[0]["payload"]["raw_content"]
+        self.assertLessEqual(len(content), 2000 + len("\n[content truncated]"))
 
-    def test_skip_decision_routes_to_skip(self) -> None:
+
+class ResearcherSkipTests(unittest.TestCase):
+    def test_skip_returns_no_notes(self) -> None:
         client = CaptureClient(
-            research_output(decision="SKIP", reason="Not in scope", topic="", notes=[])
+            {
+                "decision": "SKIP",
+                "reason": "not about our scope",
+                "topic": "",
+                "notes": [],
+            }
         )
-        update = ResearcherNode(client, "researcher-model", body_extractor())(
-            {"article": ARTICLE}
-        )
+        update = node(client)(state())
         self.assertEqual("SKIP", update["status"])
         self.assertEqual("SKIP", update["research_notes"]["decision"])
+        self.assertEqual([], update["research_notes"]["notes"])
 
-    def test_keep_requires_at_least_one_note(self) -> None:
-        client = CaptureClient(research_output(notes=[]))
-        with self.assertRaises(SchemaError):
-            ResearcherNode(client, "researcher-model", body_extractor())(
-                {"article": ARTICLE}
-            )
 
-    def test_invalid_decision_is_rejected(self) -> None:
-        client = CaptureClient(research_output(decision="MAYBE"))
-        with self.assertRaises(SchemaError):
-            ResearcherNode(client, "researcher-model", body_extractor())(
-                {"article": ARTICLE}
-            )
+class ResearcherFailureTests(unittest.TestCase):
+    def test_extraction_failure_is_a_source_error_without_a_model_call(self) -> None:
+        def broken(url: str) -> str:
+            raise SourceError("Article extraction failed with HTTP 404")
 
-    def test_empty_cleaned_content_is_a_source_error_without_a_gemini_call(self) -> None:
-        client = CaptureClient(research_output())
-        node = ResearcherNode(client, "researcher-model", body_extractor(""))
+        client = CaptureClient()
         with self.assertRaises(SourceError):
-            node({"article": ARTICLE})
+            node(client, extractor=broken)(state())
         self.assertEqual([], client.calls)
 
+    def test_empty_extraction_is_a_source_error(self) -> None:
+        client = CaptureClient()
+        with self.assertRaises(SourceError):
+            node(client, extractor=lambda url: "   ")(state())
 
-class ResearcherHealthTests(unittest.TestCase):
-    def test_success_records_one_event(self) -> None:
-        events = []
-        ResearcherNode(
-            CaptureClient(research_output()),
-            "researcher-model",
-            body_extractor(),
-            health_recorder=events.append,
-        )({"article": ARTICLE})
-        self.assertEqual([HealthEvent.SUCCESS], events)
-
-    def test_transient_exhaustion_records_one_transient_event(self) -> None:
-        events = []
-        node = ResearcherNode(
-            ExplodingClient(
-                GeminiAPIError("HTTP 503", status_code=503, transient=True)
-            ),
-            "researcher-model",
-            body_extractor(),
-            health_recorder=events.append,
-        )
-        with self.assertRaises(GeminiAPIError):
-            node({"article": ARTICLE})
-        self.assertEqual([HealthEvent.TRANSIENT_FAILURE], events)
-
-    def test_response_error_records_one_neutral_event(self) -> None:
-        events = []
-        node = ResearcherNode(
-            ExplodingClient(GeminiResponseError("invalid json")),
-            "researcher-model",
-            body_extractor(),
-            health_recorder=events.append,
-        )
-        with self.assertRaises(GeminiResponseError):
-            node({"article": ARTICLE})
-        self.assertEqual([HealthEvent.NON_TRANSIENT_FAILURE], events)
-
-    def test_schema_failure_records_exactly_one_neutral_event(self) -> None:
-        events = []
-        node = ResearcherNode(
-            CaptureClient(research_output(decision="MAYBE")),
-            "researcher-model",
-            body_extractor(),
-            health_recorder=events.append,
+    def test_malformed_response_is_a_schema_error(self) -> None:
+        client = CaptureClient(
+            {"decision": "MAYBE", "reason": "x", "topic": "y", "notes": []}
         )
         with self.assertRaises(SchemaError):
-            node({"article": ARTICLE})
-        self.assertEqual([HealthEvent.NON_TRANSIENT_FAILURE], events)
+            node(client)(state())
 
-    def test_source_extraction_failure_records_no_health_event(self) -> None:
-        events = []
-        node = ResearcherNode(
-            CaptureClient(research_output()),
-            "researcher-model",
-            body_extractor(""),
-            health_recorder=events.append,
+    def test_keep_without_notes_is_a_schema_error(self) -> None:
+        client = CaptureClient(research_output(notes=[]))
+        with self.assertRaises(SchemaError):
+            node(client)(state())
+
+    def test_api_failure_propagates_and_updates_the_breaker(self) -> None:
+        breaker = ServiceHealth(window_size=2, failure_threshold=1)
+        client = CaptureClient(GeminiAPIError("boom", status_code=503, transient=True))
+        with self.assertRaises(GeminiAPIError):
+            node(client, health_recorder=breaker.record)(state())
+        self.assertEqual((HealthEvent.TRANSIENT_FAILURE,), breaker.events)
+
+    def test_successful_call_records_one_breaker_event(self) -> None:
+        breaker = ServiceHealth(window_size=3, failure_threshold=2)
+        client = CaptureClient(research_output())
+        node(client, health_recorder=breaker.record)(state())
+        self.assertEqual((HealthEvent.SUCCESS,), breaker.events)
+
+    def test_source_error_is_not_a_service_failure(self) -> None:
+        events: list[HealthEvent] = []
+        record_health_outcome(
+            events.append, stage="researcher", cause=SourceError("no content")
         )
-        with self.assertRaises(SourceError):
-            node({"article": ARTICLE})
         self.assertEqual([], events)
 
 

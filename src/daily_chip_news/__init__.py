@@ -1,4 +1,7 @@
-"""Daily Chip News editorial micro-graph."""
+"""Daily Chip News production pipeline.
+
+Sources -> researcher -> writer -> reviewer -> publisher.
+"""
 
 __all__ = ["__version__"]
 

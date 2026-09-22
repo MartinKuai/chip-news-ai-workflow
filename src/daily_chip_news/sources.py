@@ -1,21 +1,27 @@
-"""RSS candidate collection and deterministic article extraction."""
+"""Source ingestion and deterministic candidate selection.
+
+Flow: RSS ingestion -> normalization -> canonical URL -> dedupe -> garbage
+filtering -> recency filtering -> source round-robin -> candidate limit.
+Nothing in this module calls Gemini.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import re
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from email.utils import parsedate_to_datetime
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import feedparser
 import requests
 
-from .config import RSS_FEEDS
-from .schemas import Article
+from .config import DEFAULT_SOURCES
+from .schemas import Candidate
 
 
 class SourceError(RuntimeError):
@@ -32,9 +38,9 @@ class SourceFailure:
 
 @dataclass(frozen=True)
 class SourceCollectionResult:
-    """Articles and availability statistics from one RSS collection pass."""
+    """Candidates and availability statistics from one RSS collection pass."""
 
-    articles: list[Article]
+    candidates: list[Candidate]
     sources_total: int
     sources_ok: int
     sources_failed: int
@@ -54,21 +60,28 @@ def _safe_source_name(value: object) -> str:
     return " ".join(str(value).split())[:200]
 
 
+def candidate_id(url: str) -> str:
+    """Deterministic short id derived from the canonical URL."""
+    canonical = canonical_url(url)
+    return hashlib.blake2s(canonical.encode("utf-8"), digest_size=5).hexdigest()
+
+
 def collect_articles(
     articles_per_feed: int,
     *,
-    feeds: Iterable[str] = RSS_FEEDS,
-    parser: Callable[[str], Any] = feedparser.parse,
+    feeds: Iterable[str] = DEFAULT_SOURCES,
+    parser: Callable[[str], Any] | None = None,
 ) -> SourceCollectionResult:
     """Collect candidates while isolating failures to individual RSS feeds."""
+    parse = parser or feedparser.parse
     feed_urls = list(feeds)
-    articles: list[Article] = []
+    candidates: list[Candidate] = []
     failures: list[SourceFailure] = []
     sources_ok = 0
     seen_urls: set[str] = set()
     for feed_url in feed_urls:
         try:
-            feed = parser(feed_url)
+            feed = parse(feed_url)
         except Exception as exc:
             failures.append(
                 SourceFailure(_safe_source_name(feed_url), type(exc).__name__)
@@ -97,19 +110,24 @@ def collect_articles(
             if not url or url in seen_urls:
                 continue
             seen_urls.add(url)
-            articles.append(
+            candidates.append(
                 {
+                    "id": candidate_id(url),
                     "title": str(entry.get("title", "Untitled article")),
                     "url": url,
                     "source": source,
                     "published_at": str(
                         entry.get("published", entry.get("updated", ""))
                     ),
+                    "metadata": {
+                        "feed_url": feed_url,
+                        "feed_title": source,
+                    },
                 }
             )
 
     result = SourceCollectionResult(
-        articles=articles,
+        candidates=candidates,
         sources_total=len(feed_urls),
         sources_ok=sources_ok,
         sources_failed=len(failures),
@@ -174,7 +192,8 @@ def canonical_url(url: str) -> str:
     return urlunsplit((scheme, netloc, path, urlencode(sorted(query_pairs)), ""))
 
 
-def _recency_key(value: str) -> float:
+def published_timestamp(value: str) -> float:
+    """Parse a feed date (RFC 822 or ISO 8601); 0.0 means unknown."""
     text = (value or "").strip()
     if not text:
         return 0.0
@@ -188,9 +207,9 @@ def _recency_key(value: str) -> float:
         return 0.0
 
 
-def _looks_like_junk(article: Article) -> bool:
-    title = str(article.get("title", "")).strip().lower()
-    url = str(article.get("url", "")).lower()
+def _looks_like_junk(candidate: Candidate) -> bool:
+    title = str(candidate.get("title", "")).strip().lower()
+    url = str(candidate.get("url", "")).lower()
     if len(title) < _MIN_TITLE_LENGTH:
         return True
     if title in _JUNK_TITLE_EXACT:
@@ -200,39 +219,61 @@ def _looks_like_junk(article: Article) -> bool:
     return any(pattern in url for pattern in _JUNK_URL_PATTERNS)
 
 
+def _is_stale(candidate: Candidate, *, max_age_hours: float, now: float) -> bool:
+    """Drop only candidates whose date is known and older than the cutoff."""
+    if max_age_hours <= 0:
+        return False
+    published = published_timestamp(candidate.get("published_at", ""))
+    if published <= 0:
+        # An undated feed entry is unknown, not stale.
+        return False
+    return (now - published) > max_age_hours * 3600.0
+
+
 def select_candidates(
-    articles: Iterable[Article],
+    candidates: Iterable[Candidate],
     *,
     limit: int,
     max_per_source: int | None = None,
-) -> list[Article]:
+    max_age_hours: float = 0.0,
+    now: float | None = None,
+) -> list[Candidate]:
     """Deterministic, zero-Gemini candidate control.
 
-    Canonical-URL dedupe, obvious junk removal, then round-robin source
-    diversity with recency ordering inside each source.
+    Canonical-URL dedupe, obvious junk removal, recency filtering, then
+    round-robin source diversity with recency ordering inside each source.
     """
     if limit < 1:
         return []
-    grouped: dict[str, list[Article]] = {}
+    current_time = time.time() if now is None else now
+    grouped: dict[str, list[Candidate]] = {}
     seen: set[str] = set()
-    for article in articles:
-        key = canonical_url(article.get("url", ""))
-        if not key or key in seen:
+    for candidate in candidates:
+        raw_url = str(candidate.get("url", "")).strip()
+        if not raw_url:
+            continue
+        key = canonical_url(raw_url)
+        if key in seen:
             continue
         seen.add(key)
-        if _looks_like_junk(article):
+        if _looks_like_junk(candidate):
             continue
-        source = str(article.get("source", "")).strip() or "unknown"
-        grouped.setdefault(source, []).append(article)
+        if _is_stale(candidate, max_age_hours=max_age_hours, now=current_time):
+            continue
+        source = str(candidate.get("source", "")).strip() or "unknown"
+        grouped.setdefault(source, []).append(candidate)
 
-    queues: list[list[Article]] = []
+    queues: list[list[Candidate]] = []
     for items in grouped.values():
-        items.sort(key=lambda item: _recency_key(item.get("published_at", "")), reverse=True)
+        items.sort(
+            key=lambda item: published_timestamp(item.get("published_at", "")),
+            reverse=True,
+        )
         queues.append(items[:max_per_source] if max_per_source else items)
 
-    selected: list[Article] = []
+    selected: list[Candidate] = []
     while queues and len(selected) < limit:
-        next_round: list[list[Article]] = []
+        next_round: list[list[Candidate]] = []
         for queue in queues:
             if len(selected) >= limit:
                 break
@@ -246,8 +287,8 @@ def select_candidates(
 def clean_extracted_text(raw: str, *, max_chars: int) -> str:
     """Deterministic cleanup before the model call: drop reader metadata and noise.
 
-    This runs locally, costs no Gemini request and keeps only high-signal lines so
-    the Writer receives dense context instead of raw reader output.
+    This runs locally, costs no Gemini request and keeps only high-signal lines
+    so the Researcher receives dense context instead of raw reader output.
     """
     if not raw:
         return ""
@@ -306,7 +347,9 @@ class ArticleExtractor:
                 response = self._session.get(reader_url, timeout=self._timeout)
             except requests.RequestException as exc:
                 if attempt == self._max_attempts:
-                    raise SourceError("Article extraction network request failed") from exc
+                    raise SourceError(
+                        "Article extraction network request failed"
+                    ) from exc
                 time.sleep(float(attempt))
                 continue
             last_status = response.status_code

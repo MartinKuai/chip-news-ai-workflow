@@ -1,12 +1,12 @@
-"""Rolling-window Gemini service health used instead of a consecutive-failure breaker."""
+"""Circuit breaker for consecutive Gemini service failures during a run."""
 
 from __future__ import annotations
 
 from collections import deque
-from enum import Enum
+from enum import StrEnum
 
 
-class HealthEvent(str, Enum):
+class HealthEvent(StrEnum):
     """One Gemini AI-stage outcome recorded into the rolling window."""
 
     SUCCESS = "success"

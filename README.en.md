@@ -2,49 +2,55 @@
 
 [简体中文](README.md) | **English**
 
-Daily Chip News is a daily automation workflow for semiconductor industry intelligence.
+Daily Chip News is a daily semiconductor-industry intelligence pipeline.
 
-It collects recent items from several industry RSS feeds, uses deterministic code for extraction, cleaning and candidate control, and then sends each candidate through three focused AI nodes:
+It ingests multiple industry RSS feeds, uses deterministic code for article extraction, cleaning and candidate control, and then runs three single-responsibility AI nodes:
 
-**Researcher → Writer → Reviewer → Telegram**
+**Sources → Candidate Selection → Researcher → Writer → Reviewer → Publisher → Run Summary**
 
-The Researcher reads the article body and produces structured research notes. The Writer turns those notes into concise Chinese coverage. The Reviewer checks factual support, relevance and writing quality against a fixed rubric. Approved content is delivered to Telegram by the deterministic Publisher. The repository has accumulated more than 230 scheduled GitHub Actions runs.
+The Researcher reads the article body and emits structured research notes; the Writer drafts Chinese copy from those notes only; the Reviewer applies a fixed rubric; the deterministic Publisher sends approved items to Telegram; the run ends with a summary and, when needed, an operational alert.
 
-## Workflow
+## Pipeline
 
 ```mermaid
 flowchart TD
-    A[RSS Sources] --> B[Source Collection]
-    B --> C[Deterministic Extraction + Cleaning + Candidate Control]
-    C --> D[Researcher: relevance + evidence notes]
-    D -->|SKIP| Z[END]
-    D -->|KEEP + Research Notes| E[Writer]
-    E -->|Draft| F[Reviewer]
-    F -->|PASS| G[Publisher]
-    F -->|REJECT below limit| E
-    F -->|REJECT at limit| H[HOLD]
-    G --> I[Telegram]
+    A[RSS Sources] --> B[Candidate Selection]
+    B --> C[Researcher]
+    C -->|SKIP| Z[SKIPPED]
+    C -->|KEEP + Research Notes| D[Writer compose]
+    D --> E[Reviewer]
+    E -->|PASS| F[Publisher]
+    E -->|REVISE within limit| G[Writer revise]
+    G --> E
+    E -->|REVISE at limit| H[HOLD → SKIPPED]
+    E -->|REJECT → SKIPPED| Z
+    F --> I[Telegram]
+    F --> J[Run Summary / Notification]
 ```
 
-LangGraph `StateGraph` coordinates the three AI nodes while the deterministic Publisher handles delivery. A draft may be revised once by default (`MAX_REVISIONS=1`); another rejection moves the item to `HOLD`.
+A LangGraph `StateGraph` wires the three AI nodes while the Publisher stays deterministic. One revision is allowed by default (`MAX_REVISIONS=1`); when the limit is reached the item ends as `HOLD` (counted as SKIPPED).
 
 ## The three AI nodes
 
 ### Researcher
 
-The only AI node that reads the extracted article body. It judges relevance against the editorial scope (`KEEP`/`SKIP`) and emits Structured Research Notes: topic, source, URL, publication date, and 1-4 evidence-backed claims with confidence values.
+The only AI node that reads the article body (capped at `ARTICLE_CONTENT_CHARS=12000`). It judges relevance against the editorial scope (`KEEP`/`SKIP`) and emits structured research notes: topic, source, URL, date, companies / products / models / events, key numbers and time points, information gaps, plus 1-4 evidence-backed notes with confidence. Research notes are the factual baseline for writing and review.
 
 ### Writer
 
-The first draft only receives Research Notes, the editorial brief and the output schema. It never sees raw article text, never fetches the web and must not add facts outside the notes. A revision only receives `research_notes`, `previous_draft` and `revision_brief`; it never re-calls the Researcher and cannot change the factual basis.
+Compose reads Research Notes + editorial brief + output schema only: no article body, no web access, no facts beyond the notes. Revise additionally receives `previous_draft` and `revision_brief`, still from the same Research Notes, without calling the Researcher again.
 
 ### Reviewer
 
-The Reviewer only receives Research Notes, the Draft and the rubric, and never rewrites copy. `PASS` sends the item to the Publisher; `REJECT` returns a concise `revision_brief` that triggers exactly one Writer revision.
+Reads Research Notes + Draft + rubric and never rewrites, focusing on factual consistency, company / product / model / number accuracy, unsupported extrapolation, structure and publishable quality:
+
+- `PASS`: publishable, handed to the Publisher.
+- `REVISE`: fixable by editing the draft; must return explicit `revision_brief` instructions and triggers one Writer revision.
+- `REJECT`: not fixable by rewriting; the candidate ends as `SKIPPED`.
 
 ## Sources and candidate control
 
-The daily candidate set currently comes from five feeds:
+Five default sources (override with `SOURCE_FEEDS`):
 
 - [EE Times](https://www.eetimes.com/feed/)
 - [Semiconductor Engineering](https://semiengineering.com/feed/)
@@ -52,76 +58,58 @@ The daily candidate set currently comes from five feeds:
 - [TrendForce Semiconductors](https://www.trendforce.com/feed/Semiconductors.html)
 - [Hacker News RSS](https://hnrss.org/newest?points=100)
 
-Deterministic, zero-Gemini candidate control: URL/canonical dedupe → obvious junk removal (ads, hiring, nav pages, too-short titles) → round-robin source diversity with recency ordering inside each source → `MAX_CANDIDATES_PER_RUN=6`. After extraction, `clean_extracted_text()` removes reader metadata, image-only lines and repeated lines and truncates to `ARTICLE_CONTENT_CHARS=12000`. A single unavailable feed only affects that source; collection fails the run only when every source is down.
-
-## Model routing
-
-- `RESEARCHER_MODEL`: lightweight extraction model (currently `gemini-3.5-flash-lite`).
-- `WRITER_MODEL`: Chinese writing quality (currently `gemini-3.6-flash`).
-- `REVIEWER_MODEL`: fact checking and stable judgment (currently `gemini-3.7-flash`).
-
-All three nodes run with `thinking=low` and output ceilings of 3072 / 2560 / 1024 tokens. Structured output (`responseSchema`) is kept, `candidateCount=1`, and no paid tools such as Search grounding are enabled.
-
-## Cost governance (hard budget under the $10 credit)
-
-Three layers of protection:
+Candidate selection is fully deterministic (zero model calls):
 
 ```text
-application guard (primary, in code)
-→ project spend cap (Owner sets ~$8 in AI Studio/Cloud)
-→ $10/month promotional credit
+RSS ingestion → normalize → canonical URL → dedupe → garbage filtering
+→ recency filtering (MAX_CANDIDATE_AGE_HOURS) → source round-robin
+→ MAX_CANDIDATES_PER_RUN (default 6)
 ```
 
-Code-level budgets:
+Every candidate is a structured object: `id` / `title` / `url` / `source` / `published_at` / `metadata`. After extraction, `clean_extracted_text()` strips reader metadata, image lines and duplicates and truncates at `ARTICLE_CONTENT_CHARS`. A single unavailable feed only affects that source; when every source is unavailable the run is `FAILED`.
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `SCHEDULED_RUN_BUDGET_USD` | `0.20` | Paid ceiling for one scheduled run |
-| `MANUAL_RUN_BUDGET_USD` | `0.05` | Manual `workflow_dispatch` ceiling, code hard max `0.10` |
-| `GEMINI_ROLLING_30D_BUDGET_USD` | `7.50` | Rolling 30-day ceiling no run may exceed |
+## Gemini client and model routing
 
-- 31 fully spent days ≈ $6.20, leaving ≈ $1.30 for price drift, manual runs and billing lag.
-- **Cost protection outranks finishing every candidate**: when the budget is short the run stops; it never raises the budget or switches models to finish the job.
+All AI nodes share one Gemini client (`gemini.py`): API key from configuration, request serialization, response parsing, timeouts, retries, HTTP error mapping and JSON repair. Each node has its own model and generation profile:
 
-### Pre-flight before every billable call (fail closed)
+| Node | Variable | Default thinking | Default output limit |
+| --- | --- | --- | --- |
+| Researcher | `RESEARCHER_MODEL` | `low` | 3072 |
+| Writer | `WRITER_MODEL` | `low` | 2560 |
+| Reviewer | `REVIEWER_MODEL` | `low` | 1024 |
 
-1. `countTokens` returns the exact input tokens for the equivalent request; any failure refuses the call.
-2. Price lookup: unknown model or expired pricing refuses the call.
-3. Worst-case projection: `input × 1.05 × input price + max_output_tokens × output price` (thinking tokens are billed as output).
-4. Check `run_spend + projected ≤ run_budget` and `rolling_30d_spend + projected ≤ 7.50`; if either fails the request is never sent, never retried and never downgraded to a different model.
+Structured output keeps `responseSchema` (`GEMINI_STRUCTURED_OUTPUT=1`) and no paid tools such as Search grounding are used. All settings live in `config.py`: local runs read `.env`, GitHub Actions reads Secrets / Variables.
 
-### Billing and ledger
-
-- Every successful 200 response is billed separately from `usageMetadata` (`prompt` + `candidates` + `thoughts`); each successful retry counts on its own and a JSON repair is its own billable request.
-- Each attempt first writes a worst-case reservation and later reconciles to the actual cost; ambiguous timeouts keep their reservation instead of assuming a free call.
-- The rolling 30-day ledger is JSONL persisted across runs through a GitHub Actions artifact (`retention-days: 45`, single-instance concurrency). Each run first commits a run_open reservation for its whole budget and settles it to the actual spend at the end, so a crashed run can never undercount.
-- A corrupt, missing (`COST_LEDGER_REQUIRED=1`) or unreadable ledger fails closed: no paid generation.
-
-## Run outcome state machine
-
-| Outcome | Condition | exit code |
-| --- | --- | --- |
-| `SUCCESS` | Completed normally, `published > 0`, no failures | 0 |
-| `PARTIAL_SUCCESS` | `published > 0`, but article failures / breaker open / time budget exhausted | 0 |
-| `EMPTY_SUCCESS` | No candidates, or all candidates filtered (`SKIP`/`HOLD`) | 0 |
-| `COST_GUARD_STOPPED` | Budget protection stopped the run | 0 |
-| `FAILED` | `published == 0` with failures/service unavailability, or a program fault | 1 |
-
-Key semantics: once an article is published, later Gemini failures never redefine the run as FAILED; a cost-guard stop is an expected operational state that stays green and never pollutes the Gemini health window; a genuine zero-publish outage is never disguised as success.
-
-## Error taxonomy and breaker
+## Reliability
 
 ```text
-TRANSIENT_RATE_LIMIT / TRANSIENT_SERVER / TRANSIENT_NETWORK   service-level, counted by the breaker
-MODEL_RESPONSE_INVALID / MODEL_RESPONSE_TRUNCATED / SCHEMA_INVALID   article-level
-SOURCE_ERROR / PUBLISH_ERROR / CONFIG_ERROR / COST_GUARD / UNEXPECTED_ERROR
+TRANSIENT_RATE_LIMIT / TRANSIENT_SERVER / TRANSIENT_NETWORK   service level, counts toward the breaker
+MODEL_RESPONSE_INVALID / MODEL_RESPONSE_TRUNCATED / SCHEMA_INVALID   candidate level
+SOURCE_ERROR / PUBLISH_ERROR / CONFIG_ERROR / UNEXPECTED_ERROR
 ```
 
-Rolling-window breaker: among the last `GEMINI_HEALTH_WINDOW(5)` AI logical calls, `GEMINI_HEALTH_THRESHOLD(3)` transient failures mean the service is unavailable. Granularity is fixed at **one logical call = one event** (success and failure share the same granularity); `SchemaError`/`GeminiResponseError` occupy slots without counting as transient and without erasing history; `COST_GUARD` never enters the window.
+- **retry**: 429 honours `Retry-After` (capped at 120s); 5xx / network / timeout back off exponentially 2s→4s→8s→16s with jitter; one logical call is bounded by `GEMINI_CALL_BUDGET_SECONDS=240`, one run by `RUN_BUDGET_SECONDS=2100`, and the HTTP timeout is clamped to the remaining budget.
+- **breaker**: when transient failures among the last `BREAKER_WINDOW(5)` AI logical calls reach `BREAKER_THRESHOLD(3)`, the run stops AI processing for the remaining candidates. Granularity is exactly one event per logical call; `SchemaError`/`GeminiResponseError` occupy a slot without counting as transient and without clearing history.
+- **JSON repair**: invalid structured output is repaired through one normal model call sharing the deadline, retries and timeout budget.
+- If a model explicitly rejects `thinkingConfig` with a 400, the run downgrades to the model default and records `thinking_downgrades`.
 
-Retries: 429 honours `Retry-After` first (capped at 120 s); 5xx/network/timeout use exponential backoff 2s→4s→8s→16s with jitter; one logical call is capped by `GEMINI_CALL_BUDGET_SECONDS=240`, the run by `RUN_BUDGET_SECONDS=2100`, and HTTP timeouts are clamped to the remaining budget.
+## Outcomes
 
-## Installation and configuration
+Candidate statuses are simple: `PUBLISHED` / `SKIPPED` / `FAILED` (`SKIPPED` covers researcher-skip, reviewer-reject and revision-limit).
+
+| Run outcome | Condition | exit code |
+| --- | --- | --- |
+| `SUCCESS` | no candidate failures and no early stop | 0 |
+| `PARTIAL_SUCCESS` | failures or an early stop, but at least one item published | 0 |
+| `FAILED` | nothing published together with failures / early stop, or a program-level fault | 1 |
+
+Already-published items never turn the run into `FAILED`; a run where every candidate is skipped by the editorial rules (`published == 0`, no failures) counts as a normal completion.
+
+## Observability
+
+Per candidate the logs record `id`, `source`, current node, revisions, terminal status and error category. The run summary reports discovered / selected / processed / published / skipped (broken down by reason) / failed / revisions / breaker status / the three model names / final outcome, plus Gemini-level requests, retries, transient failures, JSON repairs and thinking downgrades. Setting `RUN_SUMMARY_PATH` also writes a JSON summary as a business artifact.
+
+## Install and configure
 
 ```bash
 python -m venv .venv
@@ -139,70 +127,68 @@ REVIEWER_MODEL=your_reviewer_model
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 TELEGRAM_CHAT_ID=your_telegram_chat_id
 ARTICLES_PER_FEED=2
+MAX_CANDIDATES_PER_RUN=6
 MAX_REVISIONS=1
 ```
 
-Git ignores `.env`; the Gemini key travels in the `x-goog-api-key` header. GitHub Actions reads credentials from Repository Secrets and model names from Repository Variables.
+`.env` is git-ignored; the Gemini key travels in the `x-goog-api-key` header and logs only contain safe fields. GitHub Actions uses Repository Secrets for credentials and Repository Variables for model names.
 
 ## GitHub Actions
 
-Runs daily at 06:55 Asia/Shanghai (`55 22 * * *` UTC) and supports `workflow_dispatch`. The job uses `timeout-minutes: 60` and `concurrency.cancel-in-progress: false` so only one run touches the ledger.
+Runs daily at 06:55 Asia/Shanghai (`55 22 * * *` UTC) and supports `workflow_dispatch`; both paths use the same application architecture.
 
-Manual inputs:
+```text
+checkout → setup python → install → run application (Secrets / Variables)
+→ upload run summary artifact → notification (in-app Telegram)
+```
 
-- `paid_budget_usd`: paid ceiling for this manual run, default `0.05`, code hard max `0.10`.
-- `ledger_anchor_usd`: recovery only, for re-anchoring spend after a lost ledger.
-
-Pipeline: `Prepare cost ledger` (read the previous artifact, write the run_open reservation) → `python main.py` → `Upload cost ledger` (`if: always()`, so failures and crashes still persist spend).
-
-## Run locally
+## Local runs
 
 ```bash
 python main.py
 ```
 
-Local runs default to `RUN_MODE=manual` and skip ledger writes unless `COST_LEDGER_PATH` is set.
+`PUBLISH_ENABLED=0` performs a dry run without sending Telegram messages; `MAX_CANDIDATES_PER_RUN=1` gives a single-candidate smoke test.
 
 ## Calls per article
 
 ```text
-typical (KEEP → PASS): Researcher 1 + Writer 1 + Reviewer 1 = 3
-one revision:          + Writer 1 + Reviewer 1               = 5
-SKIP:                  Researcher only                       = 1
-JSON repair:           +1 only when the output is invalid (billed separately)
+Typical (KEEP → PASS): Researcher 1 + Writer 1 + Reviewer 1 = 3
+One revision:          + Writer 1 + Reviewer 1             = 5
+SKIP / REJECT:         stops at the terminal node
+JSON repair:           +1 only when the output is invalid
 ```
 
 ## Tests
 
 ```bash
-python -m compileall .
-python -m unittest discover -s tests
+python -m compileall src tests main.py
+python -m unittest discover -s tests -t tests
+python -m ruff check .
 ```
 
-## Project structure
+Tests follow the pipeline stages: `test_sources` (canonical dedupe / garbage / recency / round-robin / limit), `test_researcher`, `test_writer`, `test_reviewer`, `test_graph` (publish / skip / revision / revision limit / node failure), `test_gemini`, `test_breaker`, `test_runner` (SUCCESS / PARTIAL_SUCCESS / FAILED) and `test_smoke_pipeline` (end-to-end run with every HTTP dependency mocked).
+
+## Project layout
 
 ```text
 .
 ├─ src/daily_chip_news/
-│  ├─ app.py          # batch orchestration, outcome, summary, ledger wiring
-│  ├─ config.py       # environment settings, budget parsing, editorial constants
-│  ├─ cost.py         # pricing table and token cost math
-│  ├─ cost_guard.py   # pre-flight / reservation / reconcile
+│  ├─ config.py       # single configuration entry point
+│  ├─ sources.py      # RSS ingestion and deterministic candidate selection
+│  ├─ schemas.py      # Candidate / ResearchNotes / Draft / Review / GraphState
+│  ├─ gemini.py       # unified Gemini client
+│  ├─ nodes/
+│  │  ├─ researcher.py
+│  │  ├─ writer.py
+│  │  └─ reviewer.py
+│  ├─ graph.py        # LangGraph StateGraph and revision loop
+│  ├─ health.py       # breaker
 │  ├─ errors.py       # failure taxonomy and routing flags
-│  ├─ gemini.py       # Gemini client: retry/timeout/countTokens/structured JSON
-│  ├─ graph.py        # LangGraph StateGraph
-│  ├─ health.py       # rolling-window service health
-│  ├─ ledger.py       # rolling 30-day cost ledger and artifact reader
-│  ├─ metrics.py      # run counters and token/cost accumulation
-│  ├─ outcomes.py     # outcome state machine and exit codes
-│  ├─ publisher.py
-│  ├─ schemas.py
-│  ├─ sources.py      # RSS collection, extraction, cleaning, candidate control
-│  └─ nodes/
-│     ├─ researcher.py
-│     ├─ writer.py
-│     └─ reviewer.py
-├─ scripts/ledger_prepare.py
+│  ├─ metrics.py      # run-level counters
+│  ├─ outcomes.py     # candidate / run outcomes and exit codes
+│  ├─ publisher.py    # deterministic Telegram publishing and alerts
+│  └─ runner.py       # candidate loop, run summary, notification
 ├─ tests/
 ├─ docs/architecture.md
 ├─ .github/workflows/daily_news.yml
@@ -211,4 +197,4 @@ python -m unittest discover -s tests
 └─ requirements.txt
 ```
 
-See [`docs/architecture.md`](docs/architecture.md) for state, data contracts and the cost lifecycle.
+See [`docs/architecture.md`](docs/architecture.md) for states, data contracts and the runtime path.

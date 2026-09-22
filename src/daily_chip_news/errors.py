@@ -1,11 +1,10 @@
-"""Unified failure taxonomy: article-level vs Gemini service-level vs workflow-level."""
+"""Unified failure taxonomy: candidate-level vs service-level vs run-level."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 
-from .cost_guard import CostGuardExceeded
 from .gemini import GeminiAPIError, GeminiResponseError, GeminiTruncatedResponseError
 from .health import HealthEvent
 from .publisher import PublisherError
@@ -13,8 +12,8 @@ from .schemas import SchemaError
 from .sources import SourceError
 
 
-class FailureCategory(str, Enum):
-    """Machine-readable failure classes used by routing, health and the summary."""
+class FailureCategory(StrEnum):
+    """Machine-readable failure classes used by routing, breaker and summary."""
 
     TRANSIENT_RATE_LIMIT = "TRANSIENT_RATE_LIMIT"
     TRANSIENT_SERVER = "TRANSIENT_SERVER"
@@ -22,11 +21,9 @@ class FailureCategory(str, Enum):
     MODEL_RESPONSE_INVALID = "MODEL_RESPONSE_INVALID"
     MODEL_RESPONSE_TRUNCATED = "MODEL_RESPONSE_TRUNCATED"
     SCHEMA_INVALID = "SCHEMA_INVALID"
-    CONTENT_REJECTED = "CONTENT_REJECTED"
     SOURCE_ERROR = "SOURCE_ERROR"
     PUBLISH_ERROR = "PUBLISH_ERROR"
     CONFIG_ERROR = "CONFIG_ERROR"
-    COST_GUARD = "COST_GUARD"
     UNEXPECTED_ERROR = "UNEXPECTED_ERROR"
 
 
@@ -55,23 +52,14 @@ class FailureInfo:
 
     category: FailureCategory
     transient: bool
-    # Stop processing further articles (configuration errors, program faults).
+    # Stop processing further candidates (configuration errors, program faults).
     stop_run: bool
-    # The run is FAILED even when articles were already published.
+    # The run is FAILED even when candidates were already published.
     force_failed: bool
 
 
 def classify_failure(stage: str, cause: Exception) -> FailureInfo:
     """Map a node exception to one category and its run-level routing flags."""
-    if isinstance(cause, CostGuardExceeded):
-        # Budget protection is an expected operational stop: it must not be
-        # retried and must never look like a Gemini service failure.
-        return FailureInfo(
-            FailureCategory.COST_GUARD,
-            transient=False,
-            stop_run=True,
-            force_failed=False,
-        )
     if isinstance(cause, GeminiTruncatedResponseError):
         return FailureInfo(
             FailureCategory.MODEL_RESPONSE_TRUNCATED,
@@ -119,7 +107,7 @@ def classify_failure(stage: str, cause: Exception) -> FailureInfo:
                 force_failed=False,
             )
         # Authentication, permission and model configuration failures stop the run
-        # but stay partial successes when articles were already published.
+        # but stay partial successes when candidates were already published.
         return FailureInfo(
             FailureCategory.CONFIG_ERROR,
             transient=False,
@@ -143,7 +131,7 @@ def classify_failure(stage: str, cause: Exception) -> FailureInfo:
 
 
 def health_event_for(stage: str, info: FailureInfo) -> HealthEvent | None:
-    """Return the health-window event for one node exception, or None."""
+    """Return the breaker event for one node exception, or None."""
     if stage not in AI_STAGES:
         return None
     if info.category in TRANSIENT_CATEGORIES:
@@ -159,7 +147,7 @@ def record_health_outcome(
     stage: str,
     cause: Exception | None = None,
 ) -> None:
-    """Record exactly one health event for one logical AI call.
+    """Record exactly one breaker event for one logical AI call.
 
     ``cause is None`` means the call (including local schema validation)
     succeeded. Failures that are not Gemini service signals, such as a source

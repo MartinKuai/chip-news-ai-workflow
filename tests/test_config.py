@@ -3,123 +3,144 @@ from __future__ import annotations
 import unittest
 
 from _support import SRC  # noqa: F401
-from daily_chip_news.config import ConfigError, Settings
+
+from daily_chip_news.config import DEFAULT_SOURCES, ConfigError, Settings
+
+BASE_ENV = {
+    "GEMINI_API_KEY": "gemini-key",
+    "RESEARCHER_MODEL": "researcher-model",
+    "WRITER_MODEL": "writer-model",
+    "REVIEWER_MODEL": "reviewer-model",
+    "TELEGRAM_BOT_TOKEN": "telegram-token",
+    "TELEGRAM_CHAT_ID": "telegram-chat",
+}
 
 
-def valid_env() -> dict[str, str]:
-    return {
-        "GEMINI_API_KEY": "test-key",
-        "RESEARCHER_MODEL": "researcher-model",
-        "WRITER_MODEL": "writer-model",
-        "REVIEWER_MODEL": "review-model",
-        "TELEGRAM_BOT_TOKEN": "test-token",
-        "TELEGRAM_CHAT_ID": "test-chat",
-        "ARTICLES_PER_FEED": "3",
-        "MAX_REVISIONS": "1",
-    }
+def env(**overrides: str) -> dict[str, str]:
+    values = dict(BASE_ENV)
+    values.update(overrides)
+    return values
 
 
-class SettingsTests(unittest.TestCase):
-    def test_missing_api_key_fails_clearly(self) -> None:
-        env = valid_env()
-        env.pop("GEMINI_API_KEY")
-        with self.assertRaisesRegex(ConfigError, "GEMINI_API_KEY is not configured"):
-            Settings.from_env(env)
+class ConfigDefaultsTests(unittest.TestCase):
+    def test_node_profiles_come_from_their_own_variables(self) -> None:
+        settings = Settings.from_env(env())
+        self.assertEqual("researcher-model", settings.researcher.model)
+        self.assertEqual("writer-model", settings.writer.model)
+        self.assertEqual("reviewer-model", settings.reviewer.model)
 
-    def test_models_are_read_independently(self) -> None:
-        settings = Settings.from_env(valid_env())
-        self.assertEqual("researcher-model", settings.researcher_model)
-        self.assertEqual("writer-model", settings.writer_model)
-        self.assertEqual("review-model", settings.reviewer_model)
-        self.assertEqual(3, settings.articles_per_feed)
+    def test_generation_defaults_follow_the_verified_values(self) -> None:
+        settings = Settings.from_env(env())
+        self.assertEqual("low", settings.researcher.thinking_level)
+        self.assertEqual("low", settings.writer.thinking_level)
+        self.assertEqual("low", settings.reviewer.thinking_level)
+        self.assertEqual(3072, settings.researcher.max_output_tokens)
+        self.assertEqual(2560, settings.writer.max_output_tokens)
+        self.assertEqual(1024, settings.reviewer.max_output_tokens)
 
-    def test_quality_oriented_defaults(self) -> None:
-        settings = Settings.from_env(valid_env())
-        self.assertEqual(1, settings.max_revisions)
-        self.assertEqual("low", settings.researcher_thinking_level)
-        self.assertEqual("low", settings.writer_thinking_level)
-        self.assertEqual("low", settings.reviewer_thinking_level)
-        self.assertGreaterEqual(settings.gemini_timeout_seconds, 120.0)
-        self.assertGreaterEqual(settings.gemini_max_attempts, 5)
-        self.assertEqual(3072, settings.researcher_max_output_tokens)
-        self.assertEqual(2560, settings.writer_max_output_tokens)
-        self.assertEqual(1024, settings.reviewer_max_output_tokens)
+    def test_pipeline_defaults(self) -> None:
+        settings = Settings.from_env(env())
+        self.assertEqual(DEFAULT_SOURCES, settings.source_feeds)
+        self.assertEqual(2, settings.articles_per_feed)
         self.assertEqual(6, settings.max_candidates_per_run)
+        self.assertEqual(72.0, settings.max_candidate_age_hours)
+        self.assertEqual(1, settings.max_revisions)
         self.assertEqual(12000, settings.article_content_chars)
-        self.assertEqual(5, settings.health_window_size)
-        self.assertEqual(3, settings.health_failure_threshold)
 
-    def test_candidate_cap_is_configurable_and_bounded(self) -> None:
-        env = valid_env()
-        env["MAX_CANDIDATES_PER_RUN"] = "4"
-        self.assertEqual(4, Settings.from_env(env).max_candidates_per_run)
-        env["MAX_CANDIDATES_PER_RUN"] = "0"
-        with self.assertRaisesRegex(ConfigError, "MAX_CANDIDATES_PER_RUN"):
-            Settings.from_env(env)
+    def test_client_and_breaker_defaults(self) -> None:
+        settings = Settings.from_env(env())
+        self.assertEqual(180.0, settings.gemini_timeout_seconds)
+        self.assertEqual(5, settings.gemini_max_attempts)
+        self.assertEqual(240.0, settings.gemini_call_budget_seconds)
+        self.assertTrue(settings.gemini_structured_output)
+        self.assertEqual(5, settings.breaker_window_size)
+        self.assertEqual(3, settings.breaker_failure_threshold)
+        self.assertEqual(2100.0, settings.run_budget_seconds)
 
-    def test_max_revisions_is_parsed(self) -> None:
-        env = valid_env()
-        env["MAX_REVISIONS"] = "2"
-        self.assertEqual(2, Settings.from_env(env).max_revisions)
+    def test_publishing_defaults(self) -> None:
+        settings = Settings.from_env(env())
+        self.assertTrue(settings.publish_enabled)
+        self.assertEqual(15.0, settings.telegram_timeout_seconds)
+        self.assertEqual("", settings.summary_path)
 
-    def test_max_revisions_is_bounded(self) -> None:
-        env = valid_env()
-        env["MAX_REVISIONS"] = "3"
-        with self.assertRaisesRegex(ConfigError, "MAX_REVISIONS"):
-            Settings.from_env(env)
 
-    def test_placeholder_model_is_rejected(self) -> None:
-        env = valid_env()
-        env["WRITER_MODEL"] = "your_writer_model"
-        with self.assertRaisesRegex(ConfigError, "WRITER_MODEL"):
-            Settings.from_env(env)
+class ConfigOverrideTests(unittest.TestCase):
+    def test_per_node_overrides(self) -> None:
+        settings = Settings.from_env(
+            env(
+                RESEARCHER_THINKING_LEVEL="high",
+                WRITER_THINKING_LEVEL="off",
+                REVIEWER_MAX_OUTPUT_TOKENS="2048",
+                MAX_CANDIDATES_PER_RUN="3",
+                MAX_REVISIONS="2",
+                ARTICLES_PER_FEED="4",
+                ARTICLE_CONTENT_CHARS="8000",
+            )
+        )
+        self.assertEqual("high", settings.researcher.thinking_level)
+        self.assertEqual("", settings.writer.thinking_level)
+        self.assertEqual(2048, settings.reviewer.max_output_tokens)
+        self.assertEqual(3, settings.max_candidates_per_run)
+        self.assertEqual(2, settings.max_revisions)
+        self.assertEqual(4, settings.articles_per_feed)
+        self.assertEqual(8000, settings.article_content_chars)
 
-    def test_invalid_thinking_level_is_rejected(self) -> None:
-        env = valid_env()
-        env["WRITER_THINKING_LEVEL"] = "extreme"
-        with self.assertRaisesRegex(ConfigError, "WRITER_THINKING_LEVEL"):
-            Settings.from_env(env)
+    def test_source_feeds_accept_commas_and_newlines(self) -> None:
+        settings = Settings.from_env(
+            env(SOURCE_FEEDS="https://a.example/feed,\nhttps://b.example/feed")
+        )
+        self.assertEqual(
+            ("https://a.example/feed", "https://b.example/feed"),
+            settings.source_feeds,
+        )
 
-    def test_threshold_above_window_is_rejected(self) -> None:
-        env = valid_env()
-        env["GEMINI_HEALTH_WINDOW"] = "4"
-        env["GEMINI_HEALTH_THRESHOLD"] = "5"
-        with self.assertRaisesRegex(ConfigError, "GEMINI_HEALTH_THRESHOLD"):
-            Settings.from_env(env)
+    def test_recency_filter_can_be_disabled(self) -> None:
+        settings = Settings.from_env(env(MAX_CANDIDATE_AGE_HOURS="0"))
+        self.assertEqual(0.0, settings.max_candidate_age_hours)
 
-    def test_structured_output_flag_is_parsed(self) -> None:
-        env = valid_env()
-        env["GEMINI_STRUCTURED_OUTPUT"] = "off"
-        self.assertFalse(Settings.from_env(env).gemini_structured_output)
+    def test_publishing_overrides(self) -> None:
+        settings = Settings.from_env(
+            env(
+                PUBLISH_ENABLED="0",
+                RUN_SUMMARY_PATH="output/run-summary.json",
+                BREAKER_WINDOW="8",
+                BREAKER_THRESHOLD="4",
+            )
+        )
+        self.assertFalse(settings.publish_enabled)
+        self.assertEqual("output/run-summary.json", settings.summary_path)
+        self.assertEqual(8, settings.breaker_window_size)
+        self.assertEqual(4, settings.breaker_failure_threshold)
 
-    def test_run_budget_depends_on_run_mode(self) -> None:
-        env = valid_env()
-        env["RUN_MODE"] = "scheduled"
-        self.assertEqual(0.20, Settings.from_env(env).run_budget_usd)
-        env["RUN_MODE"] = "manual"
-        env["MANUAL_RUN_BUDGET_USD"] = "0.03"
-        self.assertEqual(0.03, Settings.from_env(env).run_budget_usd)
 
-    def test_manual_budget_hard_max_is_enforced(self) -> None:
-        env = valid_env()
-        env["MANUAL_RUN_BUDGET_USD"] = "0.50"
-        with self.assertRaisesRegex(ConfigError, "MANUAL_RUN_BUDGET_USD"):
-            Settings.from_env(env)
+class ConfigErrorTests(unittest.TestCase):
+    def test_missing_required_value(self) -> None:
+        values = env()
+        values.pop("GEMINI_API_KEY")
+        with self.assertRaises(ConfigError):
+            Settings.from_env(values)
 
-    def test_manual_budget_may_be_zero_for_guard_verification(self) -> None:
-        env = valid_env()
-        env["MANUAL_RUN_BUDGET_USD"] = "0"
-        self.assertEqual(0.0, Settings.from_env(env).run_budget_usd)
+    def test_placeholder_value_is_rejected(self) -> None:
+        with self.assertRaises(ConfigError):
+            Settings.from_env(env(GEMINI_API_KEY="your_gemini_api_key"))
 
-    def test_rolling_budget_default_is_below_the_promotional_credit(self) -> None:
-        settings = Settings.from_env(valid_env())
-        self.assertEqual(7.50, settings.gemini_rolling_30d_budget_usd)
+    def test_non_integer_and_non_boolean_values(self) -> None:
+        with self.assertRaises(ConfigError):
+            Settings.from_env(env(MAX_CANDIDATES_PER_RUN="many"))
+        with self.assertRaises(ConfigError):
+            Settings.from_env(env(PUBLISH_ENABLED="sometimes"))
 
-    def test_timeout_cannot_be_set_below_the_quality_floor(self) -> None:
-        env = valid_env()
-        env["GEMINI_TIMEOUT_SECONDS"] = "10"
-        with self.assertRaisesRegex(ConfigError, "GEMINI_TIMEOUT_SECONDS"):
-            Settings.from_env(env)
+    def test_unknown_thinking_level(self) -> None:
+        with self.assertRaises(ConfigError):
+            Settings.from_env(env(REVIEWER_THINKING_LEVEL="max"))
+
+    def test_threshold_must_not_exceed_window(self) -> None:
+        with self.assertRaises(ConfigError):
+            Settings.from_env(env(BREAKER_WINDOW="3", BREAKER_THRESHOLD="4"))
+
+    def test_empty_source_feeds_are_rejected(self) -> None:
+        with self.assertRaises(ConfigError):
+            Settings.from_env(env(SOURCE_FEEDS=" , "))
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""The actual LangGraph StateGraph for the bounded editorial workflow."""
+"""The editorial pipeline graph: Researcher -> Writer -> Reviewer loop."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ from typing import Any, Literal
 from langgraph.graph import END, START, StateGraph
 
 from .config import Settings
-from .cost_guard import CostGuard
 from .gemini import GeminiClient
 from .health import ServiceHealth
 from .metrics import RunMetrics
@@ -17,8 +16,18 @@ from .publisher import PublisherNode, TelegramPublisher
 from .schemas import GraphState, SchemaError
 from .sources import ArticleExtractor
 
-
 GraphNode = Callable[[GraphState], dict[str, Any]]
+StepRecorder = Callable[[str, str], None]
+
+STATUS_NEW = "NEW"
+STATUS_SKIP = "SKIP"
+STATUS_RESEARCHED = "RESEARCHED"
+STATUS_DRAFTED = "DRAFTED"
+STATUS_PASS = "PASS"
+STATUS_REVISE = "REVISE"
+STATUS_REJECT = "REJECT"
+STATUS_HOLD = "HOLD"
+STATUS_PUBLISHED = "PUBLISHED"
 
 
 class NodeExecutionError(RuntimeError):
@@ -37,10 +46,19 @@ def build_editorial_graph(
     reviewer: GraphNode,
     publisher: GraphNode,
     max_revisions: int,
+    on_step: StepRecorder | None = None,
 ):
-    """Build START -> Researcher -> Writer -> Reviewer with bounded routing."""
+    """Build START -> Researcher -> Writer -> Reviewer with bounded routing.
+
+    Terminal statuses: ``SKIP`` (not relevant), ``REJECT`` (not publishable),
+    ``HOLD`` (revision limit reached) and ``PUBLISHED``.
+    """
     if max_revisions < 0:
         raise ValueError("max_revisions cannot be negative")
+
+    def record(stage: str, status: str) -> None:
+        if on_step is not None:
+            on_step(stage, status)
 
     def research_node(state: GraphState) -> dict[str, Any]:
         try:
@@ -51,14 +69,13 @@ def build_editorial_graph(
             decision = str(notes.get("decision", "")).upper()
             if decision not in {"KEEP", "SKIP"}:
                 raise SchemaError("Researcher decision must be KEEP or SKIP")
-            return {
-                **update,
-                "status": "SKIP" if decision == "SKIP" else "RESEARCHED",
-            }
+            status = STATUS_SKIP if decision == "SKIP" else STATUS_RESEARCHED
         except NodeExecutionError:
             raise
         except Exception as exc:
             raise NodeExecutionError("researcher", exc) from exc
+        record("researcher", status)
+        return {**update, "status": status}
 
     def writer_node(state: GraphState) -> dict[str, Any]:
         try:
@@ -66,11 +83,12 @@ def build_editorial_graph(
             draft = update.get("draft")
             if not isinstance(draft, dict) or not draft:
                 raise SchemaError("Writer node did not return a draft")
-            return {**update, "status": "DRAFTED"}
         except NodeExecutionError:
             raise
         except Exception as exc:
             raise NodeExecutionError("writer", exc) from exc
+        record("writer", STATUS_DRAFTED)
+        return {**update, "status": STATUS_DRAFTED}
 
     def review_node(state: GraphState) -> dict[str, Any]:
         try:
@@ -79,57 +97,65 @@ def build_editorial_graph(
             if not isinstance(review, dict):
                 raise SchemaError("Reviewer node did not return a review")
             decision = str(review.get("status", "")).upper()
-            if decision == "PASS":
-                return {
-                    **update,
-                    "status": "PASS",
-                    "revision_brief": [],
-                }
-            if decision != "REJECT":
-                raise SchemaError("Reviewer status must be PASS or REJECT")
-
             brief = review.get("revision_brief", [])
-            if not isinstance(brief, list) or not brief:
-                raise SchemaError("Reviewer REJECT requires revision_brief")
-            revision_count = int(state.get("revision_count", 0))
-            if revision_count >= max_revisions:
-                return {
+            if decision == STATUS_PASS:
+                result = {**update, "status": STATUS_PASS, "revision_brief": []}
+            elif decision == STATUS_REJECT:
+                result = {
                     **update,
-                    "status": "HOLD",
-                    "revision_brief": list(brief),
-                    "revision_count": revision_count,
+                    "status": STATUS_REJECT,
+                    "revision_brief": list(brief) if isinstance(brief, list) else [],
                 }
-            return {
-                **update,
-                "status": "REJECT",
-                "revision_brief": list(brief),
-                "revision_count": revision_count + 1,
-            }
+            elif decision == STATUS_REVISE:
+                if not isinstance(brief, list) or not brief:
+                    raise SchemaError("Reviewer REVISE requires revision_brief")
+                revision_count = int(state.get("revision_count", 0))
+                if revision_count >= max_revisions:
+                    # Hard revision limit: keep the instructions for the summary.
+                    result = {
+                        **update,
+                        "status": STATUS_HOLD,
+                        "revision_brief": list(brief),
+                        "revision_count": revision_count,
+                    }
+                else:
+                    result = {
+                        **update,
+                        "status": STATUS_REVISE,
+                        "revision_brief": list(brief),
+                        "revision_count": revision_count + 1,
+                    }
+            else:
+                raise SchemaError("Reviewer status must be PASS, REVISE or REJECT")
         except NodeExecutionError:
             raise
         except Exception as exc:
             raise NodeExecutionError("reviewer", exc) from exc
+        record("reviewer", result["status"])
+        return result
 
     def publish_node(state: GraphState) -> dict[str, Any]:
         try:
             update = publisher(state)
-            return {**update, "published": True, "status": "PASS"}
         except NodeExecutionError:
             raise
         except Exception as exc:
             raise NodeExecutionError("publisher", exc) from exc
+        record("publisher", STATUS_PUBLISHED)
+        return {**update, "published": True, "status": STATUS_PUBLISHED}
 
     def after_researcher(state: GraphState) -> Literal["writer", "end"]:
-        return "end" if state["status"] == "SKIP" else "writer"
+        return "end" if state["status"] == STATUS_SKIP else "writer"
 
     def after_reviewer(state: GraphState) -> Literal["writer", "publisher", "end"]:
-        if state["status"] == "PASS":
+        status = state["status"]
+        if status == STATUS_PASS:
             return "publisher"
-        if state["status"] == "REJECT":
+        if status == STATUS_REVISE:
             return "writer"
-        if state["status"] == "HOLD":
+        if status in {STATUS_REJECT, STATUS_HOLD}:
             return "end"
-        raise SchemaError(f"Unexpected graph status after review: {state['status']}")
+        raise SchemaError(f"Unexpected graph status after review: {status}")
 
     builder = StateGraph(GraphState)
     builder.add_node("researcher", research_node)
@@ -154,13 +180,13 @@ def create_runtime_graph(
     settings: Settings,
     *,
     metrics: RunMetrics | None = None,
-    health: ServiceHealth | None = None,
-    cost_guard: CostGuard | None = None,
+    breaker: ServiceHealth | None = None,
     run_deadline: float | None = None,
+    on_step: StepRecorder | None = None,
 ):
     """Wire real infrastructure while preserving independent model selection."""
     run_metrics = metrics or RunMetrics()
-    health_recorder = health.record if health is not None else None
+    record = breaker.record if breaker is not None else None
     client = GeminiClient(
         settings.gemini_api_key,
         timeout=settings.gemini_timeout_seconds,
@@ -168,42 +194,38 @@ def create_runtime_graph(
         call_budget_seconds=settings.gemini_call_budget_seconds,
         structured_output=settings.gemini_structured_output,
         run_deadline=run_deadline,
-        cost_guard=cost_guard,
         logger=print,
         metrics=run_metrics,
     )
     return build_editorial_graph(
         researcher=ResearcherNode(
             client,
-            settings.researcher_model,
+            settings.researcher,
             ArticleExtractor(),
             metrics=run_metrics,
-            health_recorder=health_recorder,
-            thinking_level=settings.researcher_thinking_level,
-            max_output_tokens=settings.researcher_max_output_tokens,
+            health_recorder=record,
             max_content_chars=settings.article_content_chars,
         ),
         writer=WriterNode(
             client,
-            settings.writer_model,
+            settings.writer,
             metrics=run_metrics,
-            health_recorder=health_recorder,
-            thinking_level=settings.writer_thinking_level,
-            max_output_tokens=settings.writer_max_output_tokens,
+            health_recorder=record,
         ),
         reviewer=ReviewerNode(
             client,
-            settings.reviewer_model,
+            settings.reviewer,
             metrics=run_metrics,
-            health_recorder=health_recorder,
-            thinking_level=settings.reviewer_thinking_level,
-            max_output_tokens=settings.reviewer_max_output_tokens,
+            health_recorder=record,
         ),
         publisher=PublisherNode(
             TelegramPublisher(
                 settings.telegram_bot_token,
                 settings.telegram_chat_id,
+                timeout=settings.telegram_timeout_seconds,
+                enabled=settings.publish_enabled,
             )
         ),
         max_revisions=settings.max_revisions,
+        on_step=on_step,
     )

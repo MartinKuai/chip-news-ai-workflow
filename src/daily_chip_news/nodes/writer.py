@@ -5,13 +5,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from ..config import EDITORIAL_BRIEF
+from ..config import EDITORIAL_BRIEF, NodeProfile
 from ..errors import record_health_outcome
 from ..gemini import JSONClient
 from ..health import HealthEvent
 from ..metrics import RunMetrics
 from ..schemas import GraphState, validate_draft
-
 
 WRITER_OUTPUT_SCHEMA = {
     "headline": "concise Chinese headline",
@@ -43,8 +42,11 @@ WRITER_OUTPUT_SPEC = {
 
 WRITER_INSTRUCTION = """
 你是 Writer（写手）。每次调用都是全新的干净上下文。
-只能使用 payload 中的 Editorial Brief、Structured Research Notes、Revision Brief 和 Output Schema。
-不得补充 Research Notes 中不存在的事实、数字、因果、预测或背景知识。
+只能使用 payload 中的 Editorial Brief、Structured Research Notes、
+Revision Brief 和 Output Schema。
+不得补充 Research Notes 中不存在的事实、数字、公司名、产品名、型号、
+因果、预测或背景知识。
+Research Notes 的 entities 与 key_numbers 是事实基线，必须与之保持一致。
 写作使用中文，简洁、克制、事实优先，不写营销腔。
 返工时只执行精简 revision_brief，只修改 previous_draft，不新增事实。
 严格返回符合 output_schema 的 JSON 对象。
@@ -57,19 +59,15 @@ class WriterNode:
     def __init__(
         self,
         client: JSONClient,
-        model: str,
+        profile: NodeProfile,
         *,
         metrics: RunMetrics | None = None,
         health_recorder: Callable[[HealthEvent], None] | None = None,
-        thinking_level: str = "low",
-        max_output_tokens: int = 2560,
     ) -> None:
         self._client = client
-        self._model = model
+        self._profile = profile
         self._metrics = metrics
         self._health_recorder = health_recorder
-        self._thinking_level = thinking_level
-        self._max_output_tokens = max_output_tokens
 
     def __call__(self, state: GraphState) -> dict[str, Any]:
         try:
@@ -96,12 +94,12 @@ class WriterNode:
         if previous_draft and revision_brief:
             payload["previous_draft"] = previous_draft
         result = self._client.request_json(
-            model=self._model,
+            model=self._profile.model,
             system_instruction=WRITER_INSTRUCTION,
             payload=payload,
             purpose="writer",
             output_schema=WRITER_OUTPUT_SPEC,
-            thinking_level=self._thinking_level,
-            max_output_tokens=self._max_output_tokens,
+            thinking_level=self._profile.thinking_level,
+            max_output_tokens=self._profile.max_output_tokens,
         )
         return {"draft": validate_draft(result), "status": "DRAFTED"}

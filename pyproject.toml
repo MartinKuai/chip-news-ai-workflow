@@ -1,0 +1,10 @@
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+exclude = [".git", ".venv", "__pycache__"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "SIM", "BLE", "UP"]
+# Source ingestion, node isolation and alert delivery must survive any exception
+# raised by a third-party library, and record only type(exc).__name__.
+ignore = ["BLE001"]

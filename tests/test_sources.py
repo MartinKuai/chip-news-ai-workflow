@@ -1,286 +1,361 @@
 from __future__ import annotations
 
 import unittest
+from datetime import UTC, datetime
+from unittest.mock import patch
 
-from _support import SRC  # noqa: F401
+import requests
+from _support import SRC, FakeResponse, FakeSession  # noqa: F401
+
 from daily_chip_news.sources import (
+    ArticleExtractor,
     SourceCollectionError,
+    SourceError,
+    candidate_id,
+    canonical_url,
     clean_extracted_text,
     collect_articles,
+    published_timestamp,
     select_candidates,
 )
 
+NOW = datetime(2026, 9, 23, 12, 0, tzinfo=UTC).timestamp()
 
-FEEDS = tuple(f"https://feed-{index}.example/rss" for index in range(5))
+
+def iso_hours_ago(hours: float) -> str:
+    moment = datetime.fromtimestamp(NOW - hours * 3600.0, tz=UTC)
+    return moment.isoformat()
 
 
-def entry(index: int) -> dict[str, str]:
+def candidate(
+    url: str,
+    *,
+    title: str = "A useful semiconductor headline",
+    source: str = "Feed A",
+    published: str = "",
+) -> dict:
     return {
-        "title": f"Article {index}",
-        "link": f"https://articles.example/{index}",
-        "published": "2026-08-24",
+        "id": candidate_id(url),
+        "title": title,
+        "url": url,
+        "source": source,
+        "published_at": published,
+        "metadata": {},
     }
 
 
 class FakeFeed:
     def __init__(
         self,
-        index: int,
+        entries=(),
         *,
-        bozo: bool = False,
-        entries: list[dict[str, str]] | None = None,
-        error: Exception | None = None,
+        feed_title: str = "Feed",
         status: int = 200,
+        bozo: bool = False,
+        bozo_exception: Exception | None = None,
     ) -> None:
-        self.feed = {"title": f"Source {index}"}
-        self.entries = [entry(index)] if entries is None else entries
-        self.bozo = bozo
-        self.bozo_exception = error
+        self.entries = list(entries)
+        self.feed = {"title": feed_title}
         self.status = status
+        self.bozo = bozo
+        self.bozo_exception = bozo_exception
 
 
-class SourceCollectionTests(unittest.TestCase):
-    def test_all_five_sources_succeed(self) -> None:
-        feeds = {url: FakeFeed(index) for index, url in enumerate(FEEDS)}
+def parser_for(mapping: dict[str, object]):
+    def parse(url: str):
+        result = mapping[url]
+        if isinstance(result, Exception):
+            raise result
+        return result
 
-        result = collect_articles(1, feeds=FEEDS, parser=feeds.__getitem__)
+    return parse
 
-        self.assertEqual(5, result.sources_total)
-        self.assertEqual(5, result.sources_ok)
-        self.assertEqual(0, result.sources_failed)
-        self.assertEqual(5, len(result.articles))
 
-    def test_one_failed_source_keeps_other_candidates(self) -> None:
-        feeds = {url: FakeFeed(index) for index, url in enumerate(FEEDS)}
-        feeds[FEEDS[2]] = FakeFeed(
-            2,
-            bozo=True,
-            entries=[],
-            error=ValueError("invalid feed"),
+class CanonicalUrlTests(unittest.TestCase):
+    def test_tracking_parameters_and_fragment_are_removed(self) -> None:
+        value = canonical_url(
+            "https://www.example.com/news/item/?utm_source=x&fbclid=y&id=7#top"
+        )
+        self.assertEqual("https://example.com/news/item?id=7", value)
+
+    def test_host_case_and_trailing_slash_are_normalized(self) -> None:
+        self.assertEqual(
+            canonical_url("HTTP://WWW.Example.COM/a/"),
+            canonical_url("http://example.com/a"),
         )
 
-        result = collect_articles(1, feeds=FEEDS, parser=feeds.__getitem__)
+    def test_remaining_query_parameters_are_sorted(self) -> None:
+        self.assertEqual(
+            "https://example.com/a?a=1&b=2",
+            canonical_url("https://example.com/a?b=2&a=1"),
+        )
 
-        self.assertEqual(4, result.sources_ok)
+
+class CandidateIdTests(unittest.TestCase):
+    def test_id_is_deterministic_across_tracking_variants(self) -> None:
+        first = candidate_id("https://www.example.com/a?utm_source=x")
+        second = candidate_id("https://example.com/a")
+        self.assertEqual(first, second)
+        self.assertEqual(10, len(first))
+
+    def test_different_urls_get_different_ids(self) -> None:
+        self.assertNotEqual(
+            candidate_id("https://example.com/a"),
+            candidate_id("https://example.com/b"),
+        )
+
+
+class SelectCandidateTests(unittest.TestCase):
+    def test_canonical_duplicates_are_removed(self) -> None:
+        selected = select_candidates(
+            [
+                candidate("https://www.example.com/a?utm_source=rss"),
+                candidate("https://example.com/a"),
+                candidate("https://example.com/a/"),
+            ],
+            limit=6,
+        )
+        self.assertEqual(1, len(selected))
+
+    def test_garbage_is_filtered(self) -> None:
+        junk = [
+            candidate("https://example.com/1", title="hi"),
+            candidate("https://example.com/2", title="Home"),
+            candidate("https://example.com/3", title="We are hiring engineers"),
+            candidate("https://example.com/jobs/4", title="Staff engineer"),
+            candidate("https://example.com/5", title="Weekly newsletter"),
+            candidate("", title="No URL at all"),
+        ]
+        self.assertEqual([], select_candidates(junk, limit=6))
+
+    def test_recency_filter_drops_known_stale_items_only(self) -> None:
+        selected = select_candidates(
+            [
+                candidate("https://example.com/fresh", published=iso_hours_ago(2)),
+                candidate("https://example.com/stale", published=iso_hours_ago(200)),
+                candidate("https://example.com/undated"),
+            ],
+            limit=6,
+            max_age_hours=72,
+            now=NOW,
+        )
+        urls = [item["url"] for item in selected]
+        self.assertIn("https://example.com/fresh", urls)
+        self.assertIn("https://example.com/undated", urls)
+        self.assertNotIn("https://example.com/stale", urls)
+
+    def test_recency_filter_can_be_disabled(self) -> None:
+        selected = select_candidates(
+            [candidate("https://example.com/stale", published=iso_hours_ago(5000))],
+            limit=6,
+            max_age_hours=0,
+            now=NOW,
+        )
+        self.assertEqual(1, len(selected))
+
+    def test_newest_item_leads_each_source(self) -> None:
+        selected = select_candidates(
+            [
+                candidate("https://example.com/old", published=iso_hours_ago(30)),
+                candidate("https://example.com/new", published=iso_hours_ago(1)),
+            ],
+            limit=6,
+            now=NOW,
+        )
+        self.assertEqual("https://example.com/new", selected[0]["url"])
+
+    def test_round_robin_keeps_sources_balanced(self) -> None:
+        items = [
+            candidate(f"https://a.example.com/{index}", source="A")
+            for index in range(3)
+        ] + [candidate("https://b.example.com/1", source="B")]
+        selected = select_candidates(items, limit=4)
+        self.assertEqual(["A", "B", "A", "A"], [item["source"] for item in selected])
+
+    def test_candidate_limit_is_enforced(self) -> None:
+        items = [candidate(f"https://example.com/{index}") for index in range(10)]
+        self.assertEqual(6, len(select_candidates(items, limit=6)))
+        self.assertEqual([], select_candidates(items, limit=0))
+
+    def test_max_per_source_caps_one_source(self) -> None:
+        items = [
+            candidate(f"https://a.example.com/{index}", source="A")
+            for index in range(5)
+        ]
+        selected = select_candidates(items, limit=6, max_per_source=2)
+        self.assertEqual(2, len(selected))
+
+
+class CollectArticlesTests(unittest.TestCase):
+    def test_candidates_carry_source_metadata_and_ids(self) -> None:
+        feed = FakeFeed(
+            [
+                {
+                    "title": "Chip news",
+                    "link": "https://example.com/a",
+                    "published": "x",
+                },
+            ],
+            feed_title="Example Feed",
+        )
+        result = collect_articles(
+            2,
+            feeds=["https://example.com/feed"],
+            parser=parser_for({"https://example.com/feed": feed}),
+        )
+        self.assertEqual(1, result.sources_ok)
+        entry = result.candidates[0]
+        self.assertEqual("Example Feed", entry["source"])
+        self.assertEqual("https://example.com/feed", entry["metadata"]["feed_url"])
+        self.assertEqual(candidate_id("https://example.com/a"), entry["id"])
+
+    def test_entries_per_feed_limit_is_applied(self) -> None:
+        feed = FakeFeed(
+            [
+                {"title": f"Story {index}", "link": f"https://example.com/{index}"}
+                for index in range(5)
+            ]
+        )
+        result = collect_articles(
+            2,
+            feeds=["https://example.com/feed"],
+            parser=parser_for({"https://example.com/feed": feed}),
+        )
+        self.assertEqual(2, len(result.candidates))
+
+    def test_duplicate_urls_across_feeds_are_collected_once(self) -> None:
+        entries = [{"title": "Same story", "link": "https://example.com/same"}]
+        result = collect_articles(
+            2,
+            feeds=["https://a.example/feed", "https://b.example/feed"],
+            parser=parser_for(
+                {
+                    "https://a.example/feed": FakeFeed(entries, feed_title="A"),
+                    "https://b.example/feed": FakeFeed(entries, feed_title="B"),
+                }
+            ),
+        )
+        self.assertEqual(1, len(result.candidates))
+
+    def test_broken_feed_is_isolated(self) -> None:
+        good = FakeFeed([{"title": "Good", "link": "https://example.com/good"}])
+        broken = FakeFeed(bozo=True, bozo_exception=ValueError("bad xml"))
+        result = collect_articles(
+            2,
+            feeds=["https://good.example/feed", "https://bad.example/feed"],
+            parser=parser_for(
+                {
+                    "https://good.example/feed": good,
+                    "https://bad.example/feed": broken,
+                }
+            ),
+        )
+        self.assertEqual(1, result.sources_ok)
         self.assertEqual(1, result.sources_failed)
-        self.assertEqual(4, len(result.articles))
         self.assertEqual("ValueError", result.failures[0].error)
 
-    def test_first_source_exception_does_not_stop_later_sources(self) -> None:
-        calls: list[str] = []
-
-        def parser(url: str):
-            calls.append(url)
-            if url == FEEDS[0]:
-                raise TimeoutError("source timeout")
-            return FakeFeed(FEEDS.index(url))
-
-        result = collect_articles(1, feeds=FEEDS, parser=parser)
-
-        self.assertEqual(list(FEEDS), calls)
-        self.assertEqual(4, result.sources_ok)
-        self.assertEqual(1, result.sources_failed)
-        self.assertEqual(4, len(result.articles))
-
-    def test_http_error_without_entries_is_source_failure(self) -> None:
-        feeds = {url: FakeFeed(index) for index, url in enumerate(FEEDS)}
-        feeds[FEEDS[1]] = FakeFeed(1, entries=[], status=503)
-
-        result = collect_articles(1, feeds=FEEDS, parser=feeds.__getitem__)
-
-        self.assertEqual(4, result.sources_ok)
-        self.assertEqual(1, result.sources_failed)
-        self.assertEqual("HTTPError", result.failures[0].error)
-
-    def test_all_sources_failed_raises_collection_error(self) -> None:
-        def parser(url: str):
-            return FakeFeed(
-                FEEDS.index(url),
-                bozo=True,
-                entries=[],
-                error=ValueError("invalid feed"),
-            )
-
-        with self.assertRaises(SourceCollectionError) as context:
-            collect_articles(1, feeds=FEEDS, parser=parser)
-
-        self.assertEqual(5, context.exception.result.sources_total)
-        self.assertEqual(0, context.exception.result.sources_ok)
-        self.assertEqual(5, context.exception.result.sources_failed)
-        self.assertEqual([], context.exception.result.articles)
-
-    def test_bozo_feed_with_entries_is_usable(self) -> None:
-        feeds = {
-            FEEDS[0]: FakeFeed(
-                0,
-                bozo=True,
-                error=ValueError("recoverable warning"),
-            )
-        }
-
-        result = collect_articles(1, feeds=(FEEDS[0],), parser=feeds.__getitem__)
-
-        self.assertEqual(1, result.sources_ok)
-        self.assertEqual(0, result.sources_failed)
-        self.assertEqual(1, len(result.articles))
-
-
-    def test_trendforce_parser_error_stays_source_scoped(self) -> None:
-        def parser(url: str):
-            if url == FEEDS[3]:
-                raise TypeError("SAXParseException-like parser failure")
-            return FakeFeed(FEEDS.index(url))
-
-        result = collect_articles(1, feeds=FEEDS, parser=parser)
-
-        self.assertEqual(5, result.sources_total)
-        self.assertEqual(4, result.sources_ok)
-        self.assertEqual(1, result.sources_failed)
-        self.assertEqual("TypeError", result.failures[0].error)
-        self.assertEqual(4, len(result.articles))
-
-    def test_malformed_xml_feed_does_not_stop_the_others(self) -> None:
-        feeds = {url: FakeFeed(index) for index, url in enumerate(FEEDS)}
-        feeds[FEEDS[3]] = FakeFeed(
-            3,
-            bozo=True,
-            entries=[],
-            error=ValueError("syntax error: line 1, column 0"),
+    def test_parser_exception_is_recorded_as_source_failure(self) -> None:
+        result = collect_articles(
+            2,
+            feeds=["https://a.example/feed", "https://b.example/feed"],
+            parser=parser_for(
+                {
+                    "https://a.example/feed": FakeFeed([]),
+                    "https://b.example/feed": requests.RequestException("boom"),
+                }
+            ),
         )
-
-        result = collect_articles(1, feeds=FEEDS, parser=feeds.__getitem__)
-
-        self.assertEqual(4, result.sources_ok)
         self.assertEqual(1, result.sources_failed)
-        self.assertEqual(4, len(result.articles))
+        self.assertEqual("RequestException", result.failures[0].error)
+
+    def test_all_sources_unavailable_raises_with_statistics(self) -> None:
+        with self.assertRaises(SourceCollectionError) as context:
+            collect_articles(
+                2,
+                feeds=["https://bad.example/feed"],
+                parser=parser_for({"https://bad.example/feed": FakeFeed(status=503)}),
+            )
+        self.assertEqual(1, context.exception.result.sources_total)
+        self.assertEqual(0, context.exception.result.sources_ok)
+        self.assertEqual(1, context.exception.result.sources_failed)
 
 
 class CleanExtractedTextTests(unittest.TestCase):
-    def test_reader_metadata_block_is_removed(self) -> None:
+    def test_reader_metadata_header_is_dropped(self) -> None:
         raw = (
-            "Title: HBM update\n\n"
-            "URL Source: https://example.com/hbm\n\n"
-            "Published Time: 2026-08-24\n\n"
+            "Title: Some article\n"
+            "URL Source: https://example.com/a\n"
+            "Published Time: 2026-09-23\n"
             "Markdown Content:\n"
-            "First paragraph.\n\n"
-            "Second paragraph.\n"
+            "Body line one\n"
         )
-        cleaned = clean_extracted_text(raw, max_chars=1000)
-        self.assertEqual("First paragraph.\n\nSecond paragraph.", cleaned)
+        self.assertEqual("Body line one", clean_extracted_text(raw, max_chars=1000))
 
-    def test_images_rules_and_duplicate_lines_are_dropped(self) -> None:
-        raw = (
-            "Markdown Content:\n"
-            "![cover](https://example.com/cover.png)\n\n"
-            "---\n\n"
-            "Repeated line.\n"
-            "Repeated line.\n\n\n\n"
-            "Tail line.\n"
-        )
-        cleaned = clean_extracted_text(raw, max_chars=1000)
-        self.assertEqual("Repeated line.\n\nTail line.", cleaned)
+    def test_noise_lines_are_dropped(self) -> None:
+        raw = "Body line\nBody line\n\n![image](https://example.com/a.png)\n---\n"
+        self.assertEqual("Body line", clean_extracted_text(raw, max_chars=1000))
 
-    def test_long_text_is_truncated_at_a_paragraph_boundary(self) -> None:
-        paragraphs = [f"Paragraph {index} " + "x" * 80 for index in range(40)]
-        cleaned = clean_extracted_text("\n\n".join(paragraphs), max_chars=600)
-        self.assertLessEqual(len(cleaned), 600 + len("\n[content truncated]"))
-        self.assertIn("[content truncated]", cleaned)
-        self.assertNotIn("Paragraph 39", cleaned)
-
-    def test_empty_input_stays_empty(self) -> None:
-        self.assertEqual("", clean_extracted_text("", max_chars=1000))
-        self.assertEqual("", clean_extracted_text("\n\n\n", max_chars=1000))
-
-
-class CandidateSelectionTests(unittest.TestCase):
-    def article(
-        self,
-        index: int,
-        *,
-        source: str = "Source A",
-        title: str | None = None,
-        url: str | None = None,
-        published: str = "Mon, 21 Sep 2026 10:00:00 +0000",
-    ) -> dict[str, str]:
-        return {
-            "title": title or f"Semiconductor story number {index}",
-            "source": source,
-            "url": url or f"https://example.com/story-{index}",
-            "published_at": published,
-        }
-
-    def test_limit_caps_the_selection(self) -> None:
-        items = [self.article(index) for index in range(10)]
-        selected = select_candidates(items, limit=6)
-        self.assertEqual(6, len(selected))
-
-    def test_canonical_dedupe_ignores_tracking_params_and_fragments(self) -> None:
-        items = [
-            self.article(
-                1, url="https://www.example.com/story?utm_source=rss#section"
-            ),
-            self.article(2, url="https://example.com/story"),
-            self.article(3, url="https://example.com/story?fbclid=abc"),
-        ]
-        selected = select_candidates(items, limit=6)
-        self.assertEqual(1, len(selected))
-
-    def test_obvious_junk_is_removed(self) -> None:
-        items = [
-            self.article(1, title="Advertisement: buy this now"),
-            self.article(2, title="We're hiring engineers now"),
-            self.article(3, title="Hi"),
-            self.article(4, title="Home"),
-            self.article(5, url="https://example.com/jobs/123"),
-            self.article(6),
-        ]
-        selected = select_candidates(items, limit=6)
-        self.assertEqual(1, len(selected))
-        self.assertEqual("https://example.com/story-6", selected[0]["url"])
-
-    def test_short_but_real_titles_survive(self) -> None:
-        items = [
-            self.article(1, title="HBM 量产"),
-            self.article(2, title="Intel cuts jobs"),
-        ]
-        selected = select_candidates(items, limit=6)
-        self.assertEqual(2, len(selected))
-
-    def test_round_robin_preserves_source_diversity(self) -> None:
-        items = [
-            self.article(1, source="Source A"),
-            self.article(2, source="Source A"),
-            self.article(3, source="Source A"),
-            self.article(4, source="Source B"),
-            self.article(5, source="Source B"),
-            self.article(6, source="Source B"),
-        ]
-        selected = select_candidates(items, limit=4)
+    def test_paragraph_breaks_are_kept(self) -> None:
+        raw = "First paragraph\n\nSecond paragraph\n"
         self.assertEqual(
-            ["Source A", "Source B", "Source A", "Source B"],
-            [item["source"] for item in selected],
+            "First paragraph\n\nSecond paragraph",
+            clean_extracted_text(raw, max_chars=1000),
         )
 
-    def test_recency_orders_within_a_source(self) -> None:
-        items = [
-            self.article(1, published="Mon, 21 Sep 2026 08:00:00 +0000"),
-            self.article(2, published="Mon, 21 Sep 2026 12:00:00 +0000"),
-            self.article(3, published="Mon, 21 Sep 2026 10:00:00 +0000"),
-        ]
-        selected = select_candidates(items, limit=1)
-        self.assertEqual("https://example.com/story-2", selected[0]["url"])
+    def test_long_text_is_truncated_on_a_paragraph_boundary(self) -> None:
+        raw = "first paragraph " * 20 + "\n\n" + "second paragraph " * 20
+        cleaned = clean_extracted_text(raw, max_chars=200)
+        self.assertTrue(cleaned.endswith("[content truncated]"))
+        self.assertLessEqual(len(cleaned), 200 + len("\n[content truncated]"))
 
-    def test_zero_limit_selects_nothing(self) -> None:
-        items = [self.article(1)]
-        self.assertEqual([], select_candidates(items, limit=0))
 
-    def test_selection_is_deterministic(self) -> None:
-        items = [self.article(index) for index in range(8)]
-        first = select_candidates(items, limit=6)
-        second = select_candidates(items, limit=6)
-        self.assertEqual(
-            [item["url"] for item in first], [item["url"] for item in second]
+class ArticleExtractorTests(unittest.TestCase):
+    def test_successful_extraction_returns_reader_text(self) -> None:
+        session = FakeSession(FakeResponse(200, text="A" * 400))
+        extractor = ArticleExtractor(session=session)
+        self.assertEqual("A" * 400, extractor("https://example.com/a"))
+        self.assertIn("https://r.jina.ai/https://example.com/a", session.calls[0][1])
+
+    def test_transient_http_failure_is_retried(self) -> None:
+        session = FakeSession(
+            FakeResponse(503, text=""), FakeResponse(200, text="B" * 300)
         )
+        with patch("daily_chip_news.sources.time.sleep", lambda seconds: None):
+            text = ArticleExtractor(max_attempts=2, session=session)(
+                "https://example.com/a"
+            )
+        self.assertEqual("B" * 300, text)
+
+    def test_permanent_http_failure_raises_source_error(self) -> None:
+        session = FakeSession(FakeResponse(404, text=""))
+        with self.assertRaises(SourceError):
+            ArticleExtractor(session=session)("https://example.com/a")
+
+    def test_short_response_is_treated_as_failure(self) -> None:
+        session = FakeSession(FakeResponse(200, text="too short"))
+        with self.assertRaises(SourceError):
+            ArticleExtractor(session=session)("https://example.com/a")
+
+    def test_network_failure_is_retried_then_raised(self) -> None:
+        session = FakeSession(
+            requests.ConnectionError("boom"), requests.ConnectionError("boom")
+        )
+        with (
+            patch("daily_chip_news.sources.time.sleep", lambda seconds: None),
+            self.assertRaises(SourceError),
+        ):
+            ArticleExtractor(max_attempts=2, session=session)("https://example.com/a")
+
+
+class PublishedTimestampTests(unittest.TestCase):
+    def test_rfc822_and_iso_values_are_parsed(self) -> None:
+        rfc = published_timestamp("Tue, 23 Sep 2026 02:00:00 GMT")
+        iso = published_timestamp("2026-09-23T02:00:00Z")
+        self.assertAlmostEqual(rfc, iso, delta=1.0)
+
+    def test_unknown_values_return_zero(self) -> None:
+        self.assertEqual(0.0, published_timestamp(""))
+        self.assertEqual(0.0, published_timestamp("not a date"))
 
 
 if __name__ == "__main__":
