@@ -50,12 +50,17 @@ class ConfigDefaultsTests(unittest.TestCase):
     def test_client_and_breaker_defaults(self) -> None:
         settings = Settings.from_env(env())
         self.assertEqual(180.0, settings.gemini_timeout_seconds)
-        self.assertEqual(5, settings.gemini_max_attempts)
+        self.assertEqual(3, settings.gemini_max_attempts)
         self.assertEqual(240.0, settings.gemini_call_budget_seconds)
         self.assertTrue(settings.gemini_structured_output)
+        self.assertEqual((), settings.gemini_fallback_models)
         self.assertEqual(5, settings.breaker_window_size)
         self.assertEqual(3, settings.breaker_failure_threshold)
         self.assertEqual(2100.0, settings.run_budget_seconds)
+
+    def test_fallback_models_are_an_ordered_comma_list(self) -> None:
+        settings = Settings.from_env(env(GEMINI_FALLBACK_MODELS=" model-x , ,model-y "))
+        self.assertEqual(("model-x", "model-y"), settings.gemini_fallback_models)
 
     def test_publishing_defaults(self) -> None:
         settings = Settings.from_env(env())

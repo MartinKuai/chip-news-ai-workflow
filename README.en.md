@@ -80,6 +80,30 @@ All AI nodes share one Gemini client (`gemini.py`): API key from configuration, 
 
 Structured output keeps `responseSchema` (`GEMINI_STRUCTURED_OUTPUT=1`) and no paid tools such as Search grounding are used. All settings live in `config.py`: local runs read `.env`, GitHub Actions reads Secrets / Variables.
 
+### Fallback models
+
+Gemini capacity and quotas are per model: when one model is overloaded (503) or rate limited (429), others are often still available. `GEMINI_FALLBACK_MODELS` is an ordered comma list; once the primary model exhausts its retries, the client switches to the **first listed model that differs from the primary** for one more full round (at most one switch per logical call, sharing the primary's deadline).
+
+- Only 429 / 5xx trigger a switch; config and billing errors (401 / 402 / 403) and network errors do not.
+- Leave it empty to disable the fallback.
+- Switches are counted as `model_fallbacks` in the summary.
+
+### Recommended configuration (measured 2026-10)
+
+| Variable | Value | Notes |
+| --- | --- | --- |
+| `RESEARCHER_MODEL` | `gemini-3.6-flash` | Structured fact extraction; the previous-generation Flash is sufficient and the most stable |
+| `WRITER_MODEL` | `gemini-3.6-flash` | 3.8 / 3.7 Flash returned frequent 503s at peak times in testing |
+| `REVIEWER_MODEL` | `gemini-3.5-flash` | A different model from the Writer keeps the review independent |
+| `GEMINI_FALLBACK_MODELS` | `gemini-3.5-flash,gemini-3.6-flash` | 3.6 nodes fall back to 3.5, the 3.5 node falls back to 3.6 |
+
+Model availability and congestion change over time; adjust Variables / `.env` without touching code.
+
+### Billing notes
+
+- **Free tier**: an AI Studio project without billing is on the free tier, rate limited per model (RPM / RPD); data may be used to improve Google's products.
+- **Paid / prepaid**: once billing is enabled (including the monthly $10 Google Cloud credit bundled with Google AI Pro, which must be activated manually in the Google Developer Program), usage is billed per token. When a prepaid balance runs out the API returns `402 RESOURCE_EXHAUSTED` ("prepayment credits are depleted"); the pipeline classifies it as `CONFIG_ERROR` and stops the run. Top up or adjust billing on the [AI Studio projects page](https://ai.studio/projects).
+
 ## Reliability
 
 ```text
@@ -88,7 +112,7 @@ MODEL_RESPONSE_INVALID / MODEL_RESPONSE_TRUNCATED / SCHEMA_INVALID   candidate l
 SOURCE_ERROR / PUBLISH_ERROR / CONFIG_ERROR / UNEXPECTED_ERROR
 ```
 
-- **retry**: 429 honours `Retry-After` (capped at 120s); 5xx / network / timeout back off exponentially 2s→4s→8s→16s with jitter; one logical call is bounded by `GEMINI_CALL_BUDGET_SECONDS=240`, one run by `RUN_BUDGET_SECONDS=2100`, and the HTTP timeout is clamped to the remaining budget.
+- **retry**: up to `GEMINI_MAX_ATTEMPTS=3` attempts per model by default. 429 honours `Retry-After` (capped at 120s); 5xx (overload) backs off longer, 10s→20s→40s; 429 without `Retry-After` / network / timeout back off 2s→4s→8s; all with jitter and a 60s cap per wait. After the retries, `GEMINI_FALLBACK_MODELS` provides a fallback model. One logical call is bounded by `GEMINI_CALL_BUDGET_SECONDS=240`, one run by `RUN_BUDGET_SECONDS=2100`, and the HTTP timeout is clamped to the remaining budget.
 - **breaker**: when transient failures among the last `BREAKER_WINDOW(5)` AI logical calls reach `BREAKER_THRESHOLD(3)`, the run stops AI processing for the remaining candidates. Granularity is exactly one event per logical call; `SchemaError`/`GeminiResponseError` occupy a slot without counting as transient and without clearing history.
 - **JSON repair**: invalid structured output is repaired through one normal model call sharing the deadline, retries and timeout budget.
 - If a model explicitly rejects `thinkingConfig` with a 400, the run downgrades to the model default and records `thinking_downgrades`.
@@ -107,7 +131,7 @@ Already-published items never turn the run into `FAILED`; a run where every cand
 
 ## Observability
 
-Per candidate the logs record `id`, `source`, current node, revisions, terminal status and error category. The run summary reports discovered / selected / processed / published / skipped (broken down by reason) / failed / revisions / breaker status / the three model names / final outcome, plus Gemini-level requests, retries, transient failures, JSON repairs and thinking downgrades. Setting `RUN_SUMMARY_PATH` also writes a JSON summary as a business artifact.
+Per candidate the logs record `id`, `source`, current node, revisions, terminal status and error category. The run summary reports discovered / selected / processed / published / skipped (broken down by reason) / failed / revisions / breaker status / the three model names / final outcome, plus Gemini-level requests, retries, transient failures, JSON repairs, thinking downgrades and model fallbacks. Per-node calls / success / failures are counted from what actually ran: a node that was never reached (for example the Writer after a Researcher failure) is not counted. Setting `RUN_SUMMARY_PATH` also writes a JSON summary as a business artifact.
 
 ## Install and configure
 
@@ -121,9 +145,10 @@ Copy `.env.example` to `.env` and fill it in:
 
 ```env
 GEMINI_API_KEY=your_gemini_api_key
-RESEARCHER_MODEL=your_researcher_model
-WRITER_MODEL=your_writer_model
-REVIEWER_MODEL=your_reviewer_model
+RESEARCHER_MODEL=gemini-3.6-flash
+WRITER_MODEL=gemini-3.6-flash
+REVIEWER_MODEL=gemini-3.5-flash
+GEMINI_FALLBACK_MODELS=gemini-3.5-flash,gemini-3.6-flash
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 TELEGRAM_CHAT_ID=your_telegram_chat_id
 ARTICLES_PER_FEED=2
@@ -131,7 +156,9 @@ MAX_CANDIDATES_PER_RUN=6
 MAX_REVISIONS=1
 ```
 
-`.env` is git-ignored; the Gemini key travels in the `x-goog-api-key` header and logs only contain safe fields. GitHub Actions uses Repository Secrets for credentials and Repository Variables for model names.
+`.env` is git-ignored; the Gemini key travels in the `x-goog-api-key` header and logs only contain safe fields. GitHub Actions uses Repository Secrets for credentials and Repository Variables for model names and `GEMINI_FALLBACK_MODELS`.
+
+> Note: `python-dotenv` does not override existing environment variables; variables passed on the command line (e.g. `PUBLISH_ENABLED=0 python main.py`) take precedence over `.env`.
 
 ## GitHub Actions
 
@@ -157,6 +184,7 @@ Typical (KEEP → PASS): Researcher 1 + Writer 1 + Reviewer 1 = 3
 One revision:          + Writer 1 + Reviewer 1             = 5
 SKIP / REJECT:         stops at the terminal node
 JSON repair:           +1 only when the output is invalid
+Model fallback:        one more round on the fallback model after 429/5xx retries
 ```
 
 ## Tests

@@ -80,6 +80,30 @@ Candidate 统一为结构化对象：`id` / `title` / `url` / `source` / `publis
 
 结构化输出保留 `responseSchema`（`GEMINI_STRUCTURED_OUTPUT=1`），不使用 Search grounding 等付费工具。所有配置项集中在 `config.py`，本地读取 `.env`，GitHub Actions 读取 Secrets / Variables。
 
+### 备用模型（fallback）
+
+Gemini 的容量与配额按模型计算：同一时刻某个模型过载（503）或被限流（429），其他模型往往仍可用。`GEMINI_FALLBACK_MODELS` 是一个按优先级排列的逗号列表，主模型用尽重试后，client 会切换到列表中**第一个与主模型不同**的模型再完整尝试一轮（每次逻辑调用最多切换一次，与主模型共享同一个 deadline）。
+
+- 只对 429 / 5xx 切换；401 / 402 / 403 等配置与计费错误、网络错误不切换。
+- 留空即关闭 fallback。
+- 切换次数记录在 summary 的 `model_fallbacks`。
+
+### 推荐配置（2026-10 实测）
+
+| 变量 | 值 | 说明 |
+| --- | --- | --- |
+| `RESEARCHER_MODEL` | `gemini-3.6-flash` | 结构化事实抽取，上一代 Flash 足够且最稳定 |
+| `WRITER_MODEL` | `gemini-3.6-flash` | 实测中 3.8 / 3.7 Flash 高峰期 503 频繁，先用稳定模型 |
+| `REVIEWER_MODEL` | `gemini-3.5-flash` | 与 Writer 使用不同模型，保持审稿独立性 |
+| `GEMINI_FALLBACK_MODELS` | `gemini-3.5-flash,gemini-3.6-flash` | 3.6 节点退到 3.5，3.5 节点退到 3.6 |
+
+模型可用性与拥堵程度会变化，可随时只改 Variables / `.env` 调整，无需改代码。
+
+### 计费说明
+
+- **免费层**：AI Studio 中未开通结算的项目即为免费层，按模型限制 RPM / RPD，数据可能被用于改进模型。
+- **付费 / 预付费**：项目开通结算后（包括 Google AI Pro 订阅附带、需在 Google Developer Program 手动激活的每月 $10 Cloud 抵扣金），调用按 token 计费。预付费项目余额耗尽时 API 返回 `402 RESOURCE_EXHAUSTED`（"prepayment credits are depleted"），本 pipeline 将其归类为 `CONFIG_ERROR` 并立即停止本轮，需到 [AI Studio 项目页](https://ai.studio/projects) 充值或调整结算。
+
 ## 可靠性
 
 ```text
@@ -88,7 +112,7 @@ MODEL_RESPONSE_INVALID / MODEL_RESPONSE_TRUNCATED / SCHEMA_INVALID   候选级
 SOURCE_ERROR / PUBLISH_ERROR / CONFIG_ERROR / UNEXPECTED_ERROR
 ```
 
-- **retry**：429 优先遵守 `Retry-After`（上限 120s）；5xx / network / timeout 指数退避 2s→4s→8s→16s + jitter；单次逻辑调用受 `GEMINI_CALL_BUDGET_SECONDS=240` 约束，整场受 `RUN_BUDGET_SECONDS=2100` 约束，HTTP timeout 被 clamp 到剩余预算。
+- **retry**：默认每个模型最多 `GEMINI_MAX_ATTEMPTS=3` 次。429 优先遵守 `Retry-After`（上限 120s）；5xx（服务过载）使用更长的退避 10s→20s→40s；429 无 `Retry-After` / network / timeout 指数退避 2s→4s→8s；均带 jitter，单次等待 ≤ 60s。重试用尽后按 `GEMINI_FALLBACK_MODELS` 切换备用模型。单次逻辑调用受 `GEMINI_CALL_BUDGET_SECONDS=240` 约束，整场受 `RUN_BUDGET_SECONDS=2100` 约束，HTTP timeout 被 clamp 到剩余预算。
 - **breaker**：最近 `BREAKER_WINDOW(5)` 个 AI 逻辑调用中，瞬态失败达到 `BREAKER_THRESHOLD(3)` 即判定服务不可用，终止本轮后续候选的 AI processing。粒度固定为 **1 个 logical call = 1 个事件**；`SchemaError`/`GeminiResponseError` 占位但不计瞬态，也不清空历史。
 - **JSON repair**：非法结构化输出会走一次正常的模型调用修复，与主调用共享 deadline、retry 与超时预算。
 - 模型 400 明确拒绝 `thinkingConfig` 时，本次运行自动降级为模型默认值并记录 `thinking_downgrades`。
@@ -107,7 +131,7 @@ SOURCE_ERROR / PUBLISH_ERROR / CONFIG_ERROR / UNEXPECTED_ERROR
 
 ## 可观测性
 
-按候选记录：`id`、`source`、当前节点、revision、终态与错误分类。运行结束输出 `Run summary`：discovered / selected / processed / published / skipped（按原因细分）/ failed / revisions / breaker 状态 / 三个模型名 / final outcome，以及 Gemini 层面的 requests / retries / transient failures / JSON repair / thinking downgrades。设置 `RUN_SUMMARY_PATH` 时可额外写出 JSON summary 作为业务 artifact。
+按候选记录：`id`、`source`、当前节点、revision、终态与错误分类。运行结束输出 `Run summary`：discovered / selected / processed / published / skipped（按原因细分）/ failed / revisions / breaker 状态 / 三个模型名 / final outcome，以及 Gemini 层面的 requests / retries / transient failures / JSON repair / thinking downgrades / model fallbacks。各节点的 calls / success / failures 按节点实际执行情况计数：未被执行到的节点（例如 Researcher 失败后的 Writer）不会被计入。设置 `RUN_SUMMARY_PATH` 时可额外写出 JSON summary 作为业务 artifact。
 
 ## 安装与配置
 
@@ -121,9 +145,10 @@ python -m pip install -r requirements.txt
 
 ```env
 GEMINI_API_KEY=your_gemini_api_key
-RESEARCHER_MODEL=your_researcher_model
-WRITER_MODEL=your_writer_model
-REVIEWER_MODEL=your_reviewer_model
+RESEARCHER_MODEL=gemini-3.6-flash
+WRITER_MODEL=gemini-3.6-flash
+REVIEWER_MODEL=gemini-3.5-flash
+GEMINI_FALLBACK_MODELS=gemini-3.5-flash,gemini-3.6-flash
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 TELEGRAM_CHAT_ID=your_telegram_chat_id
 ARTICLES_PER_FEED=2
@@ -131,7 +156,9 @@ MAX_CANDIDATES_PER_RUN=6
 MAX_REVISIONS=1
 ```
 
-`.env` 已由 Git 忽略；Gemini key 通过 `x-goog-api-key` header 发送，日志与 summary 只输出安全字段。GitHub Actions 的凭证来自 Repository Secrets，模型名来自 Repository Variables。
+`.env` 已由 Git 忽略；Gemini key 通过 `x-goog-api-key` header 发送，日志与 summary 只输出安全字段。GitHub Actions 的凭证来自 Repository Secrets，模型名与 `GEMINI_FALLBACK_MODELS` 来自 Repository Variables。
+
+> 注意：`python-dotenv` 不会覆盖已存在的环境变量；命令行临时传入的变量（如 `PUBLISH_ENABLED=0 python main.py`）优先于 `.env`。
 
 ## GitHub Actions
 
@@ -157,6 +184,7 @@ python main.py
 一次返工：            + Writer 1 + Reviewer 1            = 5 次
 SKIP / REJECT：       仅到终止节点为止
 JSON repair：         仅输出非法时 +1 次
+模型 fallback：       主模型 429/5xx 重试用尽时，备用模型再试一轮
 ```
 
 ## 测试

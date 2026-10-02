@@ -162,9 +162,10 @@ class Settings:
     max_revisions: int = 1
     article_content_chars: int = 12000
     gemini_timeout_seconds: float = 180.0
-    gemini_max_attempts: int = 5
+    gemini_max_attempts: int = 3
     gemini_call_budget_seconds: float = 240.0
     gemini_structured_output: bool = True
+    gemini_fallback_models: tuple[str, ...] = ()
     breaker_window_size: int = 5
     breaker_failure_threshold: int = 3
     run_budget_seconds: float = 2100.0
@@ -234,7 +235,7 @@ class Settings:
                 source, "GEMINI_TIMEOUT_SECONDS", 180.0, minimum=30.0, maximum=300.0
             ),
             gemini_max_attempts=_positive_int(
-                source, "GEMINI_MAX_ATTEMPTS", 5, minimum=1, maximum=8
+                source, "GEMINI_MAX_ATTEMPTS", 3, minimum=1, maximum=8
             ),
             gemini_call_budget_seconds=_positive_float(
                 source,
@@ -244,6 +245,11 @@ class Settings:
                 maximum=900.0,
             ),
             gemini_structured_output=_bool(source, "GEMINI_STRUCTURED_OUTPUT", True),
+            gemini_fallback_models=tuple(
+                item.strip()
+                for item in source.get("GEMINI_FALLBACK_MODELS", "").split(",")
+                if item.strip()
+            ),
             breaker_window_size=_positive_int(
                 source, "BREAKER_WINDOW", 5, minimum=2, maximum=20
             ),

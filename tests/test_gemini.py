@@ -208,6 +208,94 @@ class RetryTests(unittest.TestCase):
         self.assertTrue(context.exception.transient)
 
 
+class OverloadBackoffTests(unittest.TestCase):
+    def test_server_errors_back_off_longer_than_network_errors(self) -> None:
+        sleeps: list[float] = []
+        session = FakeSession(
+            FakeResponse(503, text=""),
+            FakeResponse(503, text=""),
+            gemini_envelope('{"ok": true}'),
+        )
+        request(make_client(session, sleep=sleeps.append, max_attempts=3))
+        self.assertEqual([10.0, 20.0], sleeps)
+
+    def test_network_errors_keep_the_short_backoff(self) -> None:
+        sleeps: list[float] = []
+        session = FakeSession(
+            requests.ConnectionError("boom"), gemini_envelope('{"ok": true}')
+        )
+        request(make_client(session, sleep=sleeps.append, max_attempts=2))
+        self.assertEqual([2.0], sleeps)
+
+
+class FallbackModelTests(unittest.TestCase):
+    def test_overloaded_primary_falls_back_to_the_fallback_model(self) -> None:
+        metrics = RunMetrics()
+        session = FakeSession(
+            FakeResponse(503, text=""),
+            FakeResponse(503, text=""),
+            gemini_envelope('{"ok": true}'),
+        )
+        client = make_client(
+            session, metrics=metrics, max_attempts=2, fallback_models=("model-b",)
+        )
+        self.assertEqual({"ok": True}, request(client))
+        urls = [url for _, url, _ in session.calls]
+        self.assertIn("models/model-a:", urls[0])
+        self.assertIn("models/model-a:", urls[1])
+        self.assertIn("models/model-b:", urls[2])
+        self.assertEqual(1, metrics.model_fallbacks)
+
+    def test_rate_limited_primary_falls_back(self) -> None:
+        session = FakeSession(
+            FakeResponse(429, text=""), gemini_envelope('{"ok": true}')
+        )
+        client = make_client(session, max_attempts=1, fallback_models=("model-b",))
+        self.assertEqual({"ok": True}, request(client))
+
+    def test_config_errors_do_not_fall_back(self) -> None:
+        session = FakeSession(FakeResponse(401, text="API key not valid"))
+        client = make_client(session, fallback_models=("model-b",))
+        with self.assertRaises(GeminiAPIError):
+            request(client)
+        self.assertEqual(1, len(session.calls))
+
+    def test_network_failures_do_not_fall_back(self) -> None:
+        session = FakeSession(requests.ConnectionError("boom"))
+        client = make_client(session, max_attempts=1, fallback_models=("model-b",))
+        with self.assertRaises(GeminiAPIError):
+            request(client)
+        self.assertEqual(1, len(session.calls))
+
+    def test_fallback_equal_to_primary_is_not_retried_twice(self) -> None:
+        session = FakeSession(FakeResponse(503, text=""))
+        client = make_client(session, max_attempts=1, fallback_models=("model-a",))
+        with self.assertRaises(GeminiAPIError):
+            request(client)
+        self.assertEqual(1, len(session.calls))
+
+    def test_first_fallback_differing_from_the_primary_is_used(self) -> None:
+        session = FakeSession(
+            FakeResponse(503, text=""), gemini_envelope('{"ok": true}')
+        )
+        client = make_client(
+            session, max_attempts=1, fallback_models=("model-a", "model-c")
+        )
+        self.assertEqual({"ok": True}, request(client))
+        self.assertIn("models/model-c:", session.calls[1][1])
+
+    def test_failed_fallback_raises_its_own_error(self) -> None:
+        metrics = RunMetrics()
+        session = FakeSession(FakeResponse(503, text=""), FakeResponse(500, text=""))
+        client = make_client(
+            session, metrics=metrics, max_attempts=1, fallback_models=("model-b",)
+        )
+        with self.assertRaises(GeminiAPIError) as context:
+            request(client)
+        self.assertEqual(500, context.exception.status_code)
+        self.assertEqual(1, metrics.model_fallbacks)
+
+
 class RepairTests(unittest.TestCase):
     def test_invalid_json_is_repaired_through_a_normal_model_call(self) -> None:
         metrics = RunMetrics()

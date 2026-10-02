@@ -139,6 +139,7 @@ def _config_line(settings: Settings) -> str:
         f" | request_timeout={settings.gemini_timeout_seconds:.0f}s"
         f" | max_attempts={settings.gemini_max_attempts}"
         f" | call_budget={settings.gemini_call_budget_seconds:.0f}s"
+        f" | fallback_models={','.join(settings.gemini_fallback_models) or 'none'}"
         f" | breaker={settings.breaker_failure_threshold}"
         f"/{settings.breaker_window_size}"
         f" | max_revisions={settings.max_revisions}"
@@ -179,11 +180,17 @@ def _print_summary(
     breaker: ServiceHealth,
     breaker_opened: bool,
     budget_exceeded: bool,
+    node_success: dict[str, int] | None = None,
 ) -> None:
     categories = _failure_categories(failures)
-    writer_calls = (
-        stats["processed"] - stats["skipped_not_relevant"] + stats["revisions"]
-    )
+    # Node counters are observed, never inferred from candidate outcomes: a
+    # node that was never reached must not be reported as called.
+    succeeded = node_success or {}
+
+    def node_lines(stage: str) -> tuple[int, int, int]:
+        ok = succeeded.get(stage, 0)
+        failed = _stage_failures(failures, stage)
+        return ok + failed, ok, failed
 
     print("Sources:")
     print(f"  total: {stats['sources_total']}")
@@ -252,27 +259,28 @@ def _print_summary(
     print(f"  response_truncated: {metrics.response_truncated}")
     print(f"  json_repairs: {sum(metrics.json_repairs.values())}")
     print(f"  thinking_downgrades: {metrics.thinking_downgrades}")
+    print(f"  model_fallbacks: {metrics.model_fallbacks}")
 
-    researcher_success = max(
-        0, stats["processed"] - _stage_failures(failures, "researcher")
-    )
+    calls, ok, failed = node_lines("researcher")
     print("Researcher:")
-    print(f"  calls: {stats['processed']}")
-    print(f"  success: {researcher_success}")
-    print(f"  failures: {_stage_failures(failures, 'researcher')}")
+    print(f"  calls: {calls}")
+    print(f"  success: {ok}")
+    print(f"  failures: {failed}")
 
+    calls, ok, failed = node_lines("writer")
     print("Writer:")
-    print(f"  calls: {writer_calls}")
-    print(f"  success: {max(0, writer_calls - _stage_failures(failures, 'writer'))}")
-    print(f"  failures: {_stage_failures(failures, 'writer')}")
+    print(f"  calls: {calls}")
+    print(f"  success: {ok}")
+    print(f"  failures: {failed}")
     print(f"  json_repair_attempts: {metrics.repairs_for('writer')}")
     print(f"  json_repair_success: {metrics.repair_success_for('writer')}")
 
+    calls, ok, failed = node_lines("reviewer")
     print("Reviewer:")
-    print(f"  calls: {writer_calls}")
-    print(f"  success: {max(0, writer_calls - _stage_failures(failures, 'reviewer'))}")
+    print(f"  calls: {calls}")
+    print(f"  success: {ok}")
     print(f"  rejected: {stats['skipped_rejected']}")
-    print(f"  failures: {_stage_failures(failures, 'reviewer')}")
+    print(f"  failures: {failed}")
 
     print("Publisher:")
     print(f"  published: {stats['published']}")
@@ -384,8 +392,10 @@ def run_daily(
     )
     deadline = clock() + settings.run_budget_seconds
     current: dict[str, str] = {"id": "-", "title": "-", "source": "-"}
+    node_success: dict[str, int] = {}
 
     def on_step(stage: str, status: str) -> None:
+        node_success[stage] = node_success.get(stage, 0) + 1
         print(f"Candidate step | id={current['id']} | node={stage} | status={status}")
 
     runtime_graph = (
@@ -626,6 +636,7 @@ def run_daily(
         breaker=service_breaker,
         breaker_opened=breaker_opened,
         budget_exceeded=budget_exceeded,
+        node_success=node_success,
     )
     result = {
         **stats,

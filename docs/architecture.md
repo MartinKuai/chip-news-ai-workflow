@@ -137,7 +137,8 @@ AI 输出先经过 `responseSchema` 约束，再经过本地 validator；缺字�
 
 - 请求：`x-goog-api-key` header；`responseMimeType=application/json`；可选 `responseSchema`、`maxOutputTokens`、`thinkingConfig.thinkingLevel`。
 - 超时与预算：`GEMINI_TIMEOUT_SECONDS=180`；单次逻辑调用 `GEMINI_CALL_BUDGET_SECONDS=240`；整场 `RUN_BUDGET_SECONDS=2100`；HTTP timeout clamp 到剩余预算。
-- 重试：最多 `GEMINI_MAX_ATTEMPTS=5`；429 优先 `Retry-After`（上限 120s）；5xx / network / timeout 指数退避 2/4/8/16s + jitter，单次 sleep ≤ 30s。
+- 重试：每个模型最多 `GEMINI_MAX_ATTEMPTS=3`；429 优先 `Retry-After`（上限 120s）；5xx（过载）退避 10/20/40s；其余（429 无 `Retry-After` / network / timeout）退避 2/4/8s；均带 jitter，单次 sleep ≤ 60s。
+- 模型 fallback：主模型 429 / 5xx 重试用尽后，切换到 `GEMINI_FALLBACK_MODELS` 中第一个与主模型不同的模型再完整尝试一轮；每次逻辑调用最多切换一次，共享同一 deadline；网络错误与 4xx 配置/计费错误不切换。breaker 只记录逻辑调用的最终结果，记录 `model_fallbacks`。
 - 日志：`purpose / attempt / http / retry_after / backoff / reason`，不含 key、header、请求体。
 - JSON 容错：直接解析 → fenced 提取 → 一次只修格式的 repair（与原调用共享 deadline，走完整 retry/超时路径）→ 仍失败抛 `GeminiResponseError`；截断抛 `GeminiTruncatedResponseError`。
 - thinking 兼容：模型 400 明确拒绝 `thinkingConfig` 时本次运行降级为默认值并记录 `thinking_downgrades`。
@@ -148,7 +149,7 @@ AI 输出先经过 `responseSchema` 约束，再经过本地 validator；缺字�
 TRANSIENT_RATE_LIMIT / TRANSIENT_SERVER / TRANSIENT_NETWORK   计入 breaker
 MODEL_RESPONSE_INVALID / MODEL_RESPONSE_TRUNCATED / SCHEMA_INVALID   候选级
 SOURCE_ERROR / PUBLISH_ERROR    候选级
-CONFIG_ERROR                    停止本轮（不重试、不换模型）
+CONFIG_ERROR                    停止本轮（不重试、不换模型；含 401/403 与预付费耗尽 402）
 UNEXPECTED_ERROR                停止本轮且 run 强制 FAILED
 ```
 
@@ -187,7 +188,8 @@ UNEXPECTED_ERROR                停止本轮且 run 强制 FAILED
 | `MAX_CANDIDATE_AGE_HOURS` | `72` | recency 过滤，`0` 关闭 |
 | `MAX_REVISIONS` | `1` | 返工上限 |
 | `ARTICLE_CONTENT_CHARS` | `12000` | 正文输入上限 |
-| `GEMINI_TIMEOUT_SECONDS` / `GEMINI_MAX_ATTEMPTS` / `GEMINI_CALL_BUDGET_SECONDS` | 180 / 5 / 240 | retry 与超时 |
+| `GEMINI_TIMEOUT_SECONDS` / `GEMINI_MAX_ATTEMPTS` / `GEMINI_CALL_BUDGET_SECONDS` | 180 / 3 / 240 | retry 与超时 |
+| `GEMINI_FALLBACK_MODELS` | 空（关闭） | 逗号分隔的备用模型，按顺序取第一个与主模型不同的 |
 | `BREAKER_WINDOW` / `BREAKER_THRESHOLD` | 5 / 3 | breaker |
 | `RUN_BUDGET_SECONDS` | `2100` | 整场时间预算 |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | 必填 | 发布与通知 |

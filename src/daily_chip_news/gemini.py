@@ -122,15 +122,17 @@ class GeminiClient:
         api_key: str,
         *,
         timeout: float = 180.0,
-        max_attempts: int = 5,
-        max_backoff: float = 30.0,
+        max_attempts: int = 3,
+        max_backoff: float = 60.0,
         backoff_base: float = 2.0,
+        overload_backoff_base: float = 10.0,
         call_budget_seconds: float = 240.0,
         retry_after_cap: float = 120.0,
         structured_output: bool = True,
+        fallback_models: tuple[str, ...] = (),
         run_deadline: float | None = None,
         session: requests.Session | None = None,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Callable[[float], None] | None = None,
         random_fn: Callable[[float, float], float] = random.uniform,
         logger: Callable[[str], None] | None = None,
         metrics: RunMetrics | None = None,
@@ -144,7 +146,7 @@ class GeminiClient:
             raise ValueError("timeout must be positive")
         if call_budget_seconds <= 0:
             raise ValueError("call_budget_seconds must be positive")
-        if max_backoff <= 0 or backoff_base <= 0:
+        if max_backoff <= 0 or backoff_base <= 0 or overload_backoff_base <= 0:
             raise ValueError("backoff values must be positive")
         if retry_after_cap <= 0:
             raise ValueError("retry_after_cap must be positive")
@@ -153,12 +155,17 @@ class GeminiClient:
         self._max_attempts = max_attempts
         self._max_backoff = max_backoff
         self._backoff_base = backoff_base
+        self._overload_backoff_base = overload_backoff_base
         self._call_budget = call_budget_seconds
         self._retry_after_cap = retry_after_cap
         self._structured_output = structured_output
+        self._fallback_models = tuple(
+            name.strip() for name in fallback_models if name and name.strip()
+        )
         self._run_deadline = run_deadline
         self._session = session or requests.Session()
-        self._sleep = sleep
+        # Resolved at construction (not import) time so tests can patch it.
+        self._sleep = sleep or time.sleep
         self._random = random_fn
         self._logger = logger
         self._metrics = metrics or RunMetrics()
@@ -183,13 +190,61 @@ class GeminiClient:
         level = (thinking_level or "").strip().lower()
         if level in {"", "off", "default", "none"}:
             level = ""
-        if level and clean_model in self._unsupported_thinking:
-            level = ""
         # One logical call owns exactly one deadline: the initial request, every
-        # HTTP retry and the optional JSON repair share it.
+        # HTTP retry, the optional fallback model and JSON repair share it.
         deadline = self._now() + self._call_budget
         if self._run_deadline is not None:
             deadline = min(deadline, self._run_deadline)
+        call = {
+            "system_instruction": system_instruction,
+            "payload": payload,
+            "purpose": purpose,
+            "output_schema": output_schema,
+            "thinking_level": level,
+            "max_output_tokens": max_output_tokens,
+            "deadline": deadline,
+        }
+        try:
+            return self._request_model(model=clean_model, **call)
+        except GeminiAPIError as exc:
+            # The first configured model that differs from the primary.
+            fallback = next(
+                (name for name in self._fallback_models if name != clean_model), ""
+            )
+            # Quotas and capacity are per model: an overloaded (5xx) or
+            # rate-limited (429) primary is worth one switch. Network failures,
+            # auth/config errors and an exhausted deadline are not.
+            if (
+                not fallback
+                or not exc.transient
+                or exc.status_code is None
+                or deadline - self._now() <= 0
+            ):
+                raise
+            self._metrics.model_fallbacks += 1
+            self._log(
+                f"Gemini model fallback | purpose={purpose or 'n/a'} "
+                f"| from={clean_model} | to={fallback} | http={exc.status_code}"
+            )
+            return self._request_model(model=fallback, **call)
+
+    def _request_model(
+        self,
+        *,
+        model: str,
+        system_instruction: str,
+        payload: dict[str, Any],
+        purpose: str,
+        output_schema: dict[str, Any] | None,
+        thinking_level: str,
+        max_output_tokens: int | None,
+        deadline: float,
+    ) -> dict[str, Any]:
+        """Call one model, downgrading thinkingConfig once if the model rejects it."""
+        clean_model = model
+        level = thinking_level
+        if level and clean_model in self._unsupported_thinking:
+            level = ""
         try:
             return self._request_with_retries(
                 model=clean_model,
@@ -496,8 +551,11 @@ class GeminiClient:
             reason = "retry-after"
             delay = min(retry_after, self._retry_after_cap)
         else:
-            reason = "exponential-backoff"
-            delay = min(self._backoff_base * (2 ** (attempt - 1)), self._max_backoff)
+            # An overloaded server needs far longer to recover than a blip.
+            overloaded = status_code is not None and 500 <= status_code < 600
+            reason = "overload-backoff" if overloaded else "exponential-backoff"
+            base = self._overload_backoff_base if overloaded else self._backoff_base
+            delay = min(base * (2 ** (attempt - 1)), self._max_backoff)
         sleep_for = max(0.0, min(delay * self._random(0.7, 1.0), remaining))
         self._metrics.gemini_retries += 1
         self._log(

@@ -193,6 +193,7 @@ def create_runtime_graph(
         max_attempts=settings.gemini_max_attempts,
         call_budget_seconds=settings.gemini_call_budget_seconds,
         structured_output=settings.gemini_structured_output,
+        fallback_models=settings.gemini_fallback_models,
         run_deadline=run_deadline,
         logger=print,
         metrics=run_metrics,

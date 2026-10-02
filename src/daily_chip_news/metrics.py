@@ -18,6 +18,7 @@ class RunMetrics:
     response_invalid: int = 0
     response_truncated: int = 0
     thinking_downgrades: int = 0
+    model_fallbacks: int = 0
     json_repairs: dict[str, int] = field(default_factory=dict)
     json_repair_success: dict[str, int] = field(default_factory=dict)
 
