@@ -88,21 +88,28 @@ Gemini 的容量与配额按模型计算：同一时刻某个模型过载（503�
 - 留空即关闭 fallback。
 - 切换次数记录在 summary 的 `model_fallbacks`。
 
-### 推荐配置（2026-10 实测）
+### 当前生产配置（Gemini 免费层，2026-10 验证）
 
 | 变量 | 值 | 说明 |
 | --- | --- | --- |
-| `RESEARCHER_MODEL` | `gemini-3.6-flash` | 结构化事实抽取，上一代 Flash 足够且最稳定 |
-| `WRITER_MODEL` | `gemini-3.6-flash` | 实测中 3.8 / 3.7 Flash 高峰期 503 频繁，先用稳定模型 |
-| `REVIEWER_MODEL` | `gemini-3.5-flash` | 与 Writer 使用不同模型，保持审稿独立性 |
+| `RESEARCHER_MODEL` | `gemini-3.6-flash` | 结构化事实抽取，上一代 Flash 足够且稳定 |
+| `WRITER_MODEL` | `gemini-3.5-flash` | 与 Researcher 分开，分散按模型计算的免费层配额 |
+| `REVIEWER_MODEL` | `gemini-3.5-flash` | 同上 |
 | `GEMINI_FALLBACK_MODELS` | `gemini-3.5-flash,gemini-3.6-flash` | 3.6 节点退到 3.5，3.5 节点退到 3.6 |
 
-模型可用性与拥堵程度会变化，可随时只改 Variables / `.env` 调整，无需改代码。
+验证结果：一次完整线上运行（6 个候选）发布 5 篇、跳过 1 篇无关内容，`SUCCESS`。30 次请求中出现 13 次 503 与 1 次 429，全部由过载退避与 2 次模型 fallback 消化。
+
+取舍：
+
+- 3.8 / 3.7 Flash 在免费层高峰期 503 最频繁，暂不使用。
+- Writer 与 Reviewer 使用同一模型会削弱审稿独立性；若发现带事实问题的稿件通过审核，把 `REVIEWER_MODEL` 改为与 `WRITER_MODEL` 不同的模型。
+- 模型可用性与拥堵程度会变化，只需修改 Variables / `.env`，无需改代码。
 
 ### 计费说明
 
-- **免费层**：AI Studio 中未开通结算的项目即为免费层，按模型限制 RPM / RPD，数据可能被用于改进模型。
-- **付费 / 预付费**：项目开通结算后（包括 Google AI Pro 订阅附带、需在 Google Developer Program 手动激活的每月 $10 Cloud 抵扣金），调用按 token 计费。预付费项目余额耗尽时 API 返回 `402 RESOURCE_EXHAUSTED`（"prepayment credits are depleted"），本 pipeline 将其归类为 `CONFIG_ERROR` 并立即停止本轮，需到 [AI Studio 项目页](https://ai.studio/projects) 充值或调整结算。
+- **免费层（当前使用）**：在 [AI Studio](https://aistudio.google.com) 新建一个**不绑定结算**的项目并在其中创建 API Key。按模型限制 RPM / RPD，数据可能被用于改进 Google 产品。每天一次、最多 6 篇的用量约 20–30 次请求；同一天多次手动触发更容易遇到 429。
+- **付费 / 预付费**：项目绑定结算后按 token 计费。Google AI Pro 订阅附带的每月 Cloud 抵扣金（需在 Google Developer Program 手动激活）在 **Prepay 账户余额为 0 时不会被使用**：API 直接返回 `402 RESOURCE_EXHAUSTED`（"prepayment credits are depleted"），所有绑定该结算账户的 Key 同时停用。预付款原则上不可退款、12 个月后过期，详见[官方计费文档](https://ai.google.dev/gemini-api/docs/billing)。
+- pipeline 将 401 / 402 / 403 归类为 `CONFIG_ERROR`：不重试、不切换模型，立即停止本轮并发送告警。
 
 ## 可靠性
 
@@ -146,7 +153,7 @@ python -m pip install -r requirements.txt
 ```env
 GEMINI_API_KEY=your_gemini_api_key
 RESEARCHER_MODEL=gemini-3.6-flash
-WRITER_MODEL=gemini-3.6-flash
+WRITER_MODEL=gemini-3.5-flash
 REVIEWER_MODEL=gemini-3.5-flash
 GEMINI_FALLBACK_MODELS=gemini-3.5-flash,gemini-3.6-flash
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
@@ -169,13 +176,33 @@ checkout → setup python → install → run application（Secrets / Variables�
 → upload run summary artifact → notification（app 内 Telegram）
 ```
 
+仓库需要的配置（Settings → Secrets and variables → Actions）：
+
+| 类型 | 名称 |
+| --- | --- |
+| Secret | `GEMINI_API_KEY`、`TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID` |
+| Variable | `RESEARCHER_MODEL`、`WRITER_MODEL`、`REVIEWER_MODEL`、`GEMINI_FALLBACK_MODELS` |
+
+也可以用 GitHub CLI 设置，例如：
+
+```bash
+gh secret set GEMINI_API_KEY
+gh variable set GEMINI_FALLBACK_MODELS -b "gemini-3.5-flash,gemini-3.6-flash"
+```
+
+手动触发 `workflow_dispatch` 会**真实发布**到 Telegram；只想验证配置时，先在本地用 `PUBLISH_ENABLED=0` 做 dry-run。没有发布任何内容且存在失败的运行会以 exit code 1 结束，Actions 显示为失败并发送 Telegram 告警，不会静默“成功”。
+
 ## 本地运行
 
 ```bash
 python main.py
 ```
 
-`PUBLISH_ENABLED=0` 可做不发送 Telegram 的 dry-run；`MAX_CANDIDATES_PER_RUN=1` 可做单候选 smoke。
+`PUBLISH_ENABLED=0` 可做不发送 Telegram 的 dry-run；`MAX_CANDIDATES_PER_RUN=1` 可做单候选 smoke。例如（Git Bash / Linux / macOS）：
+
+```bash
+PUBLISH_ENABLED=0 MAX_CANDIDATES_PER_RUN=1 python main.py
+```
 
 ## 单篇调用次数
 

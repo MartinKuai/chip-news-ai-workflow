@@ -88,21 +88,28 @@ Gemini capacity and quotas are per model: when one model is overloaded (503) or 
 - Leave it empty to disable the fallback.
 - Switches are counted as `model_fallbacks` in the summary.
 
-### Recommended configuration (measured 2026-10)
+### Production configuration (Gemini free tier, verified 2026-10)
 
 | Variable | Value | Notes |
 | --- | --- | --- |
-| `RESEARCHER_MODEL` | `gemini-3.6-flash` | Structured fact extraction; the previous-generation Flash is sufficient and the most stable |
-| `WRITER_MODEL` | `gemini-3.6-flash` | 3.8 / 3.7 Flash returned frequent 503s at peak times in testing |
-| `REVIEWER_MODEL` | `gemini-3.5-flash` | A different model from the Writer keeps the review independent |
-| `GEMINI_FALLBACK_MODELS` | `gemini-3.5-flash,gemini-3.6-flash` | 3.6 nodes fall back to 3.5, the 3.5 node falls back to 3.6 |
+| `RESEARCHER_MODEL` | `gemini-3.6-flash` | Structured fact extraction; the previous-generation Flash is sufficient and stable |
+| `WRITER_MODEL` | `gemini-3.5-flash` | Kept apart from the Researcher to spread the per-model free-tier quota |
+| `REVIEWER_MODEL` | `gemini-3.5-flash` | Same as above |
+| `GEMINI_FALLBACK_MODELS` | `gemini-3.5-flash,gemini-3.6-flash` | 3.6 nodes fall back to 3.5, 3.5 nodes fall back to 3.6 |
 
-Model availability and congestion change over time; adjust Variables / `.env` without touching code.
+Verification: one full production run (6 candidates) published 5 articles and skipped 1 off-topic item with `SUCCESS`. Of 30 requests, 13 returned 503 and 1 returned 429; all were absorbed by the overload backoff and 2 model fallbacks.
+
+Trade-offs:
+
+- 3.8 / 3.7 Flash return the most 503s on the free tier at peak times and are not used for now.
+- Using the same model for Writer and Reviewer weakens review independence; if drafts with factual problems pass review, set `REVIEWER_MODEL` to a model different from `WRITER_MODEL`.
+- Model availability and congestion change over time; adjust Variables / `.env` without touching code.
 
 ### Billing notes
 
-- **Free tier**: an AI Studio project without billing is on the free tier, rate limited per model (RPM / RPD); data may be used to improve Google's products.
-- **Paid / prepaid**: once billing is enabled (including the monthly $10 Google Cloud credit bundled with Google AI Pro, which must be activated manually in the Google Developer Program), usage is billed per token. When a prepaid balance runs out the API returns `402 RESOURCE_EXHAUSTED` ("prepayment credits are depleted"); the pipeline classifies it as `CONFIG_ERROR` and stops the run. Top up or adjust billing on the [AI Studio projects page](https://ai.studio/projects).
+- **Free tier (in use)**: create an API key inside a new [AI Studio](https://aistudio.google.com) project **without billing**. Limits are per model (RPM / RPD) and data may be used to improve Google's products. One daily run of up to 6 articles needs roughly 20–30 requests; several manual runs on the same day are more likely to hit 429.
+- **Paid / prepaid**: once a project is linked to billing, usage is billed per token. The monthly Cloud credit bundled with Google AI Pro (activated manually in the Google Developer Program) is **not used while a Prepay balance is $0**: the API returns `402 RESOURCE_EXHAUSTED` ("prepayment credits are depleted") and every key on that billing account stops working. Prepayments are generally non-refundable and expire after 12 months; see the [official billing docs](https://ai.google.dev/gemini-api/docs/billing).
+- The pipeline classifies 401 / 402 / 403 as `CONFIG_ERROR`: no retry, no model switch, the run stops and an alert is sent.
 
 ## Reliability
 
@@ -146,7 +153,7 @@ Copy `.env.example` to `.env` and fill it in:
 ```env
 GEMINI_API_KEY=your_gemini_api_key
 RESEARCHER_MODEL=gemini-3.6-flash
-WRITER_MODEL=gemini-3.6-flash
+WRITER_MODEL=gemini-3.5-flash
 REVIEWER_MODEL=gemini-3.5-flash
 GEMINI_FALLBACK_MODELS=gemini-3.5-flash,gemini-3.6-flash
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
@@ -169,13 +176,33 @@ checkout → setup python → install → run application (Secrets / Variables)
 → upload run summary artifact → notification (in-app Telegram)
 ```
 
+Required repository settings (Settings → Secrets and variables → Actions):
+
+| Type | Names |
+| --- | --- |
+| Secret | `GEMINI_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` |
+| Variable | `RESEARCHER_MODEL`, `WRITER_MODEL`, `REVIEWER_MODEL`, `GEMINI_FALLBACK_MODELS` |
+
+They can also be set with the GitHub CLI, for example:
+
+```bash
+gh secret set GEMINI_API_KEY
+gh variable set GEMINI_FALLBACK_MODELS -b "gemini-3.5-flash,gemini-3.6-flash"
+```
+
+A manual `workflow_dispatch` run **really publishes** to Telegram; to only validate configuration, dry-run locally with `PUBLISH_ENABLED=0` first. A run that publishes nothing and has failures exits with code 1, shows as failed in Actions and sends a Telegram alert instead of silently "succeeding".
+
 ## Local runs
 
 ```bash
 python main.py
 ```
 
-`PUBLISH_ENABLED=0` performs a dry run without sending Telegram messages; `MAX_CANDIDATES_PER_RUN=1` gives a single-candidate smoke test.
+`PUBLISH_ENABLED=0` performs a dry run without sending Telegram messages; `MAX_CANDIDATES_PER_RUN=1` gives a single-candidate smoke test. For example (Git Bash / Linux / macOS):
+
+```bash
+PUBLISH_ENABLED=0 MAX_CANDIDATES_PER_RUN=1 python main.py
+```
 
 ## Calls per article
 
