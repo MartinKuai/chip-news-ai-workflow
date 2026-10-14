@@ -119,10 +119,20 @@ MODEL_RESPONSE_INVALID / MODEL_RESPONSE_TRUNCATED / SCHEMA_INVALID   候选级
 SOURCE_ERROR / PUBLISH_ERROR / CONFIG_ERROR / UNEXPECTED_ERROR
 ```
 
-- **retry**：默认每个模型最多 `GEMINI_MAX_ATTEMPTS=3` 次。429 优先遵守 `Retry-After`（上限 120s）；5xx（服务过载）使用更长的退避 10s→20s→40s；429 无 `Retry-After` / network / timeout 指数退避 2s→4s→8s；均带 jitter，单次等待 ≤ 60s。重试用尽后按 `GEMINI_FALLBACK_MODELS` 切换备用模型。单次逻辑调用受 `GEMINI_CALL_BUDGET_SECONDS=240` 约束，整场受 `RUN_BUDGET_SECONDS=2100` 约束，HTTP timeout 被 clamp 到剩余预算。
+- **retry**：默认每个模型最多 `GEMINI_MAX_ATTEMPTS=3` 次。429 读取安全的配额类型与 `RetryInfo.retryDelay`，结合 `Retry-After`，同一模型至少冷却 60s；明确的每日配额耗尽不再短重试。超过等待上限 120s 或剩余调用预算时结束本轮，不提前缩短服务端要求的等待。5xx 退避 10s→20s→40s，network / timeout 退避 2s→4s→8s，带 jitter。每次逻辑调用最多切换一次备用模型，同享 240s 调用预算和 2100s 运行预算。
 - **breaker**：最近 `BREAKER_WINDOW(5)` 个 AI 逻辑调用中，瞬态失败达到 `BREAKER_THRESHOLD(3)` 即判定服务不可用，终止本轮后续候选的 AI processing。粒度固定为 **1 个 logical call = 1 个事件**；`SchemaError`/`GeminiResponseError` 占位但不计瞬态，也不清空历史。
 - **JSON repair**：非法结构化输出会走一次正常的模型调用修复，与主调用共享 deadline、retry 与超时预算。
 - 模型 400 明确拒绝 `thinkingConfig` 时，本次运行自动降级为模型默认值并记录 `thinking_downgrades`。
+
+## 免费配额控制
+
+所有 AI 节点、HTTP retry、thinking 降级与 JSON repair 共用按模型计数的 `QuotaGuard`。默认同一模型的请求起点至少间隔 **15 秒**，每个 Google 配额日最多预留 **18 次**请求；失败或结果不确定的请求不返还预留。实际服务端额度以 AI Studio 为准，同一项目的其他调用仍可能占用额度。
+
+`GEMINI_MIN_INTERVAL_SECONDS=15`、`GEMINI_DAILY_REQUEST_LIMIT=18` 可调。Google 每日配额按 `America/Los_Angeles` 午夜重置，跟随夏令时，与北京时间 00:05 的新闻定时不同。
+
+Actions 先恢复 `gemini-quota-ledger` artifact，再执行生成，并在成功或失败后保存账本。发送前原子写入计数；定时、手工运行和同一 run 的重跑共享预算与冷却。无法读取/校验账本时禁止生成；有未保存账本的先前运行时，保守预留当天剩余预算，等待下一个 Google 配额日。首次启用也审计当天旧版本运行，避免重置预算。
+
+本地可通过 `GEMINI_QUOTA_LEDGER_PATH=gemini-quota-ledger.json` 保存账本；本地必须串行，不能与 Actions 的独立账本同时消耗同一项目额度。
 
 ## 运行结果
 
@@ -132,6 +142,7 @@ SOURCE_ERROR / PUBLISH_ERROR / CONFIG_ERROR / UNEXPECTED_ERROR
 | --- | --- | --- |
 | `SUCCESS` | 无候选失败，且未因 breaker / 时间预算提前停止 | 0 |
 | `PARTIAL_SUCCESS` | 有失败或提前停止，但至少发布了一条 | 0 |
+| `QUOTA_STOPPED` | 每日预算/明确日配额主动停止，且没有其他真实失败 | 0 |
 | `FAILED` | 未发布任何内容且存在失败 / 提前停止；或程序级故障 | 1 |
 
 已发布内容不会因为后续候选失败把 run 重新定义为 `FAILED`；全部候选被编辑规则跳过（`published == 0` 且无失败）视为正常完成。
@@ -169,7 +180,7 @@ MAX_REVISIONS=1
 
 ## GitHub Actions
 
-每天北京时间 06:55（`55 22 * * *` UTC）运行，也支持 `workflow_dispatch`，两者使用同一套 application architecture。
+每天北京时间 **00:05**（`5 16 * * *` UTC，即前一天 16:05 UTC）定时触发，也支持 `workflow_dispatch`。GitHub 调度可能排队延迟；两者共用 application architecture 和每日配额账本。
 
 ```text
 checkout → setup python → install → run application（Secrets / Variables）

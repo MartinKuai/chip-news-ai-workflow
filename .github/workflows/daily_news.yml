@@ -2,12 +2,13 @@ name: Daily Chip News
 
 on:
   schedule:
-    # GitHub Actions cron is UTC: 22:55 UTC = 06:55 Asia/Shanghai (UTC+08:00) next day.
-    - cron: "55 22 * * *"
+    # GitHub Actions cron is UTC: 16:05 UTC = 00:05 Asia/Shanghai (UTC+08:00) next day.
+    - cron: "5 16 * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: chip-news-ai-workflow
@@ -22,6 +23,14 @@ jobs:
     # Keep workflow log timestamps aligned with the Beijing-time schedule.
     env:
       TZ: Asia/Shanghai
+      GEMINI_MIN_INTERVAL_SECONDS: "15"
+      GEMINI_DAILY_REQUEST_LIMIT: "18"
+      GEMINI_QUOTA_LEDGER_PATH: gemini-quota-ledger.json
+      GEMINI_QUOTA_LEDGER_REQUIRED: "1"
+      RESEARCHER_MODEL: ${{ vars.RESEARCHER_MODEL }}
+      WRITER_MODEL: ${{ vars.WRITER_MODEL }}
+      REVIEWER_MODEL: ${{ vars.REVIEWER_MODEL }}
+      GEMINI_FALLBACK_MODELS: ${{ vars.GEMINI_FALLBACK_MODELS }}
 
     steps:
       - name: Checkout repository
@@ -36,15 +45,18 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Restore Gemini quota ledger
+        id: quota-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/restore_quota_ledger.py
+
       - name: Run the news production pipeline
+        # Restore succeeds only with auditable state; an API/artifact failure
+        # prevents generation instead of silently resetting the daily budget.
         env:
           # Credentials come from Repository Secrets, models from Variables.
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          RESEARCHER_MODEL: ${{ vars.RESEARCHER_MODEL }}
-          WRITER_MODEL: ${{ vars.WRITER_MODEL }}
-          REVIEWER_MODEL: ${{ vars.REVIEWER_MODEL }}
-          # Optional comma list; empty disables the model fallback.
-          GEMINI_FALLBACK_MODELS: ${{ vars.GEMINI_FALLBACK_MODELS }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ARTICLES_PER_FEED: "2"
@@ -64,6 +76,16 @@ jobs:
           # BREAKER_WINDOW=5 | BREAKER_THRESHOLD=3 | RUN_BUDGET_SECONDS=2100
           # PUBLISH_ENABLED=1 | TELEGRAM_TIMEOUT_SECONDS=15
         run: python main.py
+
+      - name: Upload Gemini quota ledger
+        if: always() && steps.quota-restore.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: gemini-quota-ledger
+          path: gemini-quota-ledger.json
+          retention-days: 30
+          overwrite: true
+          if-no-files-found: error
 
       - name: Upload run summary
         # Always upload so a failed run still leaves its business record behind.

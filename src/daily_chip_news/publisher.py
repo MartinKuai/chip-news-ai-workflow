@@ -49,9 +49,9 @@ class TelegramPublisher:
 
     def publish_alert(self, message: str) -> None:
         """Send an operational alert without a Gemini call or source URL."""
-        self._deliver(message)
+        self._deliver(message, markdown=False)
 
-    def _deliver(self, final_text: str) -> None:
+    def _deliver(self, final_text: str, *, markdown: bool = True) -> None:
         if not self._enabled:
             self._log(
                 f"Telegram delivery skipped | reason=publish-disabled "
@@ -61,14 +61,15 @@ class TelegramPublisher:
         markdown_payload = {
             "chat_id": self._chat_id,
             "text": final_text,
-            "parse_mode": "Markdown",
             "disable_web_page_preview": False,
         }
+        if markdown:
+            markdown_payload["parse_mode"] = "Markdown"
         response = self._post(markdown_payload)
         if response.status_code == 200:
             return
 
-        if response.status_code == 400:
+        if response.status_code == 400 and markdown:
             plain_payload = dict(markdown_payload)
             plain_payload.pop("parse_mode")
             response = self._post(plain_payload)

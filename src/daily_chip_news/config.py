@@ -10,6 +10,7 @@ Secrets and Variables with the same names.
 from __future__ import annotations
 
 import os
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -98,6 +99,8 @@ def _positive_float(
         value = float(raw)
     except ValueError as exc:
         raise ConfigError(f"{name} must be a number") from exc
+    if not math.isfinite(value):
+        raise ConfigError(f"{name} must be finite")
     if value < minimum:
         raise ConfigError(f"{name} must be at least {minimum}")
     if maximum is not None and value > maximum:
@@ -166,6 +169,10 @@ class Settings:
     gemini_call_budget_seconds: float = 240.0
     gemini_structured_output: bool = True
     gemini_fallback_models: tuple[str, ...] = ()
+    gemini_min_interval_seconds: float = 15.0
+    gemini_daily_request_limit: int = 18
+    gemini_quota_ledger_path: str = ""
+    gemini_quota_ledger_required: bool = False
     breaker_window_size: int = 5
     breaker_failure_threshold: int = 3
     run_budget_seconds: float = 2100.0
@@ -250,6 +257,14 @@ class Settings:
                 for item in source.get("GEMINI_FALLBACK_MODELS", "").split(",")
                 if item.strip()
             ),
+            gemini_min_interval_seconds=_positive_float(
+                source, "GEMINI_MIN_INTERVAL_SECONDS", 15.0, minimum=1.0, maximum=120.0
+            ),
+            gemini_daily_request_limit=_positive_int(
+                source, "GEMINI_DAILY_REQUEST_LIMIT", 18, minimum=1, maximum=10000
+            ),
+            gemini_quota_ledger_path=source.get("GEMINI_QUOTA_LEDGER_PATH", "").strip(),
+            gemini_quota_ledger_required=_bool(source, "GEMINI_QUOTA_LEDGER_REQUIRED", False),
             breaker_window_size=_positive_int(
                 source, "BREAKER_WINDOW", 5, minimum=2, maximum=20
             ),

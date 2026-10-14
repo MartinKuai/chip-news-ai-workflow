@@ -21,6 +21,8 @@ class RunMetrics:
     model_fallbacks: int = 0
     json_repairs: dict[str, int] = field(default_factory=dict)
     json_repair_success: dict[str, int] = field(default_factory=dict)
+    model_requests: dict[str, int] = field(default_factory=dict)
+    http_statuses: dict[int, int] = field(default_factory=dict)
 
     @property
     def transient_failures(self) -> int:

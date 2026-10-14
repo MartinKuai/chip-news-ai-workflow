@@ -77,6 +77,14 @@ class TelegramDeliveryTests(unittest.TestCase):
         publisher(session).publish_alert("⚠️ Daily Chip News 运行失败")
         self.assertNotIn("原文", session.calls[0][2]["json"]["text"])
 
+    def test_alert_machine_labels_are_literal_plain_text(self) -> None:
+        session = FakeSession(FakeResponse(200, {"ok": True}))
+        message = "Outcome: PARTIAL_SUCCESS\nCategories: TRANSIENT_RATE_LIMIT=1"
+        publisher(session).publish_alert(message)
+        payload = session.calls[0][2]["json"]
+        self.assertNotIn("parse_mode", payload)
+        self.assertEqual(message, payload["text"])
+
 
 class PublisherNodeTests(unittest.TestCase):
     def test_pass_state_is_published(self) -> None:
