@@ -10,6 +10,7 @@ from langgraph.graph import END, START, StateGraph
 from .config import Settings
 from .gemini import GeminiClient
 from .health import ServiceHealth
+from .quota import QuotaGuard
 from .metrics import RunMetrics
 from .nodes import ResearcherNode, ReviewerNode, WriterNode
 from .publisher import PublisherNode, TelegramPublisher
@@ -197,6 +198,13 @@ def create_runtime_graph(
         run_deadline=run_deadline,
         logger=print,
         metrics=run_metrics,
+        quota_guard=QuotaGuard(
+            min_interval=settings.gemini_min_interval_seconds,
+            daily_limit=settings.gemini_daily_request_limit,
+            ledger_path=settings.gemini_quota_ledger_path,
+            required=settings.gemini_quota_ledger_required,
+            logger=print,
+        ),
     )
     return build_editorial_graph(
         researcher=ResearcherNode(

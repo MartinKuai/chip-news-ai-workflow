@@ -29,6 +29,7 @@ from .health import ServiceHealth
 from .metrics import RunMetrics
 from .outcomes import CandidateStatus, RunOutcome, decide_run_outcome, exit_code_for
 from .publisher import TelegramPublisher
+from .quota import QuotaStateError, QuotaStopped
 from .schemas import Candidate
 from .sources import (
     SourceCollectionError,
@@ -140,6 +141,8 @@ def _config_line(settings: Settings) -> str:
         f" | max_attempts={settings.gemini_max_attempts}"
         f" | call_budget={settings.gemini_call_budget_seconds:.0f}s"
         f" | fallback_models={','.join(settings.gemini_fallback_models) or 'none'}"
+        f" | model_min_interval={settings.gemini_min_interval_seconds:.0f}s"
+        f" | model_daily_budget={settings.gemini_daily_request_limit}"
         f" | breaker={settings.breaker_failure_threshold}"
         f"/{settings.breaker_window_size}"
         f" | max_revisions={settings.max_revisions}"
@@ -162,6 +165,7 @@ def _empty_stats() -> dict[str, int]:
         "published": 0,
         "skipped": 0,
         "failed": 0,
+        "deferred": 0,
         "revisions": 0,
         "skipped_not_relevant": 0,
         "skipped_rejected": 0,
@@ -209,6 +213,7 @@ def _print_summary(
     print(f"    reviewer-reject: {stats['skipped_rejected']}")
     print(f"    revision-limit: {stats['skipped_revision_limit']}")
     print(f"  failed: {stats['failed']}")
+    print(f"  deferred: {stats.get('deferred', 0)}")
     print(f"  revisions: {stats['revisions']}")
     print(f"  breaker: {'open' if breaker_opened else 'closed'} | {breaker.snapshot()}")
     print(
@@ -260,6 +265,8 @@ def _print_summary(
     print(f"  json_repairs: {sum(metrics.json_repairs.values())}")
     print(f"  thinking_downgrades: {metrics.thinking_downgrades}")
     print(f"  model_fallbacks: {metrics.model_fallbacks}")
+    print(f"  model_requests: {metrics.model_requests}")
+    print(f"  http_statuses: {metrics.http_statuses}")
 
     calls, ok, failed = node_lines("researcher")
     print("Researcher:")
@@ -296,6 +303,8 @@ def _alert_lines(
     breaker_opened: bool,
     fatal_failure: GlobalWorkflowError | None,
     status_code: int | None,
+    metrics: RunMetrics | None = None,
+    quota_stop: QuotaStopped | None = None,
 ) -> list[str]:
     lines = [
         title,
@@ -308,7 +317,9 @@ def _alert_lines(
         [
             f"Published: {stats['published']}/{stats['selected']}",
             f"Processed: {stats['processed']}/{stats['selected']}",
+            f"Skipped: {stats['skipped']}",
             f"Failed: {stats['failed']}",
+            f"Deferred: {stats.get('deferred', 0)}",
         ]
     )
     categories = _failure_categories(failures)
@@ -317,8 +328,18 @@ def _alert_lines(
         lines.append(f"Categories: {summary}")
     if breaker_opened:
         lines.append("Breaker: open")
+    if failures:
+        stages = sorted({failure["stage"] for failure in failures})
+        lines.append("Failed stages: " + ", ".join(f"{stage}={_stage_failures(failures, stage)}" for stage in stages))
+    if metrics is not None:
+        lines.append(f"Gemini requests: {metrics.gemini_requests}; retries: {metrics.gemini_retries}")
+        errors = {code: count for code, count in metrics.http_statuses.items() if code >= 400}
+        if errors:
+            lines.append("HTTP errors: " + ", ".join(f"{code}={errors[code]}" for code in sorted(errors)))
+    if quota_stop is not None:
+        lines.append(f"Quota stop: model={quota_stop.model}; reason={quota_stop.reason}")
     if status_code is not None:
-        lines.append(f"HTTP status: {status_code}")
+        lines.append(f"Last failed HTTP status: {status_code}")
     return lines
 
 
@@ -398,17 +419,25 @@ def run_daily(
         node_success[stage] = node_success.get(stage, 0) + 1
         print(f"Candidate step | id={current['id']} | node={stage} | status={status}")
 
-    runtime_graph = (
-        graph
-        if graph is not None
-        else create_runtime_graph(
+    try:
+        runtime_graph = graph if graph is not None else create_runtime_graph(
             settings,
             metrics=metrics,
             breaker=service_breaker,
             run_deadline=deadline,
             on_step=on_step,
         )
-    )
+    except QuotaStateError as exc:
+        stats = _empty_stats()
+        result = {**stats, "run_outcome": RunOutcome.FAILED.value, "exit_code": 1}
+        print(f"Quota state failure | error={type(exc).__name__} | action=no_generation")
+        _send_alert(alert_publisher, _alert_lines(
+            "⚠️ Daily Chip News 运行失败", RunOutcome.FAILED, stats, [],
+            breaker_opened=False, fatal_failure=GlobalWorkflowError("quota", type(exc).__name__, force_failed=True),
+            status_code=None,
+        ))
+        _write_summary_file(settings.summary_path, result, [], [])
+        return result
 
     if candidates is not None:
         collection = SourceCollectionResult(
@@ -487,6 +516,7 @@ def run_daily(
     fatal_failure: GlobalWorkflowError | None = None
     breaker_opened = False
     budget_exceeded = False
+    quota_stop: QuotaStopped | None = None
     started = clock()
 
     for candidate in selected:
@@ -518,6 +548,10 @@ def run_daily(
             )
         except NodeExecutionError as exc:
             cause = exc.cause
+            if isinstance(cause, QuotaStopped):
+                quota_stop = cause
+                print(f"Candidate deferred | id={current['id']} | stage={exc.stage} | {cause}")
+                break
             info = classify_failure(exc.stage, cause)
             stats["failed"] += 1
             _record_failure(failures, candidate, exc.stage, cause, info.category)
@@ -553,6 +587,10 @@ def run_daily(
                 )
                 break
             continue
+        except QuotaStopped as exc:
+            quota_stop = exc
+            print(f"Candidate deferred | id={current['id']} | {exc}")
+            break
         except Exception as exc:
             stats["failed"] += 1
             _record_failure(
@@ -610,11 +648,13 @@ def run_daily(
             f"| title={current['title']}"
         )
 
+    stats["deferred"] = stats["selected"] - stats["processed"] + int(quota_stop is not None)
     outcome = decide_run_outcome(
         published=stats["published"],
         failed=stats["failed"],
         stopped_early=breaker_opened or budget_exceeded,
         force_failed=bool(fatal_failure and fatal_failure.force_failed),
+        quota_stopped=quota_stop is not None,
     )
     print(
         "Run outcome decision | "
@@ -646,6 +686,12 @@ def run_daily(
         "writer_model": settings.writer.model,
         "reviewer_model": settings.reviewer.model,
         "breaker_opened": breaker_opened,
+        "quota_stopped": quota_stop is not None,
+        "quota_stop_model": quota_stop.model if quota_stop else None,
+        "quota_stop_reason": quota_stop.reason if quota_stop else None,
+        "gemini_requests": metrics.gemini_requests,
+        "gemini_model_requests": metrics.model_requests,
+        "gemini_http_statuses": metrics.http_statuses,
     }
     if outcome is RunOutcome.FAILED:
         failure = fatal_failure or GlobalWorkflowError(
@@ -663,19 +709,23 @@ def run_daily(
                 breaker_opened=breaker_opened,
                 fatal_failure=failure,
                 status_code=failure.status_code or _latest_status_code(failures),
+                metrics=metrics,
+                quota_stop=quota_stop,
             ),
         )
-    elif outcome is RunOutcome.PARTIAL_SUCCESS:
+    elif outcome in {RunOutcome.PARTIAL_SUCCESS, RunOutcome.QUOTA_STOPPED}:
         _send_alert(
             alert_publisher,
             _alert_lines(
-                "⚠️ Daily Chip News 部分成功",
+                "⚠️ Daily Chip News 配额保护停止" if outcome is RunOutcome.QUOTA_STOPPED else "⚠️ Daily Chip News 部分成功",
                 outcome,
                 stats,
                 failures,
                 breaker_opened=breaker_opened,
                 fatal_failure=None,
                 status_code=_latest_status_code(failures),
+                metrics=metrics,
+                quota_stop=quota_stop,
             ),
         )
     _write_summary_file(settings.summary_path, result, failures, collection.failures)

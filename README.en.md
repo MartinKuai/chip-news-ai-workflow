@@ -119,10 +119,18 @@ MODEL_RESPONSE_INVALID / MODEL_RESPONSE_TRUNCATED / SCHEMA_INVALID   candidate l
 SOURCE_ERROR / PUBLISH_ERROR / CONFIG_ERROR / UNEXPECTED_ERROR
 ```
 
-- **retry**: up to `GEMINI_MAX_ATTEMPTS=3` attempts per model by default. 429 honours `Retry-After` (capped at 120s); 5xx (overload) backs off longer, 10s→20s→40s; 429 without `Retry-After` / network / timeout back off 2s→4s→8s; all with jitter and a 60s cap per wait. After the retries, `GEMINI_FALLBACK_MODELS` provides a fallback model. One logical call is bounded by `GEMINI_CALL_BUDGET_SECONDS=240`, one run by `RUN_BUDGET_SECONDS=2100`, and the HTTP timeout is clamped to the remaining budget.
+- **retry**: up to `GEMINI_MAX_ATTEMPTS=3` attempts per model. Safe quota dimensions, `RetryInfo.retryDelay` and `Retry-After` inform 429 handling: at least a 60s per-model cooldown, and no short retries for explicit daily exhaustion. A provider delay above 120s or the remaining call budget ends that round rather than being shortened. 5xx backs off 10s→20s→40s; network/timeouts use 2s→4s→8s, with jitter. At most one fallback shares the logical call's 240s deadline; the run remains bounded by 2100s.
 - **breaker**: when transient failures among the last `BREAKER_WINDOW(5)` AI logical calls reach `BREAKER_THRESHOLD(3)`, the run stops AI processing for the remaining candidates. Granularity is exactly one event per logical call; `SchemaError`/`GeminiResponseError` occupy a slot without counting as transient and without clearing history.
 - **JSON repair**: invalid structured output is repaired through one normal model call sharing the deadline, retries and timeout budget.
 - If a model explicitly rejects `thinkingConfig` with a 400, the run downgrades to the model default and records `thinking_downgrades`.
+
+## Free-tier quota control
+
+All nodes, retries, thinking downgrades and JSON repairs share a per-model `QuotaGuard`: request starts are at least **15 seconds** apart, with **18 attempted requests per model per Google quota day**. Attempts are persisted before transmission; failed or uncertain requests never release their reservations. Actual provider quotas and other project usage still apply.
+
+The quota day resets at midnight in `America/Los_Angeles`, including DST, separately from the news schedule at 00:05 Beijing time. Configure `GEMINI_MIN_INTERVAL_SECONDS`, `GEMINI_DAILY_REQUEST_LIMIT`, and `GEMINI_QUOTA_LEDGER_PATH` as needed.
+
+Actions restores `gemini-quota-ledger`, audits preceding runs, and uploads the ledger even after a failed pipeline. Scheduled/manual runs and rerun attempts share budgets and pacing. Unreadable/corrupt state prevents generation; an unaccounted run conservatively reserves the remaining daily budget until reset, including legacy runs on first adoption. Local ledger users must serialize access and avoid consuming the same project quota concurrently with a separate Actions ledger.
 
 ## Outcomes
 
@@ -132,6 +140,7 @@ Candidate statuses are simple: `PUBLISHED` / `SKIPPED` / `FAILED` (`SKIPPED` cov
 | --- | --- | --- |
 | `SUCCESS` | no candidate failures and no early stop | 0 |
 | `PARTIAL_SUCCESS` | failures or an early stop, but at least one item published | 0 |
+| `QUOTA_STOPPED` | daily budget/provider daily quota stopped processing, with no other real failures | 0 |
 | `FAILED` | nothing published together with failures / early stop, or a program-level fault | 1 |
 
 Already-published items never turn the run into `FAILED`; a run where every candidate is skipped by the editorial rules (`published == 0`, no failures) counts as a normal completion.
@@ -169,7 +178,7 @@ MAX_REVISIONS=1
 
 ## GitHub Actions
 
-Runs daily at 06:55 Asia/Shanghai (`55 22 * * *` UTC) and supports `workflow_dispatch`; both paths use the same application architecture.
+Scheduled daily at **00:05 Asia/Shanghai** (`5 16 * * *` UTC, 16:05 UTC on the preceding day), with possible GitHub queue delays. Also supports `workflow_dispatch`; both paths share the architecture and daily quota ledger.
 
 ```text
 checkout → setup python → install → run application (Secrets / Variables)

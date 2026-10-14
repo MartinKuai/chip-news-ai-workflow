@@ -18,6 +18,7 @@ class RunOutcome(StrEnum):
 
     SUCCESS = "SUCCESS"
     PARTIAL_SUCCESS = "PARTIAL_SUCCESS"
+    QUOTA_STOPPED = "QUOTA_STOPPED"
     FAILED = "FAILED"
 
 
@@ -31,6 +32,7 @@ def decide_run_outcome(
     failed: int,
     stopped_early: bool,
     force_failed: bool = False,
+    quota_stopped: bool = False,
 ) -> RunOutcome:
     """Derive the run outcome from the processed candidate results.
 
@@ -44,4 +46,6 @@ def decide_run_outcome(
         return RunOutcome.FAILED
     if failed > 0 or stopped_early:
         return RunOutcome.PARTIAL_SUCCESS if published > 0 else RunOutcome.FAILED
+    if quota_stopped:
+        return RunOutcome.QUOTA_STOPPED
     return RunOutcome.SUCCESS

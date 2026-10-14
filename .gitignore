@@ -27,3 +27,6 @@ Thumbs.db
 logs/
 output/
 *.log
+.gemini-quota-ledger.json
+gemini-quota-ledger.json
+gemini-quota-ledger.json.tmp

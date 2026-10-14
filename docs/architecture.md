@@ -26,7 +26,7 @@ FAILED（候选级，不影响其他候选）
 Run Summary → Notification
 ```
 
-运行时依赖：LangGraph、Gemini API、RSS / Jina Reader、Telegram。无数据库、无额外 SaaS、无跨 run 状态。
+运行时依赖：LangGraph、Gemini API、RSS / Jina Reader、Telegram。无数据库、无额外 SaaS；模型每日请求预留与冷却由 GitHub Actions quota ledger artifact 跨 run 保存。
 
 ## Stage 1 — Sources 与 Candidate Selection
 
@@ -137,7 +137,8 @@ AI 输出先经过 `responseSchema` 约束，再经过本地 validator；缺字�
 
 - 请求：`x-goog-api-key` header；`responseMimeType=application/json`；可选 `responseSchema`、`maxOutputTokens`、`thinkingConfig.thinkingLevel`。
 - 超时与预算：`GEMINI_TIMEOUT_SECONDS=180`；单次逻辑调用 `GEMINI_CALL_BUDGET_SECONDS=240`；整场 `RUN_BUDGET_SECONDS=2100`；HTTP timeout clamp 到剩余预算。
-- 重试：每个模型最多 `GEMINI_MAX_ATTEMPTS=3`；429 优先 `Retry-After`（上限 120s）；5xx（过载）退避 10/20/40s；其余（429 无 `Retry-After` / network / timeout）退避 2/4/8s；均带 jitter，单次 sleep ≤ 60s。
+- 重试：每个模型最多 `GEMINI_MAX_ATTEMPTS=3`；429 根据安全的 quota dimension 区分日配额，按 `Retry-After` / `RetryInfo` 等待，并共享至少 60s 模型冷却；明确日配额耗尽不短重试。超过 120s 等待上限/deadline 时结束本轮，不提前重试。5xx 退避 10/20/40s，network / timeout 退避 2/4/8s，有 jitter。
+- 配额：每次 POST 都经过共享 `QuotaGuard`；默认 15s 模型间隔、18 次/模型/Pacific 配额日。发送前保存预留，失败不返还。账本损坏/读取失败禁止生成；未保存账本的运行保守预留剩余额度。每日重置跟随 `America/Los_Angeles` 夏令时。
 - 模型 fallback：主模型 429 / 5xx 重试用尽后，切换到 `GEMINI_FALLBACK_MODELS` 中第一个与主模型不同的模型再完整尝试一轮；每次逻辑调用最多切换一次，共享同一 deadline；网络错误与 4xx 配置/计费错误不切换。breaker 只记录逻辑调用的最终结果，记录 `model_fallbacks`。
 - 日志：`purpose / attempt / http / retry_after / backoff / reason`，不含 key、header、请求体。
 - JSON 容错：直接解析 → fenced 提取 → 一次只修格式的 repair（与原调用共享 deadline，走完整 retry/超时路径）→ 仍失败抛 `GeminiResponseError`；截断抛 `GeminiTruncatedResponseError`。
@@ -170,6 +171,7 @@ UNEXPECTED_ERROR                停止本轮且 run 强制 FAILED
 | --- | --- | --- |
 | `SUCCESS` | 无候选失败，且未提前停止 | 0 |
 | `PARTIAL_SUCCESS` | 有失败或提前停止（breaker / 时间预算），但 `published > 0` | 0 |
+| `QUOTA_STOPPED` | 日配额/预算主动停止，且没有其他真实失败；剩余候选记入 `deferred` | 0 |
 | `FAILED` | `published == 0` 且存在失败 / 提前停止；或程序级故障 | 1 |
 
 全部候选被编辑规则跳过（`published == 0`、无失败）属于正常完成：pipeline 工作正常，只是没有合格内容。
@@ -209,7 +211,7 @@ Candidate done  | id=... | status=PUBLISHED | reason=published | revisions=1
 Candidate failed| id=... | node=writer | category=TRANSIENT_SERVER | error=GeminiAPIError
 ```
 
-随后输出 `Run summary`（discovered / selected / processed / published / skipped 细分 / failed / revisions / breaker / models / outcome）、Gemini 计数与各节点 calls / success / failures。`FAILED` 与 `PARTIAL_SUCCESS` 会通过 Telegram 发送运维告警。
+随后输出 `Run summary`（discovered / selected / processed / published / skipped 细分 / failed / deferred / revisions / breaker / models / outcome）、按模型请求数、HTTP 状态计数与各节点 calls / success / failures。`FAILED`、`PARTIAL_SUCCESS` 与 `QUOTA_STOPPED` 发送纯文本 Telegram 告警，保留下划线，列出跳过/待处理数、失败阶段、HTTP 错误分布及配额停止原因。
 
 ## Secret boundary
 

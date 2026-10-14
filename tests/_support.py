@@ -110,6 +110,7 @@ def make_settings(**overrides: Any) -> Settings:
         "telegram_bot_token": "telegram-token",
         "telegram_chat_id": "telegram-chat",
         "publish_enabled": False,
+        "gemini_min_interval_seconds": 0.0,  # clocks/pacing tested with a fake clock
     }
     values.update(overrides)
     return Settings(**values)

@@ -14,6 +14,7 @@ from urllib.parse import quote
 import requests
 
 from .metrics import RunMetrics
+from .quota import QuotaGuard, QuotaStopped, QuotaWaitDeadline
 
 
 class GeminiError(RuntimeError):
@@ -74,6 +75,35 @@ REPAIR_INSTRUCTION = """
 _FENCED_JSON = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 _THINKING_FIELDS = ("thinkingconfig", "thinking_level", "thinkinglevel")
 _API_ROOT = "https://generativelanguage.googleapis.com/v1beta/models/"
+
+
+def quota_error_details(response: requests.Response) -> tuple[str, float | None]:
+    """Read only quota dimension and RetryInfo; never expose provider messages."""
+    try:
+        body = response.json()
+    except (ValueError, TypeError):
+        return "unknown", None
+    error = body.get("error", {}) if isinstance(body, dict) else {}
+    details = error.get("details", []) if isinstance(error, dict) else []
+    scope, retry_delay = "unknown", None
+    for detail in details if isinstance(details, list) else []:
+        if not isinstance(detail, dict):
+            continue
+        if str(detail.get("@type", "")).endswith("google.rpc.QuotaFailure"):
+            violations = detail.get("violations", [])
+            for violation in violations if isinstance(violations, list) else []:
+                if not isinstance(violation, dict):
+                    continue
+                identifier = re.sub(r"[^a-z]", "", str(violation.get("quotaId", "")).lower())
+                if "perday" in identifier:
+                    scope = "daily"
+                elif "perminute" in identifier and scope != "daily":
+                    scope = "minute"
+        elif str(detail.get("@type", "")).endswith("google.rpc.RetryInfo"):
+            match = re.fullmatch(r"(\d+(?:\.\d+)?)s", str(detail.get("retryDelay", "")))
+            if match:
+                retry_delay = min(float(match.group(1)), 86400.0)
+    return scope, retry_delay
 
 
 def retry_after_seconds(value: str | None, *, now: float | None = None) -> float | None:
@@ -137,6 +167,7 @@ class GeminiClient:
         logger: Callable[[str], None] | None = None,
         metrics: RunMetrics | None = None,
         now: Callable[[], float] = time.monotonic,
+        quota_guard: QuotaGuard | None = None,
     ) -> None:
         if not api_key:
             raise ValueError("Gemini API key is required")
@@ -171,6 +202,8 @@ class GeminiClient:
         self._metrics = metrics or RunMetrics()
         self._now = now
         self._unsupported_thinking: set[str] = set()
+        self._quota_guard = quota_guard
+        self._daily_blocked: set[str] = set()
 
     def request_json(
         self,
@@ -206,7 +239,7 @@ class GeminiClient:
         }
         try:
             return self._request_model(model=clean_model, **call)
-        except GeminiAPIError as exc:
+        except (GeminiAPIError, QuotaStopped) as exc:
             # The first configured model that differs from the primary.
             fallback = next(
                 (name for name in self._fallback_models if name != clean_model), ""
@@ -216,15 +249,16 @@ class GeminiClient:
             # auth/config errors and an exhausted deadline are not.
             if (
                 not fallback
-                or not exc.transient
-                or exc.status_code is None
+                or (not isinstance(exc, QuotaStopped) and not exc.transient)
+                or (not isinstance(exc, QuotaStopped) and exc.status_code is None)
                 or deadline - self._now() <= 0
             ):
                 raise
             self._metrics.model_fallbacks += 1
             self._log(
                 f"Gemini model fallback | purpose={purpose or 'n/a'} "
-                f"| from={clean_model} | to={fallback} | http={exc.status_code}"
+                f"| from={clean_model} | to={fallback} "
+                + (f"| quota_stop={exc.reason}" if isinstance(exc, QuotaStopped) else f"| http={exc.status_code}")
             )
             return self._request_model(model=fallback, **call)
 
@@ -315,6 +349,8 @@ class GeminiClient:
         last_error: GeminiAPIError | None = None
 
         for attempt in range(1, self._max_attempts + 1):
+            if self._quota_guard is None and model in self._daily_blocked:
+                raise QuotaStopped(model, "provider-daily-quota")
             remaining = deadline - self._now()
             if remaining <= 0:
                 self._log(
@@ -325,7 +361,20 @@ class GeminiClient:
                 raise last_error or GeminiAPIError(
                     "Gemini request deadline reached", transient=True
                 )
+            if self._quota_guard is not None:
+                try:
+                    self._quota_guard.before_request(model, deadline)
+                except QuotaWaitDeadline:
+                    raise last_error or GeminiAPIError(
+                        "Call budget exhausted while waiting for quota", transient=True
+                    ) from None
+                except QuotaStopped:
+                    if last_error is not None:
+                        raise last_error
+                    raise
+                remaining = deadline - self._now()
             self._metrics.gemini_requests += 1
+            self._metrics.model_requests[model] = self._metrics.model_requests.get(model, 0) + 1
             try:
                 response = self._session.post(
                     url,
@@ -354,6 +403,8 @@ class GeminiClient:
                     deadline=deadline,
                 )
                 raise last_error
+
+            self._metrics.http_statuses[response.status_code] = self._metrics.http_statuses.get(response.status_code, 0) + 1
 
             if response.status_code == 200:
                 self._metrics.gemini_success += 1
@@ -390,6 +441,18 @@ class GeminiClient:
                     transient=True,
                 )
                 retry_after = self._header_retry_after(response)
+                if status_code == 429:
+                    scope, body_delay = quota_error_details(response)
+                    self._log(f"Gemini quota signal | purpose={purpose or 'n/a'} | model={model} | scope={scope}")
+                    if scope == "daily":
+                        self._daily_blocked.add(model)
+                        if self._quota_guard is not None:
+                            self._quota_guard.block_daily(model)
+                        raise QuotaStopped(model, "provider-daily-quota")
+                    if body_delay is not None:
+                        retry_after = max(retry_after or 0.0, body_delay)
+                    if self._quota_guard is not None:
+                        self._quota_guard.cooldown(model, max(60.0, retry_after or 0.0))
                 if attempt < self._max_attempts and self._sleep_before_retry(
                     attempt=attempt,
                     purpose=purpose,
@@ -549,14 +612,21 @@ class GeminiClient:
             return False
         if retry_after is not None:
             reason = "retry-after"
-            delay = min(retry_after, self._retry_after_cap)
+            if retry_after > self._retry_after_cap:
+                return False
+            delay = retry_after
         else:
             # An overloaded server needs far longer to recover than a blip.
             overloaded = status_code is not None and 500 <= status_code < 600
-            reason = "overload-backoff" if overloaded else "exponential-backoff"
-            base = self._overload_backoff_base if overloaded else self._backoff_base
+            rate_limited = status_code == 429
+            reason = "rate-limit-backoff" if rate_limited else ("overload-backoff" if overloaded else "exponential-backoff")
+            base = 60.0 if rate_limited else (self._overload_backoff_base if overloaded else self._backoff_base)
             delay = min(base * (2 ** (attempt - 1)), self._max_backoff)
-        sleep_for = max(0.0, min(delay * self._random(0.7, 1.0), remaining))
+        # Provider delays and minute cooldowns are minimums, never jitter them down.
+        sleep_for = delay if retry_after is not None or status_code == 429 else delay * self._random(0.7, 1.0)
+        if sleep_for >= remaining:
+            return False
+        sleep_for = max(0.0, sleep_for)
         self._metrics.gemini_retries += 1
         self._log(
             f"Gemini retry | purpose={purpose or 'n/a'} "
