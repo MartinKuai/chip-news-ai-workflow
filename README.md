@@ -8,7 +8,7 @@ Daily Chip News 是一个每日运行的半导体行业情报自动化工作流�
 
 **Sources → Candidate Selection → Researcher → Writer → Reviewer → Publisher → Run Summary**
 
-Researcher 读取正文并输出结构化研究笔记；Writer 只根据研究笔记写中文成稿；Reviewer 按固定标准审核；审核通过后由确定性的 Publisher 推送至 Telegram；最后输出 run summary 与必要的运维告警。
+Researcher 读取正文并输出结构化研究笔记；Writer 只根据研究笔记写中文成稿；Reviewer 按固定标准审核；审核通过的条目在本轮结束时由确定性的 Publisher 一次性发布到个人网站 [martinkuai.com](https://martinkuai.com)（向 [MartinKuai/martinkuai](https://github.com/MartinKuai/martinkuai) 的 `data/news/` 提交一个 commit），Telegram 推送保留为默认关闭的开关 `PUBLISH_TELEGRAM`；最后输出 run summary 与必要的运维告警。
 
 ## Pipeline
 
@@ -24,7 +24,8 @@ flowchart TD
     G --> E
     E -->|REVISE 达到上限| H[HOLD → SKIPPED]
     E -->|REJECT → SKIPPED| Z
-    F --> I[Telegram]
+    F -->|本轮结束，一个 commit| W[网站 data/news/YYYY-MM-DD.json + stats.json]
+    F -.->|PUBLISH_TELEGRAM=1| I[Telegram]
     F --> J[Run Summary / Notification]
 ```
 
@@ -143,9 +144,117 @@ Actions 先恢复 `gemini-quota-ledger` artifact，再执行生成，并在成�
 | `SUCCESS` | 无候选失败，且未因 breaker / 时间预算提前停止 | 0 |
 | `PARTIAL_SUCCESS` | 有失败或提前停止，但至少发布了一条 | 0 |
 | `QUOTA_STOPPED` | 每日预算/明确日配额主动停止，且没有其他真实失败 | 0 |
-| `FAILED` | 未发布任何内容且存在失败 / 提前停止；或程序级故障 | 1 |
+| `FAILED` | 未发布任何内容且存在失败 / 提前停止；或程序级故障；或网站写入失败 | 1 |
 
 已发布内容不会因为后续候选失败把 run 重新定义为 `FAILED`；全部候选被编辑规则跳过（`published == 0` 且无失败）视为正常完成。
+
+## 发布到网站
+
+审核通过（Reviewer PASS）的条目不再逐条推送 Telegram，而是在本轮所有候选处理完后，由确定性的 `website.py` 向网站仓库 [MartinKuai/martinkuai](https://github.com/MartinKuai/martinkuai) 提交**一个** commit（Git Data API，只做 fast-forward 更新，不 force push；分支被别人同时推送时重新读取后重试）：
+
+| 文件 | 何时写入 | 内容 |
+| --- | --- | --- |
+| `data/news/YYYY-MM-DD.json` | 本轮至少一条通过审核 | 以发布时的 Asia/Shanghai 日期命名 |
+| `data/news/stats.json` | 每一轮（包括没有内容通过、运行失败） | 运行次数与成功率 |
+
+格式与网站简报 7.2 节一致（真实 dry-run 输出见 `tests/fixtures/site_dry_run/expected/`）：
+
+```json
+{
+  "date": "2026-10-20",
+  "published_at": "2026-10-20T05:01:32+08:00",
+  "title": "晶圆代工厂扩充 2.5D 先进封装产能，2027 年底目标提升约 60% 等 3 条芯闻",
+  "items": [
+    { "title": "…", "summary": "一到三句话", "source": { "name": "…", "url": "https://…" } }
+  ],
+  "run": { "number": 280, "status": "success" }
+}
+```
+
+```json
+{ "total_runs": 280, "success_rate": 0.9714, "since": "2026-01", "updated_at": "2026-10-20T05:01:32+08:00" }
+```
+
+- `title` / `summary` 直接取 Writer 结构化输出（`responseSchema`）里的 `headline` / `summary`，也就是 Reviewer 审核过的文本。Writer 的 schema 要求 summary 为一到三句；发布时只做空白规整，超过三句按句末标点截断（只删不改）。
+- `source.name` / `source.url` 来自 RSS 元数据，不由模型生成，只接受 http(s) 链接；Hacker News 这类聚合源用文章网站的域名作来源名。
+- 当天总标题用确定性规则生成：一条时就是该条标题，多条时为「第一条标题 等 N 条芯闻」，不额外调用模型、不新增事实。
+- `run.number` 等于本次发布后的 `stats.total_runs`（定时运行序号）；`run.status` 是本轮结果的小写形式：`success` / `partial_success` / `quota_stopped`。
+- 同一天再次运行（例如手动重跑）会把新条目按原文链接去重后追加到当天文件，保留第一次的 `published_at`。
+- 所有字符串都是模型或 RSS 产生的不可信文本，网站渲染时必须转义。
+
+### 没有内容通过审核（HOLD）
+
+所有候选都被 Researcher 跳过、被 Reviewer 拒绝，或在返工上限处 HOLD 时：**不写当天的新闻文件**（网站首页继续显示最近一天的芯闻），**仍然更新 `stats.json`**。这种运行属于按设计正常完成（exit 0），计为成功运行，和“审查不通过就不发布”的说法一致，也和 GitHub Actions 显示的结论一致。
+
+### total_runs 与 success_rate 的口径
+
+- `total_runs`：本工作流 `daily_news.yml` 的**定时**运行（`event=schedule`）次数。手动 `workflow_dispatch` 可以发布新闻，但不计数。
+- `success_rate`：其中 GitHub Actions 结论为 `success` 的比例，保留 4 位小数；网站展示时自行取整并加“约”。
+- `since`：`2026-01`（第一次定时运行是 2026-01-12）。
+- 2026-10-20 核对：GitHub 列出 280 次定时运行、272 次成功（97.1%），与“截至 2026 年 10 月定时运行 270 次，成功率约 97%”是同一口径。
+
+计算方法（`website.compute_stats`）：每次发布同时算两个值，取总数较大的一个（相等时用 API）。
+
+1. **Actions API**：GitHub 仍保留的全部已完成定时运行，加上本轮。GitHub 保留完整历史时，这就是上面引用的数字，并会自动纠正之前的偏差。
+2. **累加**：上一份 `stats.json`，加上它的 `updated_at` 之后创建、已完成的定时运行（补记那些在发布前就崩溃的运行），再加上本轮。
+
+只用 API 不够：GitHub 从 2026-10-01 起把 workflow run 记录纳入 Actions 保留期，公开仓库最长 90 天。旧记录被清理后 API 总数会变小，这时累加值接管，`total_runs` 不会倒退。成功次数用 `round(success_rate × total_runs)` 还原（4 位小数在 1 万次以内精确），所以 `stats.json` 不需要额外字段。
+
+- 本轮是否成功：结果不是 `FAILED`（exit 0）就算成功。网站写入失败时本轮以 `FAILED` 结束（exit 1），下一轮会通过 API 把它补记为失败。
+- 不重复计数：同一次运行的重跑（re-run attempt）或提交重试不会再计一次。
+- 读不到 Actions API（网络问题）时只用累加值，并在日志中提示。
+- 首次启用时，网站仓库里如果还留着开发样例 `stats.json`，只要样例数字小于 API 的数字就会被自动纠正；按网站简报第 9 节，上线前仍应删除样例（同一天的样例新闻文件会被合并而不是覆盖）。
+
+### 启用步骤
+
+1. 创建 fine-grained personal access token：GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token。
+   - Resource owner：`MartinKuai`；Repository access：Only select repositories → `MartinKuai/martinkuai`
+   - Repository permissions：**Contents: Read and write**（会自动带上 Metadata: Read-only），其他权限都不要
+   - 设置过期时间（最长 1 年）；过期后发布会失败并告警，需要续期后更新 secret
+2. 在本仓库 Settings → Secrets and variables → Actions → New repository secret 添加 `SITE_REPO_TOKEN`（或 `gh secret set SITE_REPO_TOKEN`）。
+3. **先加 secret，再把本分支合并到 `main`**。否则下一次定时运行会因缺少 `SITE_REPO_TOKEN` 而配置失败。
+4. 网站仓库的 `main` 如果开启了分支保护（要求 PR 或状态检查），需要允许 token 所有者绕过，或者用 Variable `SITE_REPO_BRANCH` 改写到专用分支。
+
+### 开关与配置
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `SITE_REPO_TOKEN` | github 模式必填 | Secret，写网站仓库 |
+| `SITE_PUBLISH_MODE` | `github` | `github` 提交到网站仓库；`local` 只写本地文件夹（dry-run）；`off` 不发布到网站 |
+| `SITE_REPO` | `MartinKuai/martinkuai` | 网站仓库 |
+| `SITE_REPO_BRANCH` | `main` | 写入的分支 |
+| `SITE_NEWS_DIR` | `data/news` | 仓库内目录 |
+| `SITE_LOCAL_DIR` | `output/site` | dry-run 输出目录（已被 Git 忽略） |
+| `SITE_TIMEOUT_SECONDS` | `20` | GitHub 请求超时 |
+| `SITE_STATS_SINCE` | `2026-01` | `stats.since` 的默认值 |
+| `SITE_STATS_WORKFLOW` | `daily_news.yml` | 统计哪个工作流的定时运行 |
+| `PUBLISH_TELEGRAM` | `0` | `1` 恢复 Telegram：逐条推送 + 运维告警 |
+| `PUBLISH_ENABLED` | `1` | `0` 表示不对外发布任何内容：Telegram 跳过，网站自动改为 `local` |
+
+GitHub Actions 中 `SITE_PUBLISH_MODE`、`SITE_REPO`、`SITE_REPO_BRANCH`、`PUBLISH_TELEGRAM` 可以直接用 Repository Variables 覆盖，不用改 workflow。
+
+### 本地 dry-run
+
+```bash
+SITE_PUBLISH_MODE=local python main.py    # 或 PUBLISH_ENABLED=0 python main.py
+# 输出：output/site/data/news/YYYY-MM-DD.json、output/site/data/news/stats.json
+```
+
+dry-run 写出的两个文件与线上提交的内容完全相同，只是不调用 GitHub 写接口；它会读取本地目录里上一份 `stats.json`。只有设置了 `GITHUB_REPOSITORY` 才会读取 Actions 运行历史；没有 `GITHUB_EVENT_NAME=schedule` 时本轮不计入 `total_runs`。`tests/test_site_fixture.py` 用 mock 的 Gemini 输出跑真实 graph，校验 `tests/fixtures/site_dry_run/expected/` 里的样例。
+
+### 告警
+
+Telegram 关闭时，`FAILED` / `PARTIAL_SUCCESS` / `QUOTA_STOPPED` 告警写入运行日志、Actions 的 warning 注释和 Job Summary；`FAILED` 运行 exit 1，GitHub 会按通知设置发送失败邮件。需要手机推送告警时设 `PUBLISH_TELEGRAM=1`（会同时恢复逐条推送）。
+
+### 切回 Telegram
+
+- 网站和 Telegram 同时发布：Repository Variables 添加 `PUBLISH_TELEGRAM=1`，并确认 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID` 两个 secret 仍在。
+- 完全回到旧行为：再添加 `SITE_PUBLISH_MODE=off`。都不需要改代码。
+
+### 注意
+
+- 每一轮都会在网站仓库产生一个 commit（包括只更新 `stats.json` 的日子）。如果网站部署绑定了 push 自动构建，每天会触发一次重新构建。
+- commit 作者是 token 所有者；commit message 带本次 Actions 运行链接，便于追溯。
 
 ## 可观测性
 
@@ -167,8 +276,12 @@ RESEARCHER_MODEL=gemini-3.6-flash
 WRITER_MODEL=gemini-3.5-flash
 REVIEWER_MODEL=gemini-3.5-flash
 GEMINI_FALLBACK_MODELS=gemini-3.5-flash,gemini-3.6-flash
-TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-TELEGRAM_CHAT_ID=your_telegram_chat_id
+# 本地先 dry-run；改成 github 时需要 SITE_REPO_TOKEN
+SITE_PUBLISH_MODE=local
+# SITE_REPO_TOKEN=your_site_repo_token
+# PUBLISH_TELEGRAM=1 时才需要：
+# TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+# TELEGRAM_CHAT_ID=your_telegram_chat_id
 ARTICLES_PER_FEED=2
 MAX_CANDIDATES_PER_RUN=6
 MAX_REVISIONS=1
@@ -183,25 +296,27 @@ MAX_REVISIONS=1
 每天北京时间 **00:05**（`5 16 * * *` UTC，即前一天 16:05 UTC）定时触发，也支持 `workflow_dispatch`。GitHub 调度可能排队延迟；两者共用 application architecture 和每日配额账本。
 
 ```text
-checkout → setup python → install → run application（Secrets / Variables）
-→ upload run summary artifact → notification（app 内 Telegram）
+checkout → setup python → install → restore quota ledger
+→ run application（Secrets / Variables；本轮结束时向网站仓库提交一个 commit）
+→ upload quota ledger / run summary artifact
 ```
 
 仓库需要的配置（Settings → Secrets and variables → Actions）：
 
 | 类型 | 名称 |
 | --- | --- |
-| Secret | `GEMINI_API_KEY`、`TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID` |
-| Variable | `RESEARCHER_MODEL`、`WRITER_MODEL`、`REVIEWER_MODEL`、`GEMINI_FALLBACK_MODELS` |
+| Secret | `GEMINI_API_KEY`、`SITE_REPO_TOKEN`；`PUBLISH_TELEGRAM=1` 时另需 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID` |
+| Variable | `RESEARCHER_MODEL`、`WRITER_MODEL`、`REVIEWER_MODEL`、`GEMINI_FALLBACK_MODELS`；可选 `PUBLISH_TELEGRAM`、`SITE_PUBLISH_MODE`、`SITE_REPO`、`SITE_REPO_BRANCH` |
 
 也可以用 GitHub CLI 设置，例如：
 
 ```bash
 gh secret set GEMINI_API_KEY
+gh secret set SITE_REPO_TOKEN
 gh variable set GEMINI_FALLBACK_MODELS -b "gemini-3.5-flash,gemini-3.6-flash"
 ```
 
-手动触发 `workflow_dispatch` 会**真实发布**到 Telegram；只想验证配置时，先在本地用 `PUBLISH_ENABLED=0` 做 dry-run。没有发布任何内容且存在失败的运行会以 exit code 1 结束，Actions 显示为失败并发送 Telegram 告警，不会静默“成功”。
+手动触发 `workflow_dispatch` 会**真实发布**到网站（不计入 `total_runs`）；只想验证配置时，先在本地用 `SITE_PUBLISH_MODE=local` 或 `PUBLISH_ENABLED=0` 做 dry-run。没有发布任何内容且存在失败的运行、以及网站写入失败的运行，会以 exit code 1 结束，Actions 显示为失败并发出告警，不会静默“成功”。
 
 ## 本地运行
 
@@ -209,7 +324,7 @@ gh variable set GEMINI_FALLBACK_MODELS -b "gemini-3.5-flash,gemini-3.6-flash"
 python main.py
 ```
 
-`PUBLISH_ENABLED=0` 可做不发送 Telegram 的 dry-run；`MAX_CANDIDATES_PER_RUN=1` 可做单候选 smoke。例如（Git Bash / Linux / macOS）：
+`PUBLISH_ENABLED=0` 可做不对外发布的 dry-run（网站文件写到 `output/site/`，Telegram 跳过）；`MAX_CANDIDATES_PER_RUN=1` 可做单候选 smoke。例如（Git Bash / Linux / macOS）：
 
 ```bash
 PUBLISH_ENABLED=0 MAX_CANDIDATES_PER_RUN=1 python main.py
@@ -233,7 +348,7 @@ python -m unittest discover -s tests -t tests
 python -m ruff check .
 ```
 
-测试按 pipeline 阶段组织：`test_sources`（canonical dedupe / garbage / recency / round-robin / limit）、`test_researcher`、`test_writer`、`test_reviewer`、`test_graph`（publish / skip / revision / revision limit / node failure）、`test_gemini`、`test_breaker`、`test_runner`（SUCCESS / PARTIAL_SUCCESS / FAILED）、`test_smoke_pipeline`（全 HTTP mock 的端到端 smoke）。
+测试按 pipeline 阶段组织：`test_sources`（canonical dedupe / garbage / recency / round-robin / limit）、`test_researcher`、`test_writer`、`test_reviewer`、`test_graph`（publish / skip / revision / revision limit / node failure）、`test_gemini`、`test_breaker`、`test_runner`（SUCCESS / PARTIAL_SUCCESS / FAILED / 网站发布）、`test_smoke_pipeline`（全 HTTP mock 的端到端 smoke）、`test_website`（条目映射、stats 口径、mock HTTP 的 Git Data API 提交、冲突重试、dry-run）、`test_site_fixture`（真实 graph + mock Gemini 生成的网站 JSON 样例）。
 
 ## 项目结构
 
@@ -253,8 +368,9 @@ python -m ruff check .
 │  ├─ errors.py       # 错误分类与 routing flags
 │  ├─ metrics.py      # run 级计数器
 │  ├─ outcomes.py     # 候选/运行结果状态机与 exit code
-│  ├─ publisher.py    # 确定性 Telegram 发布与运维告警
-│  └─ runner.py       # 候选循环、run summary、通知
+│  ├─ publisher.py    # PASS 守卫与可选的 Telegram 发布、告警
+│  ├─ website.py      # 网站发布：当天 JSON + stats.json，一个 commit
+│  └─ runner.py       # 候选循环、网站发布、run summary、通知
 ├─ tests/
 ├─ docs/architecture.md
 ├─ .github/workflows/daily_news.yml
