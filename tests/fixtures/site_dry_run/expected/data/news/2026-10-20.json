@@ -1,0 +1,35 @@
+{
+  "date": "2026-10-20",
+  "published_at": "2026-10-20T05:01:32+08:00",
+  "title": "晶圆代工厂扩充 2.5D 先进封装产能，2027 年底目标提升约 60% 等 3 条简报",
+  "items": [
+    {
+      "title": "晶圆代工厂扩充 2.5D 先进封装产能，2027 年底目标提升约 60%",
+      "summary": "一家晶圆代工厂表示，将在 2027 年底前把 2.5D 先进封装的月产能提升约 60%，以承接 AI 加速器订单。新增产能主要来自现有厂区改造，原文未披露投资金额。",
+      "source": {
+        "name": "Example Chip Wire",
+        "url": "https://chipwire.example/2026/10/advanced-packaging-capacity"
+      }
+    },
+    {
+      "title": "第四季度服务器 DDR5 合约价预计环比上涨 8% 至 13%",
+      "summary": "一家市场研究机构预计，第四季度服务器 DDR5 合约价将环比上涨 8% 至 13%，主要原因是 HBM 挤占了部分 DRAM 产能。PC 端 DDR5 涨幅预计略低于服务器端。",
+      "source": {
+        "name": "Example Memory Report",
+        "url": "https://memory.example/research/q4-ddr5-contract-prices"
+      }
+    },
+    {
+      "title": "云服务商分享 CXL 内存池化的生产部署经验",
+      "summary": "一家云服务商在技术博客中介绍，单个机柜内 16 台服务器通过 CXL 2.0 共享内存池，内存利用率从约 55% 提升到约 75%。文章也提到，跨节点访问延迟比本地 DRAM 高约 170 纳秒。",
+      "source": {
+        "name": "servers.example",
+        "url": "https://www.servers.example/blog/cxl-memory-pooling-in-production"
+      }
+    }
+  ],
+  "run": {
+    "number": 280,
+    "status": "success"
+  }
+}

@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from _support import SRC, make_settings  # noqa: F401
+from _support import DRAFT, SRC, make_settings  # noqa: F401
 
 from daily_chip_news.gemini import GeminiAPIError
 from daily_chip_news.graph import (
@@ -24,6 +26,13 @@ from daily_chip_news.sources import (
     SourceCollectionResult,
     SourceFailure,
     candidate_id,
+)
+from daily_chip_news.website import (
+    SITE_TZ,
+    LocalSiteStore,
+    RunContext,
+    SitePublisher,
+    SitePublishError,
 )
 
 
@@ -369,6 +378,132 @@ class SourceFailureTests(unittest.TestCase):
         self.assertEqual(1, result["discovered"])
         self.assertEqual(1, result["selected"])
         self.assertEqual(1, result["published"])
+
+
+def approved(index: int) -> dict:
+    """Terminal state of a published candidate, as the real graph returns it."""
+    return {
+        **terminal(STATUS_PUBLISHED),
+        "candidate": candidates(index + 1)[index],
+        "draft": {**DRAFT, "headline": f"标题 {index}"},
+    }
+
+
+class RecordingSite:
+    """SitePublisher stand-in that records calls or raises a scripted error."""
+
+    store = "github:MartinKuai/martinkuai@main"
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.calls: list[tuple[list[dict], str]] = []
+
+    def publish(self, items, outcome):
+        self.calls.append((list(items), outcome))
+        if self.error is not None:
+            raise self.error
+        return SimpleNamespace(
+            store=self.store,
+            items=len(items),
+            news_written=bool(items),
+            date="2026-10-20",
+            stats={"total_runs": 281, "success_rate": 0.9715},
+            basis="actions-api",
+            location="commit-sha",
+        )
+
+
+class WebsitePublishingTests(unittest.TestCase):
+    def test_approved_items_are_published_once_after_the_loop(self) -> None:
+        site = RecordingSite()
+        result = run_daily(
+            make_settings(),
+            graph=FakeGraph(approved(0), terminal(STATUS_SKIP), approved(2)),
+            candidates=candidates(3),
+            clock=lambda: 0.0,
+            site_publisher=site,
+        )
+        self.assertEqual(1, len(site.calls))
+        items, outcome = site.calls[0]
+        self.assertEqual("SUCCESS", outcome)
+        self.assertEqual(["标题 0", "标题 2"], [item["title"] for item in items])
+        self.assertEqual(candidates(3)[2]["url"], items[1]["source"]["url"])
+        self.assertTrue(result["site"]["published"])
+        self.assertEqual(281, result["site"]["total_runs"])
+
+    def test_nothing_passed_review_still_updates_stats(self) -> None:
+        site = RecordingSite()
+        result = run_daily(
+            make_settings(),
+            graph=FakeGraph(
+                terminal(STATUS_HOLD, revisions=1), terminal(STATUS_REJECT)
+            ),
+            candidates=candidates(2),
+            clock=lambda: 0.0,
+            site_publisher=site,
+        )
+        self.assertEqual([([], "SUCCESS")], site.calls)
+        self.assertEqual(RunOutcome.SUCCESS.value, result["run_outcome"])
+        self.assertFalse(result["site"]["news_file"])
+
+    def test_site_failure_fails_the_run_and_alerts(self) -> None:
+        alerts: list[str] = []
+        site = RecordingSite(
+            SitePublishError("GitHub GET failed with HTTP 401", status_code=401)
+        )
+        result = run_daily(
+            make_settings(),
+            graph=FakeGraph(approved(0)),
+            candidates=candidates(1),
+            alert_publisher=alerts.append,
+            clock=lambda: 0.0,
+            site_publisher=site,
+        )
+        self.assertEqual(RunOutcome.FAILED.value, result["run_outcome"])
+        self.assertEqual(1, result["exit_code"])
+        self.assertFalse(result["site"]["published"])
+        self.assertEqual(1, len(alerts))
+        self.assertIn("Stage: site", alerts[0])
+        self.assertIn("HTTP status: 401", alerts[0])
+
+    def test_failed_runs_are_recorded_in_the_stats(self) -> None:
+        site = RecordingSite()
+        collection = SourceCollectionResult(
+            candidates=[], sources_total=1, sources_ok=0, sources_failed=1, failures=[]
+        )
+        with patch(
+            "daily_chip_news.runner.collect_articles",
+            side_effect=SourceCollectionError(collection),
+        ):
+            result = run_daily(
+                make_settings(),
+                graph=FakeGraph(),
+                clock=lambda: 0.0,
+                site_publisher=site,
+            )
+        self.assertEqual([([], "FAILED")], site.calls)
+        self.assertEqual(RunOutcome.FAILED.value, result["run_outcome"])
+
+    def test_dry_run_store_receives_the_contract_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            site = SitePublisher(
+                LocalSiteStore(directory),
+                run=RunContext(event="schedule"),
+                now=lambda: datetime(2026, 10, 20, 5, 1, 32, tzinfo=SITE_TZ),
+                logger=None,
+            )
+            run_daily(
+                make_settings(),
+                graph=FakeGraph(approved(0)),
+                candidates=candidates(1),
+                clock=lambda: 0.0,
+                site_publisher=site,
+            )
+            day = json.loads(
+                (Path(directory) / "data/news/2026-10-20.json").read_text("utf-8")
+            )
+        self.assertEqual("标题 0", day["title"])
+        self.assertEqual({"number": 1, "status": "success"}, day["run"])
 
 
 class SummaryFileTests(unittest.TestCase):

@@ -2,15 +2,17 @@
 
 Every tunable value used by the pipeline lives here: Gemini credentials and
 per-node generation profiles (model / thinking / output tokens), source feeds,
-candidate limits, retry and timeout configuration, and publishing settings.
+candidate limits, retry and timeout configuration, and publishing settings
+(website publishing by default, Telegram behind ``PUBLISH_TELEGRAM``).
 Local runs read the git-ignored ``.env``; GitHub Actions injects Repository
 Secrets and Variables with the same names.
 """
 
 from __future__ import annotations
 
-import os
 import math
+import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -20,27 +22,29 @@ class ConfigError(RuntimeError):
 
 
 DEFAULT_SOURCES = (
-    "https://www.eetimes.com/feed/",
-    "https://semiengineering.com/feed/",
-    "https://www.servethehome.com/feed/",
-    "https://www.trendforce.com/feed/Semiconductors.html",
+    "https://openai.com/news/rss.xml",
+    "https://blog.google/technology/ai/rss/",
+    "https://blogs.nvidia.com/feed/",
+    "https://huggingface.co/blog/feed.xml",
+    "https://techcrunch.com/category/artificial-intelligence/feed/",
     "https://hnrss.org/newest?points=100",
 )
 
 EDITORIAL_SCOPE = (
-    "semiconductors",
-    "foundries and process nodes",
-    "memory and storage",
-    "chip vendors and product launches",
-    "AI infrastructure and server hardware",
-    "supply-chain pricing, shortages and inventory",
-    "B2B hardware technologies such as HBM, CXL and RISC-V",
+    "foundation models, LLMs and product launches",
+    "enterprise AI applications, solutions and agent deployments",
+    "AI accelerators, GPUs, datacenters and cloud compute",
+    "AI funding, acquisitions, regulation and policy",
+    "open-source AI models, developer tools, standards and protocols (such as MCP)",
 )
 
 EDITORIAL_BRIEF = {
-    "audience": "关注半导体、AI 基础设施与 B2B 硬件的中文商业读者",
-    "goal": "快速说明发生了什么、关键事实是什么、为什么值得关注",
-    "style": "中文、简洁、克制、事实优先，不写营销腔",
+    "audience": "关注前沿 AI、大模型生态与企业落地的中文商业与技术读者",
+    "goal": "快速说明发生了什么、关键事实是什么、为什么重要",
+    "style": (
+        "中文、专业、克制、事实优先，"
+        "专有名词保留英文原名（如 Claude、Gemini、MCP），不加评论与预测"
+    ),
 }
 
 REVIEW_RUBRIC = (
@@ -57,6 +61,20 @@ REVIEW_RUBRIC = (
 )
 
 THINKING_LEVELS = frozenset({"off", "default", "none", "low", "medium", "high"})
+
+SITE_PUBLISH_MODES = frozenset({"github", "local", "off"})
+DEFAULT_SITE_REPO = "MartinKuai/martinkuai"
+DEFAULT_SITE_BRANCH = "main"
+DEFAULT_SITE_NEWS_DIR = "data/news"
+DEFAULT_SITE_LOCAL_DIR = "output/site"
+# First scheduled run of the workflow: 2026-01-12 (stats.json "since").
+DEFAULT_SITE_STATS_SINCE = "2026-01"
+DEFAULT_SITE_STATS_WORKFLOW = "daily_news.yml"
+DEFAULT_BRIEF_NAME = "简报"
+
+_REPO_PATTERN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/[A-Za-z0-9._-]+")
+_BRANCH_PATTERN = re.compile(r"[A-Za-z0-9._/-]+")
+_MONTH_PATTERN = re.compile(r"\d{4}-(?:0[1-9]|1[0-2])")
 
 
 def _required(env: Mapping[str, str], name: str) -> str:
@@ -125,6 +143,39 @@ def _bool(env: Mapping[str, str], name: str, default: bool) -> bool:
     raise ConfigError(f"{name} must be a boolean flag")
 
 
+def _optional_secret(env: Mapping[str, str], name: str) -> str:
+    value = env.get(name, "").strip()
+    if value.lower().startswith(("your_", "placeholder", "changeme")):
+        return ""
+    return value
+
+
+def _choice(
+    env: Mapping[str, str], name: str, default: str, options: frozenset[str]
+) -> str:
+    raw = env.get(name, default).strip().lower() or default
+    if raw not in options:
+        raise ConfigError(f"{name} must be one of: {', '.join(sorted(options))}")
+    return raw
+
+
+def _matching(
+    env: Mapping[str, str], name: str, default: str, pattern: re.Pattern[str]
+) -> str:
+    raw = env.get(name, default).strip() or default
+    if not pattern.fullmatch(raw) or ".." in raw:
+        raise ConfigError(f"{name} has an invalid value")
+    return raw
+
+
+def _repo_path(env: Mapping[str, str], name: str, default: str) -> str:
+    raw = env.get(name, default).strip().strip("/") or default
+    parts = raw.split("/")
+    if any(part in {"", ".", ".."} for part in parts) or "\\" in raw:
+        raise ConfigError(f"{name} must be a relative path inside the repository")
+    return raw
+
+
 def _source_feeds(env: Mapping[str, str]) -> tuple[str, ...]:
     raw = env.get("SOURCE_FEEDS", "").strip()
     if not raw:
@@ -154,10 +205,24 @@ class Settings:
     researcher: NodeProfile
     writer: NodeProfile
     reviewer: NodeProfile
-    telegram_bot_token: str = field(repr=False)
-    telegram_chat_id: str
+    # Telegram is optional since the brief moved to the website; the token and
+    # chat id are required only when PUBLISH_TELEGRAM=1.
+    telegram_bot_token: str = field(default="", repr=False)
+    telegram_chat_id: str = ""
     publish_enabled: bool = True
+    publish_telegram: bool = False
     telegram_timeout_seconds: float = 15.0
+    # Website publishing (BRIEF 7.2): data/news/YYYY-MM-DD.json + stats.json.
+    site_publish_mode: str = "github"
+    site_repo: str = DEFAULT_SITE_REPO
+    site_repo_branch: str = DEFAULT_SITE_BRANCH
+    site_repo_token: str = field(default="", repr=False)
+    site_news_dir: str = DEFAULT_SITE_NEWS_DIR
+    site_local_dir: str = DEFAULT_SITE_LOCAL_DIR
+    site_timeout_seconds: float = 20.0
+    site_stats_since: str = DEFAULT_SITE_STATS_SINCE
+    site_stats_workflow: str = DEFAULT_SITE_STATS_WORKFLOW
+    brief_name: str = DEFAULT_BRIEF_NAME
     source_feeds: tuple[str, ...] = DEFAULT_SOURCES
     articles_per_feed: int = 2
     max_candidates_per_run: int = 6
@@ -178,9 +243,17 @@ class Settings:
     run_budget_seconds: float = 2100.0
     summary_path: str = ""
 
+    @property
+    def site_mode(self) -> str:
+        """Effective website mode: ``PUBLISH_ENABLED=0`` turns GitHub into a dry-run."""
+        if self.site_publish_mode == "github" and not self.publish_enabled:
+            return "local"
+        return self.site_publish_mode
+
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
         source = os.environ if env is None else env
+        publish_telegram = _bool(source, "PUBLISH_TELEGRAM", False)
         settings = cls(
             gemini_api_key=_required(source, "GEMINI_API_KEY"),
             researcher=NodeProfile(
@@ -216,12 +289,45 @@ class Settings:
                     maximum=65536,
                 ),
             ),
-            telegram_bot_token=_required(source, "TELEGRAM_BOT_TOKEN"),
-            telegram_chat_id=_required(source, "TELEGRAM_CHAT_ID"),
+            telegram_bot_token=(
+                _required(source, "TELEGRAM_BOT_TOKEN")
+                if publish_telegram
+                else _optional_secret(source, "TELEGRAM_BOT_TOKEN")
+            ),
+            telegram_chat_id=(
+                _required(source, "TELEGRAM_CHAT_ID")
+                if publish_telegram
+                else _optional_secret(source, "TELEGRAM_CHAT_ID")
+            ),
             publish_enabled=_bool(source, "PUBLISH_ENABLED", True),
+            publish_telegram=publish_telegram,
             telegram_timeout_seconds=_positive_float(
                 source, "TELEGRAM_TIMEOUT_SECONDS", 15.0, minimum=1.0, maximum=120.0
             ),
+            site_publish_mode=_choice(
+                source, "SITE_PUBLISH_MODE", "github", SITE_PUBLISH_MODES
+            ),
+            site_repo=_matching(source, "SITE_REPO", DEFAULT_SITE_REPO, _REPO_PATTERN),
+            site_repo_branch=_matching(
+                source, "SITE_REPO_BRANCH", DEFAULT_SITE_BRANCH, _BRANCH_PATTERN
+            ),
+            site_repo_token=_optional_secret(source, "SITE_REPO_TOKEN"),
+            site_news_dir=_repo_path(source, "SITE_NEWS_DIR", DEFAULT_SITE_NEWS_DIR),
+            site_local_dir=source.get("SITE_LOCAL_DIR", "").strip()
+            or DEFAULT_SITE_LOCAL_DIR,
+            site_timeout_seconds=_positive_float(
+                source, "SITE_TIMEOUT_SECONDS", 20.0, minimum=1.0, maximum=120.0
+            ),
+            site_stats_since=_matching(
+                source, "SITE_STATS_SINCE", DEFAULT_SITE_STATS_SINCE, _MONTH_PATTERN
+            ),
+            site_stats_workflow=_matching(
+                source,
+                "SITE_STATS_WORKFLOW",
+                DEFAULT_SITE_STATS_WORKFLOW,
+                _BRANCH_PATTERN,
+            ),
+            brief_name=source.get("BRIEF_NAME", "").strip() or DEFAULT_BRIEF_NAME,
             source_feeds=_source_feeds(source),
             articles_per_feed=_positive_int(
                 source, "ARTICLES_PER_FEED", 2, minimum=1, maximum=10
@@ -264,7 +370,9 @@ class Settings:
                 source, "GEMINI_DAILY_REQUEST_LIMIT", 18, minimum=1, maximum=10000
             ),
             gemini_quota_ledger_path=source.get("GEMINI_QUOTA_LEDGER_PATH", "").strip(),
-            gemini_quota_ledger_required=_bool(source, "GEMINI_QUOTA_LEDGER_REQUIRED", False),
+            gemini_quota_ledger_required=_bool(
+                source, "GEMINI_QUOTA_LEDGER_REQUIRED", False
+            ),
             breaker_window_size=_positive_int(
                 source, "BREAKER_WINDOW", 5, minimum=2, maximum=20
             ),
@@ -278,4 +386,9 @@ class Settings:
         )
         if settings.breaker_failure_threshold > settings.breaker_window_size:
             raise ConfigError("BREAKER_THRESHOLD must not exceed BREAKER_WINDOW")
+        if settings.site_mode == "github" and not settings.site_repo_token:
+            raise ConfigError(
+                "SITE_REPO_TOKEN is not configured "
+                "(set SITE_PUBLISH_MODE=local for a dry-run or off to disable)"
+            )
         return settings

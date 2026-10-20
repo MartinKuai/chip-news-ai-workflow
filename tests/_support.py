@@ -110,6 +110,9 @@ def make_settings(**overrides: Any) -> Settings:
         "telegram_bot_token": "telegram-token",
         "telegram_chat_id": "telegram-chat",
         "publish_enabled": False,
+        # Website publishing is exercised explicitly through an injected
+        # SitePublisher; plain runner tests must never write files.
+        "site_publish_mode": "off",
         "gemini_min_interval_seconds": 0.0,  # clocks/pacing tested with a fake clock
     }
     values.update(overrides)
@@ -152,6 +155,10 @@ class FakeResponse:
             raise ValueError("no JSON body")
         return self._body
 
+    @property
+    def content(self) -> bytes:
+        return self.text.encode("utf-8")
+
 
 class FakeSession:
     """requests.Session stand-in with queued responses or a routing function."""
@@ -172,6 +179,10 @@ class FakeSession:
     def post(self, url: str, **kwargs: Any) -> FakeResponse:
         self.calls.append(("POST", url, kwargs))
         return self._respond(url, kwargs)
+
+    def request(self, method: str, url: str, **kwargs: Any) -> FakeResponse:
+        self.calls.append((method.upper(), url, kwargs))
+        return self._respond(url, {**kwargs, "method": method.upper()})
 
     def _respond(self, url: str, kwargs: dict[str, Any]) -> FakeResponse:
         if self.handler is not None:

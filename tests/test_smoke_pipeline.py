@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
 from contextlib import ExitStack
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import patch
 
 import requests
@@ -19,6 +22,7 @@ from _support import (
 
 from daily_chip_news.outcomes import RunOutcome
 from daily_chip_news.runner import run_daily
+from daily_chip_news.website import SITE_TZ, LocalSiteStore, RunContext, SitePublisher
 
 FEED_URL = "https://feed.example/rss"
 STORY_URL = "https://news.example/hbm-capacity"
@@ -88,9 +92,17 @@ def smoke_feed() -> SmokeFeed:
 
 
 class PipelineSmokeTests(unittest.TestCase):
-    def run_pipeline(self, http: RoutedHTTP, *, publish: bool = True) -> dict:
+    def run_pipeline(
+        self,
+        http: RoutedHTTP,
+        *,
+        publish: bool = True,
+        telegram: bool = True,
+        site_publisher: SitePublisher | None = None,
+    ) -> dict:
         settings = make_settings(
             publish_enabled=publish,
+            publish_telegram=telegram,
             source_feeds=(FEED_URL,),
             articles_per_feed=2,
         )
@@ -114,7 +126,9 @@ class PipelineSmokeTests(unittest.TestCase):
                     lambda self, url, **kwargs: http.post(url, **kwargs),
                 )
             )
-            return run_daily(settings, alert_publisher=None)
+            return run_daily(
+                settings, alert_publisher=None, site_publisher=site_publisher
+            )
 
     def test_standard_path_publishes_one_candidate(self) -> None:
         http = RoutedHTTP(
@@ -191,6 +205,39 @@ class PipelineSmokeTests(unittest.TestCase):
             result = self.run_pipeline(http)
         self.assertEqual(1, result["published"])
         self.assertEqual(4, len(http.gemini_requests()))
+
+    def test_website_is_the_default_channel(self) -> None:
+        http = RoutedHTTP(
+            gemini_response(research_output()),
+            gemini_response(dict(DRAFT)),
+            gemini_response(review("REVISE")),
+            gemini_response(dict(REVISED_DRAFT)),
+            gemini_response(review("PASS")),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            site = SitePublisher(
+                LocalSiteStore(directory),
+                run=RunContext(event="schedule"),
+                now=lambda: datetime(2026, 10, 20, 5, 1, 32, tzinfo=SITE_TZ),
+                logger=None,
+            )
+            result = self.run_pipeline(http, telegram=False, site_publisher=site)
+            news = Path(directory) / "data" / "news"
+            day = json.loads((news / "2026-10-20.json").read_text(encoding="utf-8"))
+            stats = json.loads((news / "stats.json").read_text(encoding="utf-8"))
+        self.assertEqual(RunOutcome.SUCCESS.value, result["run_outcome"])
+        self.assertEqual([], http.telegram_messages())
+        self.assertEqual(
+            [
+                {
+                    "title": REVISED_DRAFT["headline"],
+                    "summary": REVISED_DRAFT["summary"],
+                    "source": {"name": "Smoke Feed", "url": STORY_URL},
+                }
+            ],
+            day["items"],
+        )
+        self.assertEqual(1, stats["total_runs"])
 
     def test_dry_run_publishes_nothing_but_completes(self) -> None:
         http = RoutedHTTP(

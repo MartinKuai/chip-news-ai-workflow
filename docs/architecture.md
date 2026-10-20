@@ -23,10 +23,13 @@ Reviewer（notes + draft + rubric）
   ↓ 任意节点异常
 FAILED（候选级，不影响其他候选）
   ↓ 全部候选处理结束
+Website：所有 PUBLISHED 条目 + run outcome → 网站仓库一个 commit
+  （data/news/YYYY-MM-DD.json 仅在有条目时写；data/news/stats.json 每轮都写）
+  ↓
 Run Summary → Notification
 ```
 
-运行时依赖：LangGraph、Gemini API、RSS / Jina Reader、Telegram。无数据库、无额外 SaaS；模型每日请求预留与冷却由 GitHub Actions quota ledger artifact 跨 run 保存。
+运行时依赖：LangGraph、Gemini API、RSS / Jina Reader、GitHub REST API（写网站仓库、读本仓库定时运行历史）；Telegram 仅在 `PUBLISH_TELEGRAM=1` 时使用。无数据库、无额外 SaaS；模型每日请求预留与冷却由 GitHub Actions quota ledger artifact 跨 run 保存，运行次数统计由网站仓库里的 `stats.json` 跨 run 保存。
 
 ## Stage 1 — Sources 与 Candidate Selection
 
@@ -64,6 +67,7 @@ canonical_url()  去 fragment、去 utm_*/fbclid/gclid/mc_cid/mc_eid、统一 ho
 - revise：额外携带 `previous_draft`，仍使用同一份 `research_notes`，不携带正文。
 - 不访问网页、不新增事实、不改变 Research Notes。
 - 输出 Draft：`headline` / `summary` / `key_facts` / `why_it_matters` / `telegram_copy`。
+- 网站条目直接使用 `headline`（标题）和 `summary`（一到三句摘要）；schema 与 instruction 都写明这两个字段会原样显示在网站上。`telegram_copy` 只在 `PUBLISH_TELEGRAM=1` 时使用。
 
 ## Stage 4 — Reviewer
 
@@ -80,14 +84,30 @@ canonical_url()  去 fragment、去 utm_*/fbclid/gclid/mc_cid/mc_eid、统一 ho
 - 再次 REVISE 且已达上限 → `HOLD`，候选以 `SKIPPED` 结束。
 - 循环有硬上限；返工不重新调用 Researcher，事实基线不变。
 
-## Stage 6 — Publisher
+## Stage 6 — Publisher 与 Website
 
-确定性发送层，只在图状态与 `review.status` 同时为 PASS 时调用 Telegram；Markdown 400 时回退纯文本。
+`PublisherNode` 是图内的 PASS 守卫：只有图状态与 `review.status` 同时为 PASS 的条目才能进入 `PUBLISHED` 终态。
 
-- `publish(copy, source_url)`：正文 + 原文链接。
-- `publish_alert(message)`：运维告警，不带原文链接，也**不会**调用 Gemini。
-- `PUBLISH_ENABLED=0` 时两种投递都跳过网络调用（dry-run）。
+- 默认（`PUBLISH_TELEGRAM=0`）：节点不做网络调用，runner 收集 `PUBLISHED` 条目。
+- `PUBLISH_TELEGRAM=1`：逐条调用 Telegram `publish(copy, source_url)`，Markdown 400 时回退纯文本；运维告警走 `publish_alert(message)`，不带原文链接，也**不会**调用 Gemini。
 - Publisher 与 AI 节点完全解耦，不感知模型与 prompt。
+
+全部候选处理完后，runner 调用 `website.SitePublisher.publish(items, outcome)`：
+
+- 条目映射 `site_item(candidate, draft)`：`title = draft.headline`、`summary = draft.summary`（空白规整，超过三句按句末标点截断）、`source = {name: RSS 源名, url: 候选 URL}`；只接受 http(s) URL，聚合源（hnrss）用文章域名作源名。
+- 存储：`GitHubSiteStore`（Git Data API：读 ref → 读 `stats.json` 与当天文件 → `POST git/trees`（base_tree + 两个文件）→ `POST git/commits` → `PATCH git/refs/heads/<branch>`，`force=false`）。ref 更新返回 409/422 时重新读取并重算，最多 3 次；429/5xx/网络错误每个请求最多重试 3 次。`LocalSiteStore` 用于 dry-run，写同样的文件到本地目录。
+- 有条目才写 `data/news/YYYY-MM-DD.json`（Asia/Shanghai 日期，同日重跑按 URL 去重合并）；`stats.json` 每轮都写，包括没有内容通过审核、所有来源不可用、配额账本失败等 FAILED 运行。
+- 网站写入失败：记一条 `stage=site`、`PUBLISH_ERROR` 失败，本轮强制 `FAILED`（exit 1）并告警。
+- `PUBLISH_ENABLED=0` 时 Telegram 跳过网络调用，网站自动改为 `local`（dry-run）。
+
+### stats.json
+
+`total_runs` = `daily_news.yml` 的定时运行次数，`success_rate` = 其中结论为 success 的比例（4 位小数），`since` = `2026-01`，`updated_at` = 本次发布时间（+08:00）。`compute_stats` 同时计算：
+
+- **actions-api**：`GET /repos/{repo}/actions/workflows/daily_news.yml/runs?event=schedule` 里全部已完成的运行（排除本轮）+ 本轮；
+- **carried**：上一份 `stats.json` + 其 `updated_at` 之后创建的已完成定时运行 + 本轮；
+
+取总数大的（相等用 API）。GitHub 自 2026-10-01 起对公开仓库的 workflow run 记录最多保留 90 天，API 总数会随清理变小，此后由 carried 接管，保证不倒退。上一份成功次数 = `round(success_rate × total_runs)`。本轮只在 `GITHUB_EVENT_NAME=schedule` 且上一份 stats 写于本轮开始之前时计入（re-run attempt 用运行的 `created_at` 判断），避免重复计数。读取运行历史使用工作流内置的只读 `GITHUB_TOKEN`（`actions: read`）。
 
 ## Graph State
 
@@ -172,7 +192,7 @@ UNEXPECTED_ERROR                停止本轮且 run 强制 FAILED
 | `SUCCESS` | 无候选失败，且未提前停止 | 0 |
 | `PARTIAL_SUCCESS` | 有失败或提前停止（breaker / 时间预算），但 `published > 0` | 0 |
 | `QUOTA_STOPPED` | 日配额/预算主动停止，且没有其他真实失败；剩余候选记入 `deferred` | 0 |
-| `FAILED` | `published == 0` 且存在失败 / 提前停止；或程序级故障 | 1 |
+| `FAILED` | `published == 0` 且存在失败 / 提前停止；或程序级故障；或网站写入失败 | 1 |
 
 全部候选被编辑规则跳过（`published == 0`、无失败）属于正常完成：pipeline 工作正常，只是没有合格内容。
 
@@ -194,8 +214,16 @@ UNEXPECTED_ERROR                停止本轮且 run 强制 FAILED
 | `GEMINI_FALLBACK_MODELS` | 空（关闭） | 逗号分隔的备用模型，按顺序取第一个与主模型不同的 |
 | `BREAKER_WINDOW` / `BREAKER_THRESHOLD` | 5 / 3 | breaker |
 | `RUN_BUDGET_SECONDS` | `2100` | 整场时间预算 |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | 必填 | 发布与通知 |
-| `PUBLISH_ENABLED` | `1` | `0` = dry-run |
+| `SITE_REPO_TOKEN` | github 模式必填 | 网站仓库 fine-grained token（Contents 读写，仅 MartinKuai/martinkuai） |
+| `SITE_PUBLISH_MODE` | `github` | `github` / `local`（dry-run）/ `off` |
+| `SITE_REPO` / `SITE_REPO_BRANCH` / `SITE_NEWS_DIR` | `MartinKuai/martinkuai` / `main` / `data/news` | 写入位置（未合并前 SITE_REPO_BRANCH 设为 claude/exciting-pasteur-57zifp） |
+| `BRIEF_NAME` | `简报` | 简报名称（输出标题格式：`... 等 N 条{BRIEF_NAME}`） |
+| `SITE_LOCAL_DIR` | `output/site` | dry-run 输出目录 |
+| `SITE_TIMEOUT_SECONDS` | `20` | GitHub 请求超时 |
+| `SITE_STATS_SINCE` / `SITE_STATS_WORKFLOW` | `2026-01` / `daily_news.yml` | stats 口径 |
+| `PUBLISH_TELEGRAM` | `0` | `1` = 恢复 Telegram 逐条推送与告警 |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | `PUBLISH_TELEGRAM=1` 时必填 | Telegram 发布与通知 |
+| `PUBLISH_ENABLED` | `1` | `0` = 不对外发布（Telegram 跳过，网站改为 local） |
 | `RUN_SUMMARY_PATH` | 空 | 设置后写出 JSON summary artifact |
 
 ## Runner 与 Observability
@@ -211,10 +239,11 @@ Candidate done  | id=... | status=PUBLISHED | reason=published | revisions=1
 Candidate failed| id=... | node=writer | category=TRANSIENT_SERVER | error=GeminiAPIError
 ```
 
-随后输出 `Run summary`（discovered / selected / processed / published / skipped 细分 / failed / deferred / revisions / breaker / models / outcome）、按模型请求数、HTTP 状态计数与各节点 calls / success / failures。`FAILED`、`PARTIAL_SUCCESS` 与 `QUOTA_STOPPED` 发送纯文本 Telegram 告警，保留下划线，列出跳过/待处理数、失败阶段、HTTP 错误分布及配额停止原因。
+随后输出 `Run summary`（discovered / selected / processed / published / skipped 细分 / failed / deferred / revisions / breaker / models / outcome）、按模型请求数、HTTP 状态计数、各节点 calls / success / failures，以及 `Website:`（mode / items / news_file / total_runs / success_rate / basis / commit）。`FAILED`、`PARTIAL_SUCCESS` 与 `QUOTA_STOPPED` 发出纯文本告警，列出跳过/待处理数、失败阶段、HTTP 错误分布及配额停止原因：`PUBLISH_TELEGRAM=1` 时发到 Telegram，否则写入运行日志、Actions warning 注释与 Job Summary（FAILED 运行 exit 1，GitHub 另发失败邮件）。
 
 ## Secret boundary
 
 - 本地凭证在 Git 忽略的 `.env`；CI 从 Repository Secrets 读取；模型名来自 Repository Variables。
+- 网站写入只用 `SITE_REPO_TOKEN`（fine-grained，仅 Contents 读写、仅网站仓库）；工作流内置 token 保持 `contents: read` / `actions: read`。GitHub 请求失败只记录 HTTP 状态码，不记录 URL、header 或响应体。
 - Gemini key 只经 `x-goog-api-key` 发送；summary、失败记录与 retry 日志只输出安全字段。
 - 不保存 prompt 内容、正文或模型原始输出。

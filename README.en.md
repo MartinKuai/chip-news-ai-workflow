@@ -8,7 +8,7 @@ It ingests multiple industry RSS feeds, uses deterministic code for article extr
 
 **Sources → Candidate Selection → Researcher → Writer → Reviewer → Publisher → Run Summary**
 
-The Researcher reads the article body and emits structured research notes; the Writer drafts Chinese copy from those notes only; the Reviewer applies a fixed rubric; the deterministic Publisher sends approved items to Telegram; the run ends with a summary and, when needed, an operational alert.
+The Researcher reads the article body and emits structured research notes; the Writer drafts Chinese copy from those notes only; the Reviewer applies a fixed rubric; at the end of the run the deterministic Publisher publishes every approved item to the personal website [martinkuai.com](https://martinkuai.com) in one commit to `data/news/` of [MartinKuai/martinkuai](https://github.com/MartinKuai/martinkuai). Telegram delivery is kept behind the `PUBLISH_TELEGRAM` flag (off by default). The run ends with a summary and, when needed, an operational alert.
 
 ## Pipeline
 
@@ -24,7 +24,8 @@ flowchart TD
     G --> E
     E -->|REVISE at limit| H[HOLD → SKIPPED]
     E -->|REJECT → SKIPPED| Z
-    F --> I[Telegram]
+    F -->|end of run, one commit| W[Website data/news/YYYY-MM-DD.json + stats.json]
+    F -.->|PUBLISH_TELEGRAM=1| I[Telegram]
     F --> J[Run Summary / Notification]
 ```
 
@@ -50,13 +51,21 @@ Reads Research Notes + Draft + rubric and never rewrites, focusing on factual co
 
 ## Sources and candidate control
 
-Five default sources (override with `SOURCE_FEEDS`):
+Content focuses on **AI industry news events** across 5 categories:
+1. **Models & Products**: Major model releases, multimodal capabilities, reasoning models
+2. **Enterprise Applications**: Enterprise deployments, vertical agent workflows, production use cases
+3. **Compute & Chips**: Datacenter GPUs/ASICs, accelerators, cluster infrastructure
+4. **Capital & Policy**: Funding, acquisitions, regulation, safety standards, export controls
+5. **Open Source & Ecosystem**: Open models, developer tooling, protocols (such as MCP)
 
-- [EE Times](https://www.eetimes.com/feed/)
-- [Semiconductor Engineering](https://semiengineering.com/feed/)
-- [ServeTheHome](https://www.servethehome.com/feed/)
-- [TrendForce Semiconductors](https://www.trendforce.com/feed/Semiconductors.html)
-- [Hacker News RSS](https://hnrss.org/newest?points=100)
+Six default verified AI sources (override with `SOURCE_FEEDS`):
+
+- [OpenAI News](https://openai.com/news/rss.xml) (Official news & releases)
+- [Google AI Blog](https://blog.google/technology/ai/rss/) (Official Gemini & models)
+- [NVIDIA Blog](https://blogs.nvidia.com/feed/) (AI compute, hardware & industrial AI)
+- [Hugging Face Blog](https://huggingface.co/blog/feed.xml) (Open-source ecosystem)
+- [TechCrunch AI](https://techcrunch.com/category/artificial-intelligence/feed/) (Funding, M&A & business)
+- [Hacker News RSS](https://hnrss.org/newest?points=100) (High-signal developer discussions)
 
 Candidate selection is fully deterministic (zero model calls):
 
@@ -141,9 +150,126 @@ Candidate statuses are simple: `PUBLISHED` / `SKIPPED` / `FAILED` (`SKIPPED` cov
 | `SUCCESS` | no candidate failures and no early stop | 0 |
 | `PARTIAL_SUCCESS` | failures or an early stop, but at least one item published | 0 |
 | `QUOTA_STOPPED` | daily budget/provider daily quota stopped processing, with no other real failures | 0 |
-| `FAILED` | nothing published together with failures / early stop, or a program-level fault | 1 |
+| `FAILED` | nothing published together with failures / early stop, a program-level fault, or a failed website write | 1 |
 
 Already-published items never turn the run into `FAILED`; a run where every candidate is skipped by the editorial rules (`published == 0`, no failures) counts as a normal completion.
+
+## Publishing to the website
+
+Approved items (Reviewer PASS) are no longer pushed to Telegram one by one. After every candidate has been processed, the deterministic `website.py` makes **one** commit to the website repo [MartinKuai/martinkuai](https://github.com/MartinKuai/martinkuai) through the Git Data API (fast-forward ref update only, never a force push; if someone pushes at the same time it re-reads and retries):
+
+| File | When | Content |
+| --- | --- | --- |
+| `data/news/YYYY-MM-DD.json` | at least one item passed review | named after the Asia/Shanghai publication date |
+| `data/news/stats.json` | every run, including runs where nothing passed and failed runs | run count and success rate |
+
+The format follows section 7.2 of the website brief; a real dry-run output lives in `tests/fixtures/site_dry_run/expected/`:
+
+```json
+{
+  "date": "2026-10-20",
+  "published_at": "2026-10-20T05:01:32+08:00",
+  "title": "晶圆代工厂扩充 2.5D 先进封装产能，2027 年底目标提升约 60% 等 3 条芯闻",
+  "items": [
+    { "title": "…", "summary": "one to three sentences", "source": { "name": "…", "url": "https://…" } }
+  ],
+  "run": { "number": 280, "status": "success" }
+}
+```
+
+```json
+{ "total_runs": 280, "success_rate": 0.9714, "since": "2026-01", "updated_at": "2026-10-20T05:01:32+08:00" }
+```
+
+- `title` / `summary` are the Writer's structured-output (`responseSchema`) fields `headline` / `summary`, exactly the text the Reviewer approved. The Writer schema asks for one to three sentences; the publisher only normalises whitespace and, as a backstop, truncates after the third sentence (it never rewrites).
+- `source.name` / `source.url` come from RSS metadata, never from the model, and only http(s) links are accepted. For aggregator feeds such as Hacker News the article's domain is used as the source name.
+- The day title is deterministic: the item's headline when there is one item, otherwise "first headline 等 N 条芯闻". No extra model call, no new facts.
+- `run.number` equals `stats.total_runs` after this publication (the scheduled-run ordinal); `run.status` is the lowercase run outcome: `success` / `partial_success` / `quota_stopped`.
+- A second run on the same date (for example a manual re-run) appends its items to that day's file, de-duplicated by source URL, and keeps the first `published_at`.
+- Every string is untrusted model or RSS text; the website must escape it when rendering.
+
+### Nothing passed review (HOLD)
+
+When every candidate was skipped by the Researcher, rejected by the Reviewer or held at the revision limit: **no news file is written** for that day (the homepage keeps showing the latest day with news), but **`stats.json` is still updated**. Such a run completes normally (exit 0) and counts as a successful run, matching "nothing is published unless it passes review" and matching what GitHub Actions shows.
+
+### What total_runs and success_rate mean
+
+- `total_runs`: number of **scheduled** runs (`event=schedule`) of `daily_news.yml`. Manual `workflow_dispatch` runs may publish news but are not counted.
+- `success_rate`: share of those runs whose GitHub Actions conclusion is `success`, with 4 decimals; the website rounds it for display.
+- `since`: `2026-01` (the first scheduled run was on 2026-01-12).
+- Checked on 2026-10-20: GitHub lists 280 scheduled runs, 272 successful (97.1%), the same definition as the quoted "270 scheduled runs as of 2026-10, about 97% success".
+
+How it is computed (`website.compute_stats`): each publication computes two totals and keeps the larger one (the API on ties).
+
+1. **Actions API**: every completed scheduled run GitHub still lists, plus this run. While GitHub keeps the full history this is exactly the quoted number, and it self-corrects any earlier miscount.
+2. **Carried**: the previous `stats.json`, plus completed scheduled runs created after its `updated_at` (this back-fills runs that crashed before publishing), plus this run.
+
+The API alone is not enough: since 2026-10-01 GitHub applies the Actions retention setting to workflow-run records, with a 90-day maximum for public repositories. Once old runs are evicted the API total shrinks, the carried total takes over and `total_runs` never goes backwards. The success count is recovered as `round(success_rate × total_runs)` (exact below 10,000 runs with 4 decimals), so `stats.json` needs no extra fields.
+
+- This run succeeds when its outcome is not `FAILED` (exit 0). If writing to the website fails, the run ends `FAILED` (exit 1) and the next run back-fills it as a failure from the API.
+- No double counting: a re-run attempt of the same run, or a retried commit, does not count the run again.
+- If the Actions API cannot be read, only the carried total is used and a warning is logged.
+- On first enable, a leftover development `stats.json` in the website repo is corrected automatically as long as its numbers are below the API's; section 9 of the website brief still asks to delete samples before launch (a sample news file with the same date would be merged, not replaced).
+
+### How to enable (Owner Setup Steps)
+
+Before merging this branch to `main`, please complete these three steps:
+
+1. **Create Fine-grained Personal Access Token**:
+   - GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token
+   - Resource owner: `MartinKuai`
+   - Repository access: Only select repositories → `MartinKuai/martinkuai`
+   - Repository permissions: **Contents: Read and write** (Metadata: Read-only is added automatically), no other permissions
+   - Pick an expiry (up to 1 year)
+2. **Add Secret in this repo**:
+   - Settings → Secrets and variables → Actions → New repository secret
+   - Name: `SITE_REPO_TOKEN`, Secret: your token value (or `gh secret set SITE_REPO_TOKEN`)
+3. **Configure target branch via `SITE_REPO_BRANCH`**:
+   - The website repo is currently being developed on branch `claude/exciting-pasteur-57zifp`, and the Cloudflare preview site deploys from it.
+   - **Before the website merges into `main`**: In this repo, add Variable `SITE_REPO_BRANCH` set to `claude/exciting-pasteur-57zifp`.
+   - **After the website merges into `main`**: Change `SITE_REPO_BRANCH` back to `main` (or delete the variable to use the default).
+
+### Flags and settings
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SITE_REPO_TOKEN` | required in github mode | Secret used to write the website repo |
+| `SITE_PUBLISH_MODE` | `github` | `github` commits to the website repo; `local` writes a local folder (dry-run); `off` disables website publishing |
+| `SITE_REPO` | `MartinKuai/martinkuai` | website repo |
+| `SITE_REPO_BRANCH` | `main` | branch to write (set to `claude/exciting-pasteur-57zifp` until website merges to main) |
+| `BRIEF_NAME` | `简报` | column name in title formatting, e.g. `... 等 N 条{BRIEF_NAME}` |
+| `SITE_NEWS_DIR` | `data/news` | folder inside the repo |
+| `SITE_LOCAL_DIR` | `output/site` | dry-run output folder (git-ignored) |
+| `SITE_TIMEOUT_SECONDS` | `20` | GitHub request timeout |
+| `SITE_STATS_SINCE` | `2026-01` | default `stats.since` |
+| `SITE_STATS_WORKFLOW` | `daily_news.yml` | workflow whose scheduled runs are counted |
+| `PUBLISH_TELEGRAM` | `0` | `1` restores Telegram: per-item delivery plus operational alerts |
+| `PUBLISH_ENABLED` | `1` | `0` publishes nothing externally: Telegram is skipped and the website switches to `local` |
+
+In GitHub Actions, `SITE_PUBLISH_MODE`, `SITE_REPO`, `SITE_REPO_BRANCH` and `PUBLISH_TELEGRAM` can be overridden with Repository Variables, without editing the workflow.
+
+### Local dry-run
+
+```bash
+SITE_PUBLISH_MODE=local python main.py    # or PUBLISH_ENABLED=0 python main.py
+# writes output/site/data/news/YYYY-MM-DD.json and output/site/data/news/stats.json
+```
+
+The dry-run writes exactly what would be committed, without calling GitHub's write API, on top of the previous `stats.json` in the local folder. The Actions run history is read only when `GITHUB_REPOSITORY` is set, and the run is counted in `total_runs` only with `GITHUB_EVENT_NAME=schedule`. `tests/test_site_fixture.py` runs the real graph with mocked Gemini output and checks the sample in `tests/fixtures/site_dry_run/expected/`.
+
+### Alerts
+
+With Telegram off, `FAILED` / `PARTIAL_SUCCESS` / `QUOTA_STOPPED` alerts go to the run log, an Actions warning annotation and the job summary; a `FAILED` run exits 1, so GitHub sends its failed-workflow e-mail according to your notification settings. For push alerts on your phone set `PUBLISH_TELEGRAM=1` (this also restores per-item delivery).
+
+### Switching back to Telegram
+
+- Website and Telegram together: add the Repository Variable `PUBLISH_TELEGRAM=1` and make sure the `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` secrets still exist.
+- Exactly the old behaviour: also add `SITE_PUBLISH_MODE=off`. No code change either way.
+
+### Notes
+
+- Every run creates one commit in the website repo (including stats-only days). If the website deploys on push, that is one rebuild per day.
+- Commits are authored by the token owner and the message links the Actions run.
 
 ## Observability
 
@@ -165,8 +291,12 @@ RESEARCHER_MODEL=gemini-3.6-flash
 WRITER_MODEL=gemini-3.5-flash
 REVIEWER_MODEL=gemini-3.5-flash
 GEMINI_FALLBACK_MODELS=gemini-3.5-flash,gemini-3.6-flash
-TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-TELEGRAM_CHAT_ID=your_telegram_chat_id
+# Dry-run locally first; github mode needs SITE_REPO_TOKEN
+SITE_PUBLISH_MODE=local
+# SITE_REPO_TOKEN=your_site_repo_token
+# Only with PUBLISH_TELEGRAM=1:
+# TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+# TELEGRAM_CHAT_ID=your_telegram_chat_id
 ARTICLES_PER_FEED=2
 MAX_CANDIDATES_PER_RUN=6
 MAX_REVISIONS=1
@@ -181,25 +311,27 @@ MAX_REVISIONS=1
 Scheduled daily at **00:05 Asia/Shanghai** (`5 16 * * *` UTC, 16:05 UTC on the preceding day), with possible GitHub queue delays. Also supports `workflow_dispatch`; both paths share the architecture and daily quota ledger.
 
 ```text
-checkout → setup python → install → run application (Secrets / Variables)
-→ upload run summary artifact → notification (in-app Telegram)
+checkout → setup python → install → restore quota ledger
+→ run application (Secrets / Variables; one commit to the website repo at the end)
+→ upload quota ledger / run summary artifacts
 ```
 
 Required repository settings (Settings → Secrets and variables → Actions):
 
 | Type | Names |
 | --- | --- |
-| Secret | `GEMINI_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` |
-| Variable | `RESEARCHER_MODEL`, `WRITER_MODEL`, `REVIEWER_MODEL`, `GEMINI_FALLBACK_MODELS` |
+| Secret | `GEMINI_API_KEY`, `SITE_REPO_TOKEN`; with `PUBLISH_TELEGRAM=1` also `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` |
+| Variable | `RESEARCHER_MODEL`, `WRITER_MODEL`, `REVIEWER_MODEL`, `GEMINI_FALLBACK_MODELS`; optional `PUBLISH_TELEGRAM`, `SITE_PUBLISH_MODE`, `SITE_REPO`, `SITE_REPO_BRANCH` |
 
 They can also be set with the GitHub CLI, for example:
 
 ```bash
 gh secret set GEMINI_API_KEY
+gh secret set SITE_REPO_TOKEN
 gh variable set GEMINI_FALLBACK_MODELS -b "gemini-3.5-flash,gemini-3.6-flash"
 ```
 
-A manual `workflow_dispatch` run **really publishes** to Telegram; to only validate configuration, dry-run locally with `PUBLISH_ENABLED=0` first. A run that publishes nothing and has failures exits with code 1, shows as failed in Actions and sends a Telegram alert instead of silently "succeeding".
+A manual `workflow_dispatch` run **really publishes** to the website (it is not counted in `total_runs`); to only validate configuration, dry-run locally with `SITE_PUBLISH_MODE=local` or `PUBLISH_ENABLED=0` first. A run that publishes nothing and has failures, or whose website write fails, exits with code 1, shows as failed in Actions and raises an alert instead of silently "succeeding".
 
 ## Local runs
 
@@ -207,7 +339,7 @@ A manual `workflow_dispatch` run **really publishes** to Telegram; to only valid
 python main.py
 ```
 
-`PUBLISH_ENABLED=0` performs a dry run without sending Telegram messages; `MAX_CANDIDATES_PER_RUN=1` gives a single-candidate smoke test. For example (Git Bash / Linux / macOS):
+`PUBLISH_ENABLED=0` performs a dry run that publishes nothing externally (website files go to `output/site/`, Telegram is skipped); `MAX_CANDIDATES_PER_RUN=1` gives a single-candidate smoke test. For example (Git Bash / Linux / macOS):
 
 ```bash
 PUBLISH_ENABLED=0 MAX_CANDIDATES_PER_RUN=1 python main.py
@@ -231,7 +363,7 @@ python -m unittest discover -s tests -t tests
 python -m ruff check .
 ```
 
-Tests follow the pipeline stages: `test_sources` (canonical dedupe / garbage / recency / round-robin / limit), `test_researcher`, `test_writer`, `test_reviewer`, `test_graph` (publish / skip / revision / revision limit / node failure), `test_gemini`, `test_breaker`, `test_runner` (SUCCESS / PARTIAL_SUCCESS / FAILED) and `test_smoke_pipeline` (end-to-end run with every HTTP dependency mocked).
+Tests follow the pipeline stages: `test_sources` (canonical dedupe / garbage / recency / round-robin / limit), `test_researcher`, `test_writer`, `test_reviewer`, `test_graph` (publish / skip / revision / revision limit / node failure), `test_gemini`, `test_breaker`, `test_runner` (SUCCESS / PARTIAL_SUCCESS / FAILED / website publishing), `test_smoke_pipeline` (end-to-end run with every HTTP dependency mocked), `test_website` (item mapping, stats semantics, Git Data API commits with mocked HTTP, conflict retry, dry-run) and `test_site_fixture` (website JSON produced by the real graph with mocked Gemini output).
 
 ## Project layout
 
@@ -251,8 +383,9 @@ Tests follow the pipeline stages: `test_sources` (canonical dedupe / garbage / r
 │  ├─ errors.py       # failure taxonomy and routing flags
 │  ├─ metrics.py      # run-level counters
 │  ├─ outcomes.py     # candidate / run outcomes and exit codes
-│  ├─ publisher.py    # deterministic Telegram publishing and alerts
-│  └─ runner.py       # candidate loop, run summary, notification
+│  ├─ publisher.py    # PASS guard, optional Telegram delivery and alerts
+│  ├─ website.py      # website publishing: day JSON + stats.json, one commit
+│  └─ runner.py       # candidate loop, website publishing, run summary, alerts
 ├─ tests/
 ├─ docs/architecture.md
 ├─ .github/workflows/daily_news.yml

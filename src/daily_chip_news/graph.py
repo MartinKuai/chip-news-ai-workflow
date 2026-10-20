@@ -227,6 +227,8 @@ def create_runtime_graph(
             metrics=run_metrics,
             health_recorder=record,
         ),
+        # Website publishing happens once per run in the runner; Telegram stays
+        # available per item behind PUBLISH_TELEGRAM=1.
         publisher=PublisherNode(
             TelegramPublisher(
                 settings.telegram_bot_token,
@@ -234,6 +236,8 @@ def create_runtime_graph(
                 timeout=settings.telegram_timeout_seconds,
                 enabled=settings.publish_enabled,
             )
+            if settings.publish_telegram
+            else None
         ),
         max_revisions=settings.max_revisions,
         on_step=on_step,

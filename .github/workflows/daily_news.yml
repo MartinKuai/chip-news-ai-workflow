@@ -6,6 +6,10 @@ on:
     - cron: "5 16 * * *"
   workflow_dispatch:
 
+# The built-in token stays read-only: it reads the quota ledger artifact and
+# the scheduled-run history for stats.json. Writes to the website repo use the
+# separate SITE_REPO_TOKEN secret (fine-grained, Contents read/write on
+# MartinKuai/martinkuai only).
 permissions:
   contents: read
   actions: read
@@ -57,6 +61,19 @@ jobs:
         env:
           # Credentials come from Repository Secrets, models from Variables.
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Website publishing (default): one commit per run to the site repo
+          # with data/news/YYYY-MM-DD.json (when an item passed review) and
+          # data/news/stats.json. SITE_PUBLISH_MODE: github | local | off.
+          SITE_REPO_TOKEN: ${{ secrets.SITE_REPO_TOKEN }}
+          SITE_PUBLISH_MODE: ${{ vars.SITE_PUBLISH_MODE || 'github' }}
+          SITE_REPO: ${{ vars.SITE_REPO || 'MartinKuai/martinkuai' }}
+          SITE_REPO_BRANCH: ${{ vars.SITE_REPO_BRANCH || 'main' }}
+          BRIEF_NAME: ${{ vars.BRIEF_NAME || '简报' }}
+          # Read-only built-in token: scheduled-run history for stats.json.
+          GITHUB_TOKEN: ${{ github.token }}
+          # Telegram is off by default; set the Variable PUBLISH_TELEGRAM=1 to
+          # send every approved item (and run alerts) to Telegram again.
+          PUBLISH_TELEGRAM: ${{ vars.PUBLISH_TELEGRAM || '0' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ARTICLES_PER_FEED: "2"
@@ -75,6 +92,8 @@ jobs:
           # GEMINI_CALL_BUDGET_SECONDS=240 | GEMINI_STRUCTURED_OUTPUT=1
           # BREAKER_WINDOW=5 | BREAKER_THRESHOLD=3 | RUN_BUDGET_SECONDS=2100
           # PUBLISH_ENABLED=1 | TELEGRAM_TIMEOUT_SECONDS=15
+          # SITE_NEWS_DIR=data/news | SITE_TIMEOUT_SECONDS=20
+          # SITE_STATS_SINCE=2026-01 | SITE_STATS_WORKFLOW=daily_news.yml
         run: python main.py
 
       - name: Upload Gemini quota ledger

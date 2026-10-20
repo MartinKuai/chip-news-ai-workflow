@@ -1,12 +1,14 @@
-"""Batch runner: candidate loop, run summary and notifications.
+"""Batch runner: candidate loop, website publishing, run summary and alerts.
 
 Pipeline: Sources -> Candidate Selection -> Researcher -> Writer -> Reviewer
-(-> Revision) -> Publisher -> Run Summary / Notification.
+(-> Revision) -> Publisher -> Website (one commit per run) -> Run Summary /
+Notification.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from collections.abc import Callable, Iterable
@@ -37,6 +39,7 @@ from .sources import (
     collect_articles,
     select_candidates,
 )
+from .website import SitePublisher, create_site_publisher, site_item
 
 SKIP_NOT_RELEVANT = "researcher-skip"
 SKIP_REJECTED = "reviewer-reject"
@@ -151,6 +154,8 @@ def _config_line(settings: Settings) -> str:
         f" | max_candidates={settings.max_candidates_per_run}"
         f" | max_age_hours={settings.max_candidate_age_hours:.0f}"
         f" | publish_enabled={'yes' if settings.publish_enabled else 'no'}"
+        f" | site={settings.site_mode}"
+        f" | telegram={'yes' if settings.publish_telegram else 'no'}"
     )
 
 
@@ -185,6 +190,7 @@ def _print_summary(
     breaker_opened: bool,
     budget_exceeded: bool,
     node_success: dict[str, int] | None = None,
+    site: dict[str, Any] | None = None,
 ) -> None:
     categories = _failure_categories(failures)
     # Node counters are observed, never inferred from candidate outcomes: a
@@ -293,6 +299,22 @@ def _print_summary(
     print(f"  published: {stats['published']}")
     print(f"  failures: {_stage_failures(failures, 'publisher')}")
 
+    if site is not None:
+        print("Website:")
+        for key in (
+            "mode",
+            "items",
+            "news_file",
+            "published",
+            "total_runs",
+            "success_rate",
+            "basis",
+            "location",
+            "error",
+        ):
+            if site.get(key) is not None:
+                print(f"  {key}: {site[key]}")
+
 
 def _alert_lines(
     title: str,
@@ -396,6 +418,66 @@ def _write_summary_file(
         )
 
 
+def _log_alert(message: str) -> None:
+    """Alert channel when Telegram is off: job log, workflow warning, job summary.
+
+    FAILED runs also exit 1, so GitHub's own failed-workflow e-mail still fires.
+    """
+    lines = message.splitlines() or [""]
+    print("Operations alert | " + " | ".join(lines))
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        escaped = (
+            message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        )
+        print(f"::warning title=Daily Chip News::{escaped}")
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as handle:
+                handle.write(f"### {lines[0]}\n\n```text\n{message}\n```\n")
+        except OSError as exc:
+            print(f"Job summary not written | error={type(exc).__name__}")
+
+
+def _publish_site(
+    site_publisher: SitePublisher | None,
+    items: list[dict[str, Any]],
+    outcome: RunOutcome,
+) -> tuple[dict[str, Any] | None, Exception | None]:
+    """Write the day file (if any item passed review) and stats in one commit."""
+    if site_publisher is None:
+        return None, None
+    try:
+        published = site_publisher.publish(items, outcome.value)
+    except Exception as exc:
+        status_code = _safe_status_code(exc)
+        status_suffix = (
+            f" | status_code={status_code}" if status_code is not None else ""
+        )
+        print(
+            f"Site publish failed | store={site_publisher.store} "
+            f"| items={len(items)} | error={type(exc).__name__}{status_suffix}"
+        )
+        return {
+            "mode": site_publisher.store.split(":", 1)[0],
+            "items": len(items),
+            "news_file": False,
+            "published": False,
+            "error": type(exc).__name__,
+        }, exc
+    return {
+        "mode": published.store.split(":", 1)[0],
+        "items": published.items,
+        "news_file": published.news_written,
+        "published": True,
+        "date": published.date,
+        "total_runs": published.stats["total_runs"],
+        "success_rate": published.stats["success_rate"],
+        "basis": published.basis,
+        "location": published.location,
+    }, None
+
+
 def run_daily(
     settings: Settings,
     *,
@@ -404,8 +486,13 @@ def run_daily(
     alert_publisher: Callable[[str], None] | None = None,
     clock: Callable[[], float] = time.monotonic,
     breaker: ServiceHealth | None = None,
+    site_publisher: SitePublisher | None = None,
 ) -> dict[str, Any]:
-    """Process every independent candidate and return stats plus the outcome."""
+    """Process every independent candidate and return stats plus the outcome.
+
+    Approved items are collected and handed to ``site_publisher`` once, after
+    the loop. Runs where nothing passed review still update the site stats.
+    """
     print(_config_line(settings))
     metrics = RunMetrics()
     service_breaker = breaker or ServiceHealth(
@@ -429,7 +516,13 @@ def run_daily(
         )
     except QuotaStateError as exc:
         stats = _empty_stats()
-        result = {**stats, "run_outcome": RunOutcome.FAILED.value, "exit_code": 1}
+        site, _ = _publish_site(site_publisher, [], RunOutcome.FAILED)
+        result = {
+            **stats,
+            "run_outcome": RunOutcome.FAILED.value,
+            "exit_code": 1,
+            "site": site,
+        }
         print(f"Quota state failure | error={type(exc).__name__} | action=no_generation")
         _send_alert(alert_publisher, _alert_lines(
             "⚠️ Daily Chip News 运行失败", RunOutcome.FAILED, stats, [],
@@ -461,6 +554,7 @@ def run_daily(
                 "sources", "SourceCollectionError", force_failed=True
             )
             print("Run outcome decision | reason=all-sources-unavailable -> FAILED")
+            site, _ = _publish_site(site_publisher, [], RunOutcome.FAILED)
             _print_summary(
                 settings,
                 stats,
@@ -471,6 +565,7 @@ def run_daily(
                 breaker=service_breaker,
                 breaker_opened=False,
                 budget_exceeded=False,
+                site=site,
             )
             _send_alert(
                 alert_publisher,
@@ -488,6 +583,7 @@ def run_daily(
                 **stats,
                 "run_outcome": RunOutcome.FAILED.value,
                 "exit_code": exit_code_for(RunOutcome.FAILED),
+                "site": site,
             }
             _write_summary_file(settings.summary_path, result, [], exc.result.failures)
             return result
@@ -513,6 +609,7 @@ def run_daily(
         "selected": len(selected),
     }
     failures: list[FailureRecord] = []
+    site_items: list[dict[str, Any]] = []
     fatal_failure: GlobalWorkflowError | None = None
     breaker_opened = False
     budget_exceeded = False
@@ -612,6 +709,11 @@ def run_daily(
             stats["published"] += 1
             final_status = CandidateStatus.PUBLISHED.value
             reason = "published"
+            item = site_item(candidate, result.get("draft"))
+            if item is not None:
+                site_items.append(item)
+            elif site_publisher is not None:
+                print(f"Site item skipped | id={current['id']} | reason=unusable-draft")
         elif status == STATUS_SKIP:
             stats["skipped"] += 1
             stats["skipped_not_relevant"] += 1
@@ -666,6 +768,30 @@ def run_daily(
         f"{'yes' if fatal_failure and fatal_failure.force_failed else 'no'} "
         f"-> {outcome.value} (exit {exit_code_for(outcome)})"
     )
+    site, site_error = _publish_site(site_publisher, site_items, outcome)
+    if site_error is not None:
+        # Nothing reached the website: the run fails and alerts, and the next
+        # run's stats count it as a failed run. Candidate counters stay as-is;
+        # the failure is recorded under its own "site" stage.
+        failures.append(
+            {
+                "candidate": "website",
+                "candidate_id": "-",
+                "source": "-",
+                "stage": "site",
+                "category": FailureCategory.PUBLISH_ERROR.value,
+                "error": type(site_error).__name__,
+                "status_code": _safe_status_code(site_error),
+            }
+        )
+        fatal_failure = GlobalWorkflowError(
+            "site",
+            type(site_error).__name__,
+            status_code=_safe_status_code(site_error),
+            force_failed=True,
+        )
+        outcome = RunOutcome.FAILED
+        print("Run outcome decision | reason=site-publish-failed -> FAILED (exit 1)")
     _print_summary(
         settings,
         stats,
@@ -677,6 +803,7 @@ def run_daily(
         breaker_opened=breaker_opened,
         budget_exceeded=budget_exceeded,
         node_success=node_success,
+        site=site,
     )
     result = {
         **stats,
@@ -692,6 +819,7 @@ def run_daily(
         "gemini_requests": metrics.gemini_requests,
         "gemini_model_requests": metrics.model_requests,
         "gemini_http_statuses": metrics.http_statuses,
+        "site": site,
     }
     if outcome is RunOutcome.FAILED:
         failure = fatal_failure or GlobalWorkflowError(
@@ -740,11 +868,18 @@ def main() -> None:
         print(f"Configuration error: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
     print("Daily Chip News run started")
-    alert_publisher = TelegramPublisher(
-        settings.telegram_bot_token,
-        settings.telegram_chat_id,
-        timeout=settings.telegram_timeout_seconds,
-        enabled=settings.publish_enabled,
-    ).publish_alert
-    result = run_daily(settings, alert_publisher=alert_publisher)
+    if settings.publish_telegram:
+        alert_publisher = TelegramPublisher(
+            settings.telegram_bot_token,
+            settings.telegram_chat_id,
+            timeout=settings.telegram_timeout_seconds,
+            enabled=settings.publish_enabled,
+        ).publish_alert
+    else:
+        alert_publisher = _log_alert
+    result = run_daily(
+        settings,
+        alert_publisher=alert_publisher,
+        site_publisher=create_site_publisher(settings),
+    )
     raise SystemExit(int(result["exit_code"]))
