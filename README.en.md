@@ -51,13 +51,21 @@ Reads Research Notes + Draft + rubric and never rewrites, focusing on factual co
 
 ## Sources and candidate control
 
-Five default sources (override with `SOURCE_FEEDS`):
+Content focuses on **AI industry news events** across 5 categories:
+1. **Models & Products**: Major model releases, multimodal capabilities, reasoning models
+2. **Enterprise Applications**: Enterprise deployments, vertical agent workflows, production use cases
+3. **Compute & Chips**: Datacenter GPUs/ASICs, accelerators, cluster infrastructure
+4. **Capital & Policy**: Funding, acquisitions, regulation, safety standards, export controls
+5. **Open Source & Ecosystem**: Open models, developer tooling, protocols (such as MCP)
 
-- [EE Times](https://www.eetimes.com/feed/)
-- [Semiconductor Engineering](https://semiengineering.com/feed/)
-- [ServeTheHome](https://www.servethehome.com/feed/)
-- [TrendForce Semiconductors](https://www.trendforce.com/feed/Semiconductors.html)
-- [Hacker News RSS](https://hnrss.org/newest?points=100)
+Six default verified AI sources (override with `SOURCE_FEEDS`):
+
+- [OpenAI News](https://openai.com/news/rss.xml) (Official news & releases)
+- [Google AI Blog](https://blog.google/technology/ai/rss/) (Official Gemini & models)
+- [NVIDIA Blog](https://blogs.nvidia.com/feed/) (AI compute, hardware & industrial AI)
+- [Hugging Face Blog](https://huggingface.co/blog/feed.xml) (Open-source ecosystem)
+- [TechCrunch AI](https://techcrunch.com/category/artificial-intelligence/feed/) (Funding, M&A & business)
+- [Hacker News RSS](https://hnrss.org/newest?points=100) (High-signal developer discussions)
 
 Candidate selection is fully deterministic (zero model calls):
 
@@ -203,15 +211,23 @@ The API alone is not enough: since 2026-10-01 GitHub applies the Actions retenti
 - If the Actions API cannot be read, only the carried total is used and a warning is logged.
 - On first enable, a leftover development `stats.json` in the website repo is corrected automatically as long as its numbers are below the API's; section 9 of the website brief still asks to delete samples before launch (a sample news file with the same date would be merged, not replaced).
 
-### How to enable
+### How to enable (Owner Setup Steps)
 
-1. Create a fine-grained personal access token: GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.
-   - Resource owner: `MartinKuai`; Repository access: Only select repositories → `MartinKuai/martinkuai`
-   - Repository permissions: **Contents: Read and write** (Metadata: Read-only is added automatically), nothing else
-   - Pick an expiry (at most one year); when it expires publishing fails with an alert, so renew it and update the secret
-2. In this repo: Settings → Secrets and variables → Actions → New repository secret `SITE_REPO_TOKEN` (or `gh secret set SITE_REPO_TOKEN`).
-3. **Add the secret first, then merge this branch into `main`**; otherwise the next scheduled run fails its configuration check for the missing `SITE_REPO_TOKEN`.
-4. If `main` of the website repo is protected (required PRs or status checks), allow the token owner to bypass, or point the Variable `SITE_REPO_BRANCH` at a dedicated branch.
+Before merging this branch to `main`, please complete these three steps:
+
+1. **Create Fine-grained Personal Access Token**:
+   - GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token
+   - Resource owner: `MartinKuai`
+   - Repository access: Only select repositories → `MartinKuai/martinkuai`
+   - Repository permissions: **Contents: Read and write** (Metadata: Read-only is added automatically), no other permissions
+   - Pick an expiry (up to 1 year)
+2. **Add Secret in this repo**:
+   - Settings → Secrets and variables → Actions → New repository secret
+   - Name: `SITE_REPO_TOKEN`, Secret: your token value (or `gh secret set SITE_REPO_TOKEN`)
+3. **Configure target branch via `SITE_REPO_BRANCH`**:
+   - The website repo is currently being developed on branch `claude/exciting-pasteur-57zifp`, and the Cloudflare preview site deploys from it.
+   - **Before the website merges into `main`**: In this repo, add Variable `SITE_REPO_BRANCH` set to `claude/exciting-pasteur-57zifp`.
+   - **After the website merges into `main`**: Change `SITE_REPO_BRANCH` back to `main` (or delete the variable to use the default).
 
 ### Flags and settings
 
@@ -220,7 +236,8 @@ The API alone is not enough: since 2026-10-01 GitHub applies the Actions retenti
 | `SITE_REPO_TOKEN` | required in github mode | Secret used to write the website repo |
 | `SITE_PUBLISH_MODE` | `github` | `github` commits to the website repo; `local` writes a local folder (dry-run); `off` disables website publishing |
 | `SITE_REPO` | `MartinKuai/martinkuai` | website repo |
-| `SITE_REPO_BRANCH` | `main` | branch to write |
+| `SITE_REPO_BRANCH` | `main` | branch to write (set to `claude/exciting-pasteur-57zifp` until website merges to main) |
+| `BRIEF_NAME` | `简报` | column name in title formatting, e.g. `... 等 N 条{BRIEF_NAME}` |
 | `SITE_NEWS_DIR` | `data/news` | folder inside the repo |
 | `SITE_LOCAL_DIR` | `output/site` | dry-run output folder (git-ignored) |
 | `SITE_TIMEOUT_SECONDS` | `20` | GitHub request timeout |

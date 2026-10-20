@@ -22,27 +22,29 @@ class ConfigError(RuntimeError):
 
 
 DEFAULT_SOURCES = (
-    "https://www.eetimes.com/feed/",
-    "https://semiengineering.com/feed/",
-    "https://www.servethehome.com/feed/",
-    "https://www.trendforce.com/feed/Semiconductors.html",
+    "https://openai.com/news/rss.xml",
+    "https://blog.google/technology/ai/rss/",
+    "https://blogs.nvidia.com/feed/",
+    "https://huggingface.co/blog/feed.xml",
+    "https://techcrunch.com/category/artificial-intelligence/feed/",
     "https://hnrss.org/newest?points=100",
 )
 
 EDITORIAL_SCOPE = (
-    "semiconductors",
-    "foundries and process nodes",
-    "memory and storage",
-    "chip vendors and product launches",
-    "AI infrastructure and server hardware",
-    "supply-chain pricing, shortages and inventory",
-    "B2B hardware technologies such as HBM, CXL and RISC-V",
+    "foundation models, LLMs and product launches",
+    "enterprise AI applications, solutions and agent deployments",
+    "AI accelerators, GPUs, datacenters and cloud compute",
+    "AI funding, acquisitions, regulation and policy",
+    "open-source AI models, developer tools, standards and protocols (such as MCP)",
 )
 
 EDITORIAL_BRIEF = {
-    "audience": "关注半导体、AI 基础设施与 B2B 硬件的中文商业读者",
-    "goal": "快速说明发生了什么、关键事实是什么、为什么值得关注",
-    "style": "中文、简洁、克制、事实优先，不写营销腔",
+    "audience": "关注前沿 AI、大模型生态与企业落地的中文商业与技术读者",
+    "goal": "快速说明发生了什么、关键事实是什么、为什么重要",
+    "style": (
+        "中文、专业、克制、事实优先，"
+        "专有名词保留英文原名（如 Claude、Gemini、MCP），不加评论与预测"
+    ),
 }
 
 REVIEW_RUBRIC = (
@@ -68,6 +70,7 @@ DEFAULT_SITE_LOCAL_DIR = "output/site"
 # First scheduled run of the workflow: 2026-01-12 (stats.json "since").
 DEFAULT_SITE_STATS_SINCE = "2026-01"
 DEFAULT_SITE_STATS_WORKFLOW = "daily_news.yml"
+DEFAULT_BRIEF_NAME = "简报"
 
 _REPO_PATTERN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/[A-Za-z0-9._-]+")
 _BRANCH_PATTERN = re.compile(r"[A-Za-z0-9._/-]+")
@@ -219,6 +222,7 @@ class Settings:
     site_timeout_seconds: float = 20.0
     site_stats_since: str = DEFAULT_SITE_STATS_SINCE
     site_stats_workflow: str = DEFAULT_SITE_STATS_WORKFLOW
+    brief_name: str = DEFAULT_BRIEF_NAME
     source_feeds: tuple[str, ...] = DEFAULT_SOURCES
     articles_per_feed: int = 2
     max_candidates_per_run: int = 6
@@ -323,6 +327,7 @@ class Settings:
                 DEFAULT_SITE_STATS_WORKFLOW,
                 _BRANCH_PATTERN,
             ),
+            brief_name=source.get("BRIEF_NAME", "").strip() or DEFAULT_BRIEF_NAME,
             source_feeds=_source_feeds(source),
             articles_per_feed=_positive_int(
                 source, "ARTICLES_PER_FEED", 2, minimum=1, maximum=10
@@ -365,7 +370,9 @@ class Settings:
                 source, "GEMINI_DAILY_REQUEST_LIMIT", 18, minimum=1, maximum=10000
             ),
             gemini_quota_ledger_path=source.get("GEMINI_QUOTA_LEDGER_PATH", "").strip(),
-            gemini_quota_ledger_required=_bool(source, "GEMINI_QUOTA_LEDGER_REQUIRED", False),
+            gemini_quota_ledger_required=_bool(
+                source, "GEMINI_QUOTA_LEDGER_REQUIRED", False
+            ),
             breaker_window_size=_positive_int(
                 source, "BREAKER_WINDOW", 5, minimum=2, maximum=20
             ),

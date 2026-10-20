@@ -68,6 +68,7 @@ jobs:
           SITE_PUBLISH_MODE: ${{ vars.SITE_PUBLISH_MODE || 'github' }}
           SITE_REPO: ${{ vars.SITE_REPO || 'MartinKuai/martinkuai' }}
           SITE_REPO_BRANCH: ${{ vars.SITE_REPO_BRANCH || 'main' }}
+          BRIEF_NAME: ${{ vars.BRIEF_NAME || '简报' }}
           # Read-only built-in token: scheduled-run history for stats.json.
           GITHUB_TOKEN: ${{ github.token }}
           # Telegram is off by default; set the Variable PUBLISH_TELEGRAM=1 to

@@ -39,6 +39,25 @@ class ConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(2560, settings.writer.max_output_tokens)
         self.assertEqual(1024, settings.reviewer.max_output_tokens)
 
+
+    def test_ai_sources_and_scope(self) -> None:
+        self.assertIn("https://openai.com/news/rss.xml", DEFAULT_SOURCES)
+        self.assertIn("https://blog.google/technology/ai/rss/", DEFAULT_SOURCES)
+        self.assertIn("https://blogs.nvidia.com/feed/", DEFAULT_SOURCES)
+        self.assertIn("https://huggingface.co/blog/feed.xml", DEFAULT_SOURCES)
+        tc_feed = "https://techcrunch.com/category/artificial-intelligence/feed/"
+        self.assertIn(tc_feed, DEFAULT_SOURCES)
+
+    def test_brief_name_config(self) -> None:
+        from daily_chip_news.config import DEFAULT_BRIEF_NAME
+        self.assertEqual("简报", DEFAULT_BRIEF_NAME)
+        # Default
+        s_def = Settings.from_env(env())
+        self.assertEqual("简报", s_def.brief_name)
+        # Custom
+        s_custom = Settings.from_env(env(BRIEF_NAME="芯闻"))
+        self.assertEqual("芯闻", s_custom.brief_name)
+
     def test_pipeline_defaults(self) -> None:
         settings = Settings.from_env(env())
         self.assertEqual(DEFAULT_SOURCES, settings.source_feeds)

@@ -37,6 +37,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from .config import DEFAULT_BRIEF_NAME
 from .publisher import PublisherError
 
 SITE_TZ = ZoneInfo("Asia/Shanghai")
@@ -162,12 +163,16 @@ def _normalise_item(value: Any) -> dict[str, Any] | None:
     }
 
 
-def brief_title(items: Sequence[Mapping[str, Any]]) -> str:
+def brief_title(
+    items: Sequence[Mapping[str, Any]], brief_name: str = DEFAULT_BRIEF_NAME
+) -> str:
     """Deterministic headline for the day: no extra model call, no new facts."""
     first = str(items[0]["title"])
     if len(items) == 1:
         return first
-    return f"{first.rstrip(_TITLE_TRAILING)} 等 {len(items)} 条芯闻"
+    ascii_name = brief_name and brief_name[0].isascii() and brief_name[0].isalnum()
+    sep = " " if ascii_name else ""
+    return f"{first.rstrip(_TITLE_TRAILING)} 等 {len(items)} 条{sep}{brief_name}"
 
 
 def build_day_document(
@@ -178,6 +183,7 @@ def build_day_document(
     run_number: int,
     run_status: str,
     existing: Mapping[str, Any] | None = None,
+    brief_name: str = DEFAULT_BRIEF_NAME,
 ) -> dict[str, Any]:
     """Build ``data/news/YYYY-MM-DD.json``.
 
@@ -207,7 +213,7 @@ def build_day_document(
     return {
         "date": date,
         "published_at": first_published,
-        "title": brief_title(merged),
+        "title": brief_title(merged, brief_name=brief_name),
         "items": merged,
         "run": {"number": run_number, "status": run_status},
     }
@@ -626,7 +632,7 @@ class LocalSiteStore:
         self._root = Path(root)
 
     def describe(self) -> str:
-        return f"local:{self._root}"
+        return f"local:{self._root.as_posix()}"
 
     def head(self) -> None:
         return None
@@ -674,6 +680,7 @@ class SitePublisher:
         store: SiteStore,
         *,
         news_dir: str = "data/news",
+        brief_name: str = DEFAULT_BRIEF_NAME,
         run: RunContext | None = None,
         history: Callable[[], Sequence[WorkflowRun]] | None = None,
         default_since: str = "2026-01",
@@ -684,6 +691,7 @@ class SitePublisher:
     ) -> None:
         self._store = store
         self._news_dir = news_dir.strip("/")
+        self._brief_name = brief_name
         self._run = run or RunContext()
         self._history = history
         self._default_since = default_since
@@ -728,6 +736,7 @@ class SitePublisher:
                     run_number=stats.document["total_runs"],
                     run_status=outcome.lower(),
                     existing=self._load_json(day_path, head),
+                    brief_name=self._brief_name,
                 )
                 files[day_path] = dump_json(day)
             files[stats_path] = dump_json(stats.document)
@@ -848,6 +857,7 @@ def create_site_publisher(
     return SitePublisher(
         store,
         news_dir=settings.site_news_dir,
+        brief_name=getattr(settings, "brief_name", DEFAULT_BRIEF_NAME),
         run=run,
         history=history,
         default_since=settings.site_stats_since,

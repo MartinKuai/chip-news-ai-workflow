@@ -34,6 +34,7 @@ from daily_chip_news.website import (
     compute_stats,
     create_site_publisher,
     limit_sentences,
+    safe_url,
     site_item,
 )
 
@@ -169,12 +170,20 @@ class DayDocumentTests(unittest.TestCase):
         self.assertEqual({"number": 281, "status": "success"}, document["run"])
         self.assertEqual(["title", "summary", "source"], list(document["items"][0]))
         self.assertEqual(["name", "url"], list(document["items"][0]["source"]))
-        self.assertEqual("标题 1 等 2 条芯闻", document["title"])
+        self.assertEqual("标题 1 等 2 条简报", document["title"])
 
     def test_title_for_a_single_item_is_its_headline(self) -> None:
         self.assertEqual("标题 1", brief_title([item(1)]))
         self.assertEqual(
-            "涨价了 等 2 条芯闻", brief_title([{"title": "涨价了！"}, item(2)])
+            "涨价了 等 2 条简报", brief_title([{"title": "涨价了！"}, item(2)])
+        )
+        self.assertEqual(
+            "涨价了 等 2 条芯闻",
+            brief_title([{"title": "涨价了！"}, item(2)], brief_name="芯闻"),
+        )
+        self.assertEqual(
+            "涨价了 等 2 条 AI 简报",
+            brief_title([{"title": "涨价了！"}, item(2)], brief_name="AI 简报"),
         )
 
     def test_same_day_rerun_merges_by_url_and_keeps_first_publication(self) -> None:
@@ -673,3 +682,214 @@ class FactoryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CodexRequiredTests(unittest.TestCase):
+    """Specific test requirements from docs/codex-tasks/daily-chip-news.md:
+    1. 无新闻日只更新 stats (no-news day updates only stats)
+    2. quota_stopped (run status and stats counting)
+    3. 重复运行 (same day merge and rerun attempt idempotency)
+    4. 非法 URL (illegal url rejection)
+    5. 超长摘要 (summary capping at 3 sentences with edge cases)
+    6. BRIEF_NAME (configurable brief name in output data)
+    """
+
+    def test_no_news_day_writes_only_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            publisher = SitePublisher(
+                LocalSiteStore(directory),
+                run=RunContext(event="schedule", run_id=123),
+                now=lambda: NOW,
+                logger=None,
+            )
+            result = publisher.publish([], "SUCCESS")
+            self.assertFalse(result.news_written)
+            self.assertEqual(0, result.items)
+            self.assertEqual(1, result.stats["total_runs"])
+            self.assertEqual("2026-01", result.stats["since"])
+
+            news_dir = Path(directory) / "data" / "news"
+            self.assertTrue((news_dir / "stats.json").is_file())
+            self.assertFalse((news_dir / "2026-10-20.json").exists())
+
+    def test_quota_stopped_outcome_and_stats(self) -> None:
+        document = build_day_document(
+            date="2026-10-20",
+            published_at="2026-10-20T05:01:32+08:00",
+            items=[item(1)],
+            run_number=282,
+            run_status="quota_stopped",
+        )
+        self.assertEqual("quota_stopped", document["run"]["status"])
+        self.assertEqual(282, document["run"]["number"])
+
+        stats_res = compute_stats(
+            previous={
+                "total_runs": 10,
+                "success_rate": 1.0,
+                "since": "2026-01",
+                "updated_at": "2026-10-19T05:00:00+08:00",
+            },
+            history=None,
+            current_run_id=124,
+            scheduled=True,
+            succeeded=True,  # QUOTA_STOPPED != FAILED -> succeeded=True
+            counted_since=NOW,
+            now=NOW,
+            default_since="2026-01",
+        )
+        self.assertTrue(stats_res.counted_current)
+        self.assertEqual(11, stats_res.document["total_runs"])
+        self.assertEqual(1.0, stats_res.document["success_rate"])
+
+    def test_rerun_and_duplicate_runs_idempotency(self) -> None:
+        # Same-day merge dedupes by URL
+        existing = build_day_document(
+            date="2026-10-20",
+            published_at="2026-10-20T05:01:32+08:00",
+            items=[item(1), item(2)],
+            run_number=280,
+            run_status="success",
+        )
+        re_run = build_day_document(
+            date="2026-10-20",
+            published_at="2026-10-20T08:00:00+08:00",
+            items=[item(2), item(3)],  # item(2) is duplicate
+            run_number=280,
+            run_status="success",
+            existing=existing,
+        )
+        self.assertEqual(3, len(re_run["items"]))
+        self.assertEqual(["https://news.example/1", "https://news.example/2", "https://news.example/3"],
+                         [it["source"]["url"] for it in re_run["items"]])
+        self.assertEqual("2026-10-20T05:01:32+08:00", re_run["published_at"])
+
+        # Actions re-run attempt > 1 does not double count total_runs
+        run_history = [
+            WorkflowRun(
+                id=999,
+                status="completed",
+                conclusion="success",
+                created_at=datetime(2026, 10, 20, 4, 0, 0, tzinfo=SITE_TZ),
+            )
+        ]
+        # Previous stats written at 04:05:00 by attempt 1
+        prev_stats = {
+            "total_runs": 50,
+            "success_rate": 1.0,
+            "since": "2026-01",
+            "updated_at": "2026-10-20T04:05:00+08:00",
+        }
+        res = compute_stats(
+            previous=prev_stats,
+            history=run_history,
+            current_run_id=999,
+            scheduled=True,
+            succeeded=True,
+            # attempt's created_at:
+            counted_since=datetime(2026, 10, 20, 4, 0, 0, tzinfo=SITE_TZ),
+            now=NOW,
+            default_since="2026-01",
+        )
+        self.assertFalse(res.counted_current)
+        self.assertEqual(50, res.document["total_runs"])
+
+    def test_illegal_urls_safe_url_and_site_item(self) -> None:
+        illegal = [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "ftp://files.example/data",
+            "data:text/html;base64,PHNjcmlwdD4=",
+            "/path/to/page",
+            "relative-url",
+            "http://",
+            "https://",
+            "https://example.com/has space/test",
+            "",
+            None,
+            12345,
+        ]
+        for url in illegal:
+            with self.subTest(url=url):
+                self.assertEqual("", safe_url(url))
+                self.assertIsNone(site_item({**CANDIDATE, "url": url}, DRAFT))
+
+        valid = [
+            "https://openai.com/index/gpt-4o",
+            "http://news.ycombinator.com/item?id=123",
+            "https://blog.google/technology/ai/?page=1#frag",
+        ]
+        for url in valid:
+            with self.subTest(url=url):
+                self.assertEqual(url, safe_url(url))
+                res = site_item({**CANDIDATE, "url": url}, DRAFT)
+                self.assertIsNotNone(res)
+                self.assertEqual(url, res["source"]["url"])
+
+    def test_overly_long_summary_sentence_capping(self) -> None:
+        # 5 sentences truncated to 3
+        text5 = (
+            "第一句关于大模型发布。"
+            "第二句介绍参数提升！"
+            "第三句说明定价与时间？"
+            "第四句是多余评论。"
+            "第五句是计划。"
+        )
+        expected3 = "第一句关于大模型发布。第二句介绍参数提升！第三句说明定价与时间？"
+        self.assertEqual(expected3, limit_sentences(text5))
+
+        # Decimals mid-sentence like GPT-4.5 or 98.5% do not split
+        text_with_decimals = (
+            "OpenAI 推出 GPT-4.5。"
+            "准确率达 98.5%！"
+            "支持 128k 窗口。"
+            "第四句不应出现。"
+        )
+        expected_decimals = "OpenAI 推出 GPT-4.5。准确率达 98.5%！支持 128k 窗口。"
+        self.assertEqual(expected_decimals, limit_sentences(text_with_decimals))
+
+        # Sentences with quotes and brackets
+        text_quotes = (
+            "专家表示：“技术突破。”"
+            "第二句跟进评估！"
+            "第三句总结反响。"
+            "第四句多余。"
+        )
+        expected_quotes = "专家表示：“技术突破。”第二句跟进评估！第三句总结反响。"
+        self.assertEqual(expected_quotes, limit_sentences(text_quotes))
+
+        # site_item enforces sentence limit on draft
+        long_draft = {**DRAFT, "summary": text5}
+        mapped = site_item(CANDIDATE, long_draft)
+        self.assertIsNotNone(mapped)
+        self.assertEqual(expected3, mapped["summary"])
+
+    def test_brief_name_configuration(self) -> None:
+        items = [item(1), item(2)]
+        # Default brief name is "简报"
+        self.assertEqual("标题 1 等 2 条简报", brief_title(items))
+        # Custom brief name "芯闻"
+        self.assertEqual("标题 1 等 2 条芯闻", brief_title(items, brief_name="芯闻"))
+        # Custom brief name "AI 简报"
+        self.assertEqual(
+            "标题 1 等 2 条 AI 简报", brief_title(items, brief_name="AI 简报")
+        )
+
+        doc_default = build_day_document(
+            date="2026-10-20",
+            published_at="2026-10-20T05:01:32+08:00",
+            items=items,
+            run_number=1,
+            run_status="success",
+        )
+        self.assertEqual("标题 1 等 2 条简报", doc_default["title"])
+
+        doc_custom = build_day_document(
+            date="2026-10-20",
+            published_at="2026-10-20T05:01:32+08:00",
+            items=items,
+            run_number=1,
+            run_status="success",
+            brief_name="芯闻",
+        )
+        self.assertEqual("标题 1 等 2 条芯闻", doc_custom["title"])

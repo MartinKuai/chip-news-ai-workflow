@@ -51,13 +51,21 @@ compose 只读取 Research Notes + editorial brief + 输出 schema，看不到�
 
 ## 信息来源与候选控制
 
-当前默认从五类来源收集候选文章（可用 `SOURCE_FEEDS` 覆盖）：
+简报内容聚焦 **AI 行业新闻事件**（关注商业落地与行业事实，不收录纯学术论文与营销软文）。每天简报覆盖五大范畴：
+1. **模型与产品**：重要模型、功能和产品发布（如 OpenAI、Google 等）
+2. **企业应用**：企业落地案例、行业解决方案、Agent 的实际生产部署
+3. **算力与芯片**：AI 芯片、数据中心、GPU/云算力集群与基础设施（延续硬件方向）
+4. **资本与政策**：融资、并购、合规监管、出口管制与产业政策
+5. **开源与生态**：开源模型、AI Coding 工具、评估标准及协议（如 MCP）
 
-- [EE Times](https://www.eetimes.com/feed/)
-- [Semiconductor Engineering](https://semiengineering.com/feed/)
-- [ServeTheHome](https://www.servethehome.com/feed/)
-- [TrendForce Semiconductors](https://www.trendforce.com/feed/Semiconductors.html)
-- [Hacker News RSS](https://hnrss.org/newest?points=100)
+当前默认配置 6 个验证可用的一手与权威 AI 来源（可用 `SOURCE_FEEDS` 覆盖）：
+
+- [OpenAI News](https://openai.com/news/rss.xml) (官方新闻与产品发布)
+- [Google AI Blog](https://blog.google/technology/ai/rss/) (官方大模型与技术发布)
+- [NVIDIA Blog](https://blogs.nvidia.com/feed/) (AI 算力、芯片与工业落地)
+- [Hugging Face Blog](https://huggingface.co/blog/feed.xml) (开源模型与生态)
+- [TechCrunch AI](https://techcrunch.com/category/artificial-intelligence/feed/) (行业投资、并购与商业)
+- [Hacker News RSS](https://hnrss.org/newest?points=100) (高赞技术讨论与行业突发)
 
 候选选择完全由确定性代码完成（0 次模型调用）：
 
@@ -205,15 +213,23 @@ Actions 先恢复 `gemini-quota-ledger` artifact，再执行生成，并在成�
 - 读不到 Actions API（网络问题）时只用累加值，并在日志中提示。
 - 首次启用时，网站仓库里如果还留着开发样例 `stats.json`，只要样例数字小于 API 的数字就会被自动纠正；按网站简报第 9 节，上线前仍应删除样例（同一天的样例新闻文件会被合并而不是覆盖）。
 
-### 启用步骤
+### 启用步骤（本人操作清单）
 
-1. 创建 fine-grained personal access token：GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token。
-   - Resource owner：`MartinKuai`；Repository access：Only select repositories → `MartinKuai/martinkuai`
-   - Repository permissions：**Contents: Read and write**（会自动带上 Metadata: Read-only），其他权限都不要
-   - 设置过期时间（最长 1 年）；过期后发布会失败并告警，需要续期后更新 secret
-2. 在本仓库 Settings → Secrets and variables → Actions → New repository secret 添加 `SITE_REPO_TOKEN`（或 `gh secret set SITE_REPO_TOKEN`）。
-3. **先加 secret，再把本分支合并到 `main`**。否则下一次定时运行会因缺少 `SITE_REPO_TOKEN` 而配置失败。
-4. 网站仓库的 `main` 如果开启了分支保护（要求 PR 或状态检查），需要允许 token 所有者绕过，或者用 Variable `SITE_REPO_BRANCH` 改写到专用分支。
+工作流合并到 `main` 前，请完成以下三步设置：
+
+1. **创建细粒度 Personal Access Token**：
+   - GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token
+   - Resource owner：`MartinKuai`
+   - Repository access：Only select repositories → 选择网站仓库 `MartinKuai/martinkuai`
+   - Permissions：**Contents: Read and write**（会自动带上 Metadata: Read-only），其他权限一律不选
+   - 设置过期时间（最长 1 年）；过期后发布会告警，届时续期并更新 secret 即可
+2. **在工作流仓库配置 Secret**：
+   - 在本仓库（`chip-news-ai-workflow`）Settings → Secrets and variables → Actions → New repository secret
+   - Name: `SITE_REPO_TOKEN`，Secret: 填入上述 Token（或通过 `gh secret set SITE_REPO_TOKEN`）
+3. **按需配置目标分支变量 `SITE_REPO_BRANCH`**：
+   - 网站当前在 `claude/exciting-pasteur-57zifp` 分支上开发，Cloudflare 预览站也是基于此分支部署。
+   - **在网站合并到 `main` 之前**：在本仓库 Settings → Secrets and variables → Actions → Variables 添加 `SITE_REPO_BRANCH`，值为 `claude/exciting-pasteur-57zifp`。
+   - **待网站合并到 `main` 之后**：将 `SITE_REPO_BRANCH` 修改为 `main`（或直接删除该变量使用默认值 `main`）。
 
 ### 开关与配置
 
@@ -222,7 +238,8 @@ Actions 先恢复 `gemini-quota-ledger` artifact，再执行生成，并在成�
 | `SITE_REPO_TOKEN` | github 模式必填 | Secret，写网站仓库 |
 | `SITE_PUBLISH_MODE` | `github` | `github` 提交到网站仓库；`local` 只写本地文件夹（dry-run）；`off` 不发布到网站 |
 | `SITE_REPO` | `MartinKuai/martinkuai` | 网站仓库 |
-| `SITE_REPO_BRANCH` | `main` | 写入的分支 |
+| `SITE_REPO_BRANCH` | `main` | 写入的分支（网站未合并前建议设为 `claude/exciting-pasteur-57zifp`） |
+| `BRIEF_NAME` | `简报` | 简报标题栏目名，如 `简报`、`芯闻`、`AI 简报`，产出数据标题格式为 `... 等 N 条{BRIEF_NAME}` |
 | `SITE_NEWS_DIR` | `data/news` | 仓库内目录 |
 | `SITE_LOCAL_DIR` | `output/site` | dry-run 输出目录（已被 Git 忽略） |
 | `SITE_TIMEOUT_SECONDS` | `20` | GitHub 请求超时 |

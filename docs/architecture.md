@@ -216,7 +216,8 @@ UNEXPECTED_ERROR                停止本轮且 run 强制 FAILED
 | `RUN_BUDGET_SECONDS` | `2100` | 整场时间预算 |
 | `SITE_REPO_TOKEN` | github 模式必填 | 网站仓库 fine-grained token（Contents 读写，仅 MartinKuai/martinkuai） |
 | `SITE_PUBLISH_MODE` | `github` | `github` / `local`（dry-run）/ `off` |
-| `SITE_REPO` / `SITE_REPO_BRANCH` / `SITE_NEWS_DIR` | `MartinKuai/martinkuai` / `main` / `data/news` | 写入位置 |
+| `SITE_REPO` / `SITE_REPO_BRANCH` / `SITE_NEWS_DIR` | `MartinKuai/martinkuai` / `main` / `data/news` | 写入位置（未合并前 SITE_REPO_BRANCH 设为 claude/exciting-pasteur-57zifp） |
+| `BRIEF_NAME` | `简报` | 简报名称（输出标题格式：`... 等 N 条{BRIEF_NAME}`） |
 | `SITE_LOCAL_DIR` | `output/site` | dry-run 输出目录 |
 | `SITE_TIMEOUT_SECONDS` | `20` | GitHub 请求超时 |
 | `SITE_STATS_SINCE` / `SITE_STATS_WORKFLOW` | `2026-01` / `daily_news.yml` | stats 口径 |
