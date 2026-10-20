@@ -13,6 +13,7 @@ BASE_ENV = {
     "REVIEWER_MODEL": "reviewer-model",
     "TELEGRAM_BOT_TOKEN": "telegram-token",
     "TELEGRAM_CHAT_ID": "telegram-chat",
+    "SITE_REPO_TOKEN": "site-token",
 }
 
 
@@ -68,6 +69,19 @@ class ConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(15.0, settings.telegram_timeout_seconds)
         self.assertEqual("", settings.summary_path)
 
+    def test_website_is_the_default_channel_and_telegram_is_off(self) -> None:
+        settings = Settings.from_env(env())
+        self.assertFalse(settings.publish_telegram)
+        self.assertEqual("github", settings.site_mode)
+        self.assertEqual("MartinKuai/martinkuai", settings.site_repo)
+        self.assertEqual("main", settings.site_repo_branch)
+        self.assertEqual("data/news", settings.site_news_dir)
+        self.assertEqual("output/site", settings.site_local_dir)
+        self.assertEqual("2026-01", settings.site_stats_since)
+        self.assertEqual("daily_news.yml", settings.site_stats_workflow)
+        self.assertEqual("site-token", settings.site_repo_token)
+        self.assertNotIn("site-token", repr(settings))
+
 
 class ConfigOverrideTests(unittest.TestCase):
     def test_per_node_overrides(self) -> None:
@@ -116,6 +130,70 @@ class ConfigOverrideTests(unittest.TestCase):
         self.assertEqual("output/run-summary.json", settings.summary_path)
         self.assertEqual(8, settings.breaker_window_size)
         self.assertEqual(4, settings.breaker_failure_threshold)
+
+
+class PublishingChannelTests(unittest.TestCase):
+    def test_telegram_credentials_are_optional_by_default(self) -> None:
+        values = env()
+        values.pop("TELEGRAM_BOT_TOKEN")
+        values.pop("TELEGRAM_CHAT_ID")
+        settings = Settings.from_env(values)
+        self.assertFalse(settings.publish_telegram)
+        self.assertEqual("", settings.telegram_bot_token)
+
+    def test_publish_telegram_requires_its_credentials(self) -> None:
+        values = env(PUBLISH_TELEGRAM="1")
+        self.assertTrue(Settings.from_env(values).publish_telegram)
+        values.pop("TELEGRAM_CHAT_ID")
+        with self.assertRaises(ConfigError):
+            Settings.from_env(values)
+
+    def test_github_mode_requires_the_site_token(self) -> None:
+        values = env()
+        values.pop("SITE_REPO_TOKEN")
+        with self.assertRaises(ConfigError) as context:
+            Settings.from_env(values)
+        self.assertIn("SITE_REPO_TOKEN", str(context.exception))
+        with self.assertRaises(ConfigError):
+            Settings.from_env({**values, "SITE_REPO_TOKEN": "your_site_token"})
+
+    def test_dry_run_modes_need_no_site_token(self) -> None:
+        values = env()
+        values.pop("SITE_REPO_TOKEN")
+        local = Settings.from_env({**values, "SITE_PUBLISH_MODE": "local"})
+        self.assertEqual("local", local.site_mode)
+        off = Settings.from_env({**values, "SITE_PUBLISH_MODE": "OFF"})
+        self.assertEqual("off", off.site_mode)
+        disabled = Settings.from_env({**values, "PUBLISH_ENABLED": "0"})
+        self.assertEqual("local", disabled.site_mode)
+
+    def test_site_overrides(self) -> None:
+        settings = Settings.from_env(
+            env(
+                SITE_REPO="someone/site-repo",
+                SITE_REPO_BRANCH="news/daily",
+                SITE_NEWS_DIR="/data/news/",
+                SITE_LOCAL_DIR="tmp/site",
+                SITE_STATS_SINCE="2026-02",
+            )
+        )
+        self.assertEqual("someone/site-repo", settings.site_repo)
+        self.assertEqual("news/daily", settings.site_repo_branch)
+        self.assertEqual("data/news", settings.site_news_dir)
+        self.assertEqual("tmp/site", settings.site_local_dir)
+        self.assertEqual("2026-02", settings.site_stats_since)
+
+    def test_invalid_site_values_are_rejected(self) -> None:
+        for name, value in (
+            ("SITE_PUBLISH_MODE", "ftp"),
+            ("SITE_REPO", "not a repo"),
+            ("SITE_REPO", "owner/../repo"),
+            ("SITE_REPO_BRANCH", "main branch"),
+            ("SITE_NEWS_DIR", "../outside"),
+            ("SITE_STATS_SINCE", "2026-13"),
+        ):
+            with self.subTest(name=name, value=value), self.assertRaises(ConfigError):
+                Settings.from_env(env(**{name: value}))
 
 
 class ConfigErrorTests(unittest.TestCase):

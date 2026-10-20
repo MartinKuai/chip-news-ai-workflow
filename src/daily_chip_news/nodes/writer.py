@@ -14,7 +14,7 @@ from ..schemas import GraphState, validate_draft
 
 WRITER_OUTPUT_SCHEMA = {
     "headline": "concise Chinese headline",
-    "summary": "80-160 Chinese characters",
+    "summary": "1-3 Chinese sentences, 80-160 Chinese characters; shown on the website",
     "key_facts": ["2-4 facts supported by Research Notes"],
     "why_it_matters": "1-2 concise sentences",
     "telegram_copy": "publishable Chinese copy within 500 Chinese characters",
@@ -48,6 +48,8 @@ Revision Brief 和 Output Schema。
 因果、预测或背景知识。
 Research Notes 的 entities 与 key_numbers 是事实基线，必须与之保持一致。
 写作使用中文，简洁、克制、事实优先，不写营销腔。
+headline 是网站上的条目标题；summary 用一到三句话说清发生了什么、关键事实是什么，
+会原样显示在网站上。
 返工时只执行精简 revision_brief，只修改 previous_draft，不新增事实。
 严格返回符合 output_schema 的 JSON 对象。
 """.strip()

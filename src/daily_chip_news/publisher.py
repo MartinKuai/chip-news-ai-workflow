@@ -1,4 +1,9 @@
-"""Deterministic Telegram publishing, outside the AI nodes."""
+"""Deterministic publishing, outside the AI nodes.
+
+The website (``website.py``) is the default channel and is written once per run,
+after the candidate loop. Telegram is optional (``PUBLISH_TELEGRAM=1``) and,
+when enabled, still receives every approved item as soon as it passes review.
+"""
 
 from __future__ import annotations
 
@@ -99,9 +104,14 @@ class TelegramPublisher:
 
 
 class PublisherNode:
-    """Graph adapter that enforces the PASS-only publication invariant."""
+    """Graph adapter that enforces the PASS-only publication invariant.
 
-    def __init__(self, publisher: TelegramPublisher) -> None:
+    Only Reviewer-approved items reach a terminal ``PUBLISHED`` state; the runner
+    collects those for the website. ``publisher`` is the optional Telegram
+    channel and is ``None`` unless ``PUBLISH_TELEGRAM=1``.
+    """
+
+    def __init__(self, publisher: TelegramPublisher | None = None) -> None:
         self._publisher = publisher
 
     def __call__(self, state: GraphState) -> dict[str, Any]:
@@ -111,7 +121,8 @@ class PublisherNode:
                 "Publisher received an item without Reviewer PASS",
                 global_failure=True,
             )
-        draft = state["draft"]
-        candidate = state["candidate"]
-        self._publisher.publish(draft["telegram_copy"], candidate["url"])
+        if self._publisher is not None:
+            draft = state["draft"]
+            candidate = state["candidate"]
+            self._publisher.publish(draft["telegram_copy"], candidate["url"])
         return {"published": True, "status": "PASS"}
