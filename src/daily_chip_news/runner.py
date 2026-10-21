@@ -29,6 +29,9 @@ from .graph import (
 )
 from .health import ServiceHealth
 from .metrics import RunMetrics
+from .nodes.researcher import RESEARCHER_INSTRUCTION
+from .nodes.reviewer import REVIEWER_INSTRUCTION
+from .nodes.writer import WRITER_INSTRUCTION
 from .outcomes import CandidateStatus, RunOutcome, decide_run_outcome, exit_code_for
 from .publisher import TelegramPublisher
 from .quota import QuotaStateError, QuotaStopped
@@ -39,7 +42,8 @@ from .sources import (
     collect_articles,
     select_candidates,
 )
-from .website import SitePublisher, create_site_publisher, site_item
+from .trace import TraceRecorder
+from .website import SitePublisher, create_site_publisher, site_item, source_name
 
 SKIP_NOT_RELEVANT = "researcher-skip"
 SKIP_REJECTED = "reviewer-reject"
@@ -443,12 +447,13 @@ def _publish_site(
     site_publisher: SitePublisher | None,
     items: list[dict[str, Any]],
     outcome: RunOutcome,
+    trace: TraceRecorder,
 ) -> tuple[dict[str, Any] | None, Exception | None]:
-    """Write the day file (if any item passed review) and stats in one commit."""
+    """Write news (if any), stats and the editorial trace in one commit."""
     if site_publisher is None:
         return None, None
     try:
-        published = site_publisher.publish(items, outcome.value)
+        published = site_publisher.publish(items, outcome.value, trace=trace)
     except Exception as exc:
         status_code = _safe_status_code(exc)
         status_suffix = (
@@ -494,6 +499,17 @@ def run_daily(
     the loop. Runs where nothing passed review still update the site stats.
     """
     print(_config_line(settings))
+    trace = TraceRecorder(
+        started_at=getattr(site_publisher, "started_at", None),
+        redactions=(
+            settings.gemini_api_key, settings.site_repo_token,
+            settings.telegram_bot_token, settings.telegram_chat_id,
+            os.environ.get("GITHUB_TOKEN", ""), os.environ.get("GH_TOKEN", ""),
+        ),
+        system_instructions=(
+            RESEARCHER_INSTRUCTION, WRITER_INSTRUCTION, REVIEWER_INSTRUCTION,
+        ),
+    )
     metrics = RunMetrics()
     service_breaker = breaker or ServiceHealth(
         settings.breaker_window_size, settings.breaker_failure_threshold
@@ -516,7 +532,7 @@ def run_daily(
         )
     except QuotaStateError as exc:
         stats = _empty_stats()
-        site, _ = _publish_site(site_publisher, [], RunOutcome.FAILED)
+        site, _ = _publish_site(site_publisher, [], RunOutcome.FAILED, trace)
         result = {
             **stats,
             "run_outcome": RunOutcome.FAILED.value,
@@ -554,7 +570,7 @@ def run_daily(
                 "sources", "SourceCollectionError", force_failed=True
             )
             print("Run outcome decision | reason=all-sources-unavailable -> FAILED")
-            site, _ = _publish_site(site_publisher, [], RunOutcome.FAILED)
+            site, _ = _publish_site(site_publisher, [], RunOutcome.FAILED, trace)
             _print_summary(
                 settings,
                 stats,
@@ -593,6 +609,11 @@ def run_daily(
         limit=settings.max_candidates_per_run,
         max_age_hours=settings.max_candidate_age_hours,
     )
+    for candidate in selected:
+        trace.add_candidate(
+            candidate,
+            source_name=source_name(candidate, trace.url(candidate.get("url")) or ""),
+        )
     print(
         "Candidate control | "
         f"discovered={len(collection.candidates)} "
@@ -634,15 +655,28 @@ def run_daily(
             f"| title={current['title']}"
         )
         try:
-            result = runtime_graph.invoke(
-                {
-                    "candidate": candidate,
-                    "revision_brief": [],
-                    "revision_count": 0,
-                    "status": "NEW",
-                    "published": False,
-                }
-            )
+            initial = {
+                "candidate": candidate,
+                "revision_brief": [],
+                "revision_count": 0,
+                "status": "NEW",
+                "published": False,
+            }
+            if callable(getattr(runtime_graph, "stream", None)):
+                # Observe each completed node before the next one can fail.
+                # LangGraph updates contain only node outputs, never prompts.
+                result = dict(initial)
+                for updates in runtime_graph.stream(initial, stream_mode="updates"):
+                    for stage, update in updates.items():
+                        if stage in {"researcher", "writer", "reviewer", "publisher"}:
+                            result.update(update)
+                            trace.observe(candidate, stage, update)
+            else:
+                # Preserve the injectable invoke-only graph adapter used by
+                # callers/tests. Such an adapter supplies only its final state.
+                result = runtime_graph.invoke(initial)
+                for stage in ("researcher", "writer", "reviewer"):
+                    trace.observe(candidate, stage, result)
         except NodeExecutionError as exc:
             cause = exc.cause
             if isinstance(cause, QuotaStopped):
@@ -712,6 +746,7 @@ def run_daily(
             item = site_item(candidate, result.get("draft"))
             if item is not None:
                 site_items.append(item)
+                trace.mark_published(candidate)
             elif site_publisher is not None:
                 print(f"Site item skipped | id={current['id']} | reason=unusable-draft")
         elif status == STATUS_SKIP:
@@ -768,7 +803,7 @@ def run_daily(
         f"{'yes' if fatal_failure and fatal_failure.force_failed else 'no'} "
         f"-> {outcome.value} (exit {exit_code_for(outcome)})"
     )
-    site, site_error = _publish_site(site_publisher, site_items, outcome)
+    site, site_error = _publish_site(site_publisher, site_items, outcome, trace)
     if site_error is not None:
         # Nothing reached the website: the run fails and alerts, and the next
         # run's stats count it as a failed run. Candidate counters stay as-is;

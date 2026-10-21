@@ -24,12 +24,14 @@ flowchart TD
     G --> E
     E -->|REVISE 达到上限| H[HOLD → SKIPPED]
     E -->|REJECT → SKIPPED| Z
-    F -->|本轮结束，一个 commit| W[网站 data/news/YYYY-MM-DD.json + stats.json]
+    F -->|本轮结束，一个 commit| W[网站 日新闻 + trace + stats.json]
     F -.->|PUBLISH_TELEGRAM=1| I[Telegram]
     F --> J[Run Summary / Notification]
 ```
 
 LangGraph `StateGraph` 编排三个 AI 节点，Publisher 保持确定性。默认最多返工一次（`MAX_REVISIONS=1`），达到上限进入 `HOLD`（计入 SKIPPED）。
+
+每次运行还会生成 `data/news/YYYY-MM-DD.trace.json`，用于网站回放逐条研究、写作、审查和发布结果。没有合格新闻也生成，同日重跑覆盖，原有新闻和统计格式不变。字段映射、失败状态的有损映射和本地复现见 [运行记录说明](docs/news-trace.md)。
 
 ## 三个 AI 节点
 

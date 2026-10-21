@@ -24,12 +24,14 @@ flowchart TD
     G --> E
     E -->|REVISE at limit| H[HOLD → SKIPPED]
     E -->|REJECT → SKIPPED| Z
-    F -->|end of run, one commit| W[Website data/news/YYYY-MM-DD.json + stats.json]
+    F -->|end of run, one commit| W[Website daily news + trace + stats.json]
     F -.->|PUBLISH_TELEGRAM=1| I[Telegram]
     F --> J[Run Summary / Notification]
 ```
 
 A LangGraph `StateGraph` wires the three AI nodes while the Publisher stays deterministic. One revision is allowed by default (`MAX_REVISIONS=1`); when the limit is reached the item ends as `HOLD` (counted as SKIPPED).
+
+Each run also exports `data/news/YYYY-MM-DD.trace.json` for the website replay, including runs with no approved news. Same-day reruns replace the trace; existing news and statistics formats stay unchanged. See the [trace contract and offline local example](docs/news-trace.md), including the documented lossy mapping for failed runs.
 
 ## The three AI nodes
 

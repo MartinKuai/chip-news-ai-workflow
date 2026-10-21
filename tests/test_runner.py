@@ -398,7 +398,7 @@ class RecordingSite:
         self.error = error
         self.calls: list[tuple[list[dict], str]] = []
 
-    def publish(self, items, outcome):
+    def publish(self, items, outcome, *, trace=None):
         self.calls.append((list(items), outcome))
         if self.error is not None:
             raise self.error

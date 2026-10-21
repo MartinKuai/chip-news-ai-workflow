@@ -118,11 +118,33 @@ CXL = draft(
 
 GEMINI_SCRIPT = [
     # 1. Packaging: KEEP -> draft -> PASS
-    research_output(topic="先进封装产能"),
+    research_output(
+        topic="先进封装产能",
+        reason="先进封装扩产影响 AI 加速器供应。",
+        notes=[
+            {
+                "claim": "先进封装产能目标提升约 60%。",
+                "evidence": "示例原文列出目标。",
+                "why_it_matters": "与 AI 加速器供应有关。",
+                "confidence": 0.9,
+            }
+        ],
+    ),
     PACKAGING,
     review("PASS"),
     # 2. DDR5: KEEP -> draft -> REVISE (unsupported forecast) -> revised -> PASS
-    research_output(topic="DDR5 合约价"),
+    research_output(
+        topic="DDR5 合约价",
+        reason="服务器内存价格变化与算力供应有关。",
+        notes=[
+            {
+                "claim": "第四季度服务器 DDR5 合约价预计环比上涨 8% 至 13%。",
+                "evidence": "示例研究报告列出区间。",
+                "why_it_matters": "影响服务器成本。",
+                "confidence": 0.9,
+            }
+        ],
+    ),
     DDR5_FIRST,
     review(
         "REVISE",
@@ -132,7 +154,18 @@ GEMINI_SCRIPT = [
     DDR5_REVISED,
     review("PASS"),
     # 3. CXL via Hacker News: KEEP -> draft -> PASS
-    research_output(topic="CXL 内存池化"),
+    research_output(
+        topic="CXL 内存池化",
+        reason="生产部署经验提供算力基础设施参考。",
+        notes=[
+            {
+                "claim": "16 台服务器通过 CXL 2.0 共享内存池。",
+                "evidence": "示例技术文章介绍部署。",
+                "why_it_matters": "提供内存扩展参考。",
+                "confidence": 0.9,
+            }
+        ],
+    ),
     CXL,
     review("PASS"),
     # 4. Phone cameras: off scope -> SKIP, nothing written
@@ -203,7 +236,9 @@ class SiteDryRunFixtureTests(unittest.TestCase):
             path.name: path.read_text(encoding="utf-8")
             for path in sorted(expected_dir.glob("*.json"))
         }
-        self.assertEqual(["2026-10-20.json", "stats.json"], sorted(expected))
+        self.assertEqual(
+            ["2026-10-20.json", "2026-10-20.trace.json", "stats.json"], sorted(expected)
+        )
         self.assertEqual(expected, produced)
 
     def test_fixture_follows_the_site_contract(self) -> None:

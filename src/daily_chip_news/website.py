@@ -9,8 +9,10 @@ After the candidate loop the runner hands every Reviewer-approved item to
   homepage keeps showing the latest day that had news.
 * ``data/news/stats.json`` on every run that reaches the publisher, including
   "nothing passed review" runs and failed runs.
+* ``data/news/YYYY-MM-DD.trace.json`` when the runner supplies its editorial
+  snapshot, including runs with no approved news; same-day reruns replace it.
 
-Both files are plain data: every string comes from the Writer or from RSS
+These files are plain data: every string comes from the editorial nodes or RSS
 metadata and the website must escape it when rendering.
 
 Stats semantics (what the owner quotes: "270 scheduled runs, about 97% success"):
@@ -39,6 +41,7 @@ import requests
 
 from .config import DEFAULT_BRIEF_NAME
 from .publisher import PublisherError
+from .trace import TraceRecorder
 
 SITE_TZ = ZoneInfo("Asia/Shanghai")
 STATS_FILE = "stats.json"
@@ -673,7 +676,7 @@ def dump_json(document: Mapping[str, Any]) -> str:
 
 
 class SitePublisher:
-    """Turn one run's approved items and outcome into the two site files."""
+    """Commit the day's news, stats and optional editorial replay together."""
 
     def __init__(
         self,
@@ -705,8 +708,16 @@ class SitePublisher:
     def store(self) -> str:
         return self._store.describe()
 
+    @property
+    def started_at(self) -> datetime:
+        return self._started_at
+
     def publish(
-        self, items: Sequence[Mapping[str, Any]], outcome: str
+        self,
+        items: Sequence[Mapping[str, Any]],
+        outcome: str,
+        *,
+        trace: TraceRecorder | None = None,
     ) -> SitePublishResult:
         history = self._load_history()
         counted_since = self._counted_since(history)
@@ -740,6 +751,13 @@ class SitePublisher:
                 )
                 files[day_path] = dump_json(day)
             files[stats_path] = dump_json(stats.document)
+            if trace is not None:
+                files[f"{self._news_dir}/{date}.trace.json"] = trace.finish(
+                    date=date,
+                    number=stats.document["total_runs"],
+                    outcome=outcome,
+                    finished_at=now,
+                )
             try:
                 location = self._store.commit(
                     files, self._message(date, len(items), stats), head

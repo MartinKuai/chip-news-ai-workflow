@@ -24,7 +24,7 @@ Reviewer（notes + draft + rubric）
 FAILED（候选级，不影响其他候选）
   ↓ 全部候选处理结束
 Website：所有 PUBLISHED 条目 + run outcome → 网站仓库一个 commit
-  （data/news/YYYY-MM-DD.json 仅在有条目时写；data/news/stats.json 每轮都写）
+  （日新闻仅在有条目时写；stats.json 和 YYYY-MM-DD.trace.json 每轮都写）
   ↓
 Run Summary → Notification
 ```
@@ -108,6 +108,12 @@ canonical_url()  去 fragment、去 utm_*/fbclid/gclid/mc_cid/mc_eid、统一 ho
 - **carried**：上一份 `stats.json` + 其 `updated_at` 之后创建的已完成定时运行 + 本轮；
 
 取总数大的（相等用 API）。GitHub 自 2026-10-01 起对公开仓库的 workflow run 记录最多保留 90 天，API 总数会随清理变小，此后由 carried 接管，保证不倒退。上一份成功次数 = `round(success_rate × total_runs)`。本轮只在 `GITHUB_EVENT_NAME=schedule` 且上一份 stats 写于本轮开始之前时计入（re-run attempt 用运行的 `created_at` 判断），避免重复计数。读取运行历史使用工作流内置的只读 `GITHUB_TOKEN`（`actions: read`）。
+
+## Website replay trace
+
+runner 通过 LangGraph 的逐节点 updates 保留已完成阶段，并用 `TraceRecorder` 导出允许展示的字段。`SitePublisher.publish(..., trace=...)` 将 `YYYY-MM-DD.trace.json` 与原有数据放进同一次提交；并发冲突重试时，trace 的运行编号随重新读取的统计一起重算。没有通过审查的条目仍写 trace，同日重跑只覆盖最新快照。
+
+`fetched` 指选入编辑流程的候选数，未完成阶段为 `null`；Reviewer 是逐条审查，`HOLD → revise`，返工只保留最近稿件和最近有效结论。固定约定不含失败状态，`FAILED → partial_success` 是有损映射，原退出码、告警和统计失败口径不变。完整字段、大小限制、信息保护和本地样例见 [news-trace.md](news-trace.md)。
 
 ## Graph State
 
