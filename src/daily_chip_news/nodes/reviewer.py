@@ -7,8 +7,8 @@ from typing import Any
 
 from ..config import REVIEW_RUBRIC, NodeProfile
 from ..errors import record_health_outcome
-from ..gemini import JSONClient
 from ..health import HealthEvent
+from ..llm import JSONClient
 from ..metrics import RunMetrics
 from ..schemas import GraphState, validate_review
 

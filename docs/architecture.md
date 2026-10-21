@@ -161,6 +161,8 @@ AI 输出先经过 `responseSchema` 约束，再经过本地 validator；缺字�
 
 ## Gemini client
 
+这是默认后端。选择 `LLM_PROVIDER=openai-compatible` 时，图使用通用 Chat Completions 适配器，不执行 Gemini 配额账本逻辑；节点依赖中立的 `JSONClient` 与错误类别。服务商配置、明确允许的型号与备用策略，以及 OpenCode 免费通道的实际失败证据见 [model-providers.md](model-providers.md)。
+
 - 请求：`x-goog-api-key` header；`responseMimeType=application/json`；可选 `responseSchema`、`maxOutputTokens`、`thinkingConfig.thinkingLevel`。
 - 超时与预算：`GEMINI_TIMEOUT_SECONDS=180`；单次逻辑调用 `GEMINI_CALL_BUDGET_SECONDS=240`；整场 `RUN_BUDGET_SECONDS=2100`；HTTP timeout clamp 到剩余预算。
 - 重试：每个模型最多 `GEMINI_MAX_ATTEMPTS=3`；429 根据安全的 quota dimension 区分日配额，按 `Retry-After` / `RetryInfo` 等待，并共享至少 60s 模型冷却；明确日配额耗尽不短重试。超过 120s 等待上限/deadline 时结束本轮，不提前重试。5xx 退避 10/20/40s，network / timeout 退避 2/4/8s，有 jitter。

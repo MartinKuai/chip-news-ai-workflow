@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 
 from .config import ConfigError, Settings
 from .errors import FailureCategory, classify_failure
+from .gemini import REPAIR_INSTRUCTION
 from .graph import (
     STATUS_HOLD,
     STATUS_PUBLISHED,
@@ -133,23 +134,45 @@ def _latest_status_code(failures: list[FailureRecord]) -> int | None:
 
 
 def _config_line(settings: Settings) -> str:
+    compatible = settings.llm_provider == "openai-compatible"
+    timeout = (
+        settings.llm_timeout_seconds if compatible else settings.gemini_timeout_seconds
+    )
+    attempts = settings.llm_max_attempts if compatible else settings.gemini_max_attempts
+    budget = (
+        settings.llm_call_budget_seconds
+        if compatible else settings.gemini_call_budget_seconds
+    )
+    fallback = (
+        settings.llm_fallback_models if compatible else settings.gemini_fallback_models
+    )
+    interval = (
+        settings.llm_min_interval_seconds
+        if compatible else settings.gemini_min_interval_seconds
+    )
+    daily_budget = (
+        "provider-managed" if compatible else str(settings.gemini_daily_request_limit)
+    )
+    thinking = "provider-default" if compatible else "/".join(
+        p.thinking_level or "default"
+        for p in (settings.researcher, settings.writer, settings.reviewer)
+    )
     return (
         "Daily Chip News config"
+        f" | provider={settings.llm_provider}"
         f" | researcher_model={settings.researcher.model}"
         f" | writer_model={settings.writer.model}"
         f" | reviewer_model={settings.reviewer.model}"
-        f" | thinking={settings.researcher.thinking_level or 'default'}"
-        f"/{settings.writer.thinking_level or 'default'}"
-        f"/{settings.reviewer.thinking_level or 'default'}"
+        f" | thinking={thinking}"
         f" | max_output_tokens={settings.researcher.max_output_tokens}"
         f"/{settings.writer.max_output_tokens}"
         f"/{settings.reviewer.max_output_tokens}"
-        f" | request_timeout={settings.gemini_timeout_seconds:.0f}s"
-        f" | max_attempts={settings.gemini_max_attempts}"
-        f" | call_budget={settings.gemini_call_budget_seconds:.0f}s"
-        f" | fallback_models={','.join(settings.gemini_fallback_models) or 'none'}"
-        f" | model_min_interval={settings.gemini_min_interval_seconds:.0f}s"
-        f" | model_daily_budget={settings.gemini_daily_request_limit}"
+        f" | request_timeout={timeout:.0f}s"
+        f" | max_attempts={attempts}"
+        f" | call_budget={budget:.0f}s"
+        f" | fallback_models={','.join(fallback) or 'none'}"
+        f" | model_min_interval={interval:.0f}s"
+        f" | model_daily_budget={daily_budget}"
         f" | breaker={settings.breaker_failure_threshold}"
         f"/{settings.breaker_window_size}"
         f" | max_revisions={settings.max_revisions}"
@@ -262,7 +285,7 @@ def _print_summary(
         for name in sorted(categories):
             print(f"    {name}: {categories[name]}")
 
-    print("Gemini:")
+    print(f"LLM ({settings.llm_provider}):")
     print(f"  requests: {metrics.gemini_requests}")
     print(f"  successful: {metrics.gemini_success}")
     print(f"  retries: {metrics.gemini_retries}")
@@ -502,12 +525,13 @@ def run_daily(
     trace = TraceRecorder(
         started_at=getattr(site_publisher, "started_at", None),
         redactions=(
-            settings.gemini_api_key, settings.site_repo_token,
+            settings.gemini_api_key, settings.site_repo_token, settings.llm_api_key,
             settings.telegram_bot_token, settings.telegram_chat_id,
             os.environ.get("GITHUB_TOKEN", ""), os.environ.get("GH_TOKEN", ""),
         ),
         system_instructions=(
             RESEARCHER_INSTRUCTION, WRITER_INSTRUCTION, REVIEWER_INSTRUCTION,
+            REPAIR_INSTRUCTION,
         ),
     )
     metrics = RunMetrics()
@@ -710,7 +734,7 @@ def run_daily(
             if service_breaker.is_open:
                 breaker_opened = True
                 print(
-                    "Gemini service breaker OPEN | "
+                    "LLM service breaker OPEN | "
                     f"{service_breaker.snapshot()} | last=stage={exc.stage} "
                     f"category={info.category.value} "
                     f"| published={stats['published']} "
@@ -844,6 +868,7 @@ def run_daily(
         **stats,
         "run_outcome": outcome.value,
         "exit_code": exit_code_for(outcome),
+        "llm_provider": settings.llm_provider,
         "researcher_model": settings.researcher.model,
         "writer_model": settings.writer.model,
         "reviewer_model": settings.reviewer.model,

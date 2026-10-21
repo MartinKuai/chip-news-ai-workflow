@@ -33,6 +33,8 @@ A LangGraph `StateGraph` wires the three AI nodes while the Publisher stays dete
 
 Each run also exports `data/news/YYYY-MM-DD.trace.json` for the website replay, including runs with no approved news. Same-day reruns replace the trace; existing news and statistics formats stay unchanged. See the [trace contract and offline local example](docs/news-trace.md), including the documented lossy mapping for failed runs.
 
+Development supports Gemini and a configurable Chat Completions provider, with model IDs and fallback allowlists supplied by configuration. Live probes of OpenCode's free models returned HTTP 403 through both direct HTTP and an isolated official CLI; that route is not verified for production. See the [provider configuration and evidence](docs/model-providers.md).
+
 ## The three AI nodes
 
 ### Researcher

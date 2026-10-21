@@ -33,6 +33,8 @@ LangGraph `StateGraph` 编排三个 AI 节点，Publisher 保持确定性。默�
 
 每次运行还会生成 `data/news/YYYY-MM-DD.trace.json`，用于网站回放逐条研究、写作、审查和发布结果。没有合格新闻也生成，同日重跑覆盖，原有新闻和统计格式不变。字段映射、失败状态的有损映射和本地复现见 [运行记录说明](docs/news-trace.md)。
 
+开发接入支持 Gemini 和可配置的 Chat Completions 服务，三个角色的型号和备用名单均从配置读取。OpenCode 的免费 DS/GLM 已做实际接入探测，目前本环境的直接 HTTP 与隔离官方 CLI 均返回免费层 403，尚不能作为可用的生产替代品。配置与证据见 [模型服务切换说明](docs/model-providers.md)。
+
 ## 三个 AI 节点
 
 ### Researcher

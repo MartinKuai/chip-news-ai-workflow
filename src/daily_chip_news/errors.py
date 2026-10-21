@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from .gemini import GeminiAPIError, GeminiResponseError, GeminiTruncatedResponseError
 from .health import HealthEvent
+from .llm import LLMAPIError, LLMResponseError, LLMTruncatedResponseError
 from .publisher import PublisherError
 from .schemas import SchemaError
 from .sources import SourceError
@@ -60,14 +60,14 @@ class FailureInfo:
 
 def classify_failure(stage: str, cause: Exception) -> FailureInfo:
     """Map a node exception to one category and its run-level routing flags."""
-    if isinstance(cause, GeminiTruncatedResponseError):
+    if isinstance(cause, LLMTruncatedResponseError):
         return FailureInfo(
             FailureCategory.MODEL_RESPONSE_TRUNCATED,
             transient=False,
             stop_run=False,
             force_failed=False,
         )
-    if isinstance(cause, GeminiResponseError):
+    if isinstance(cause, LLMResponseError):
         return FailureInfo(
             FailureCategory.MODEL_RESPONSE_INVALID,
             transient=False,
@@ -88,7 +88,7 @@ def classify_failure(stage: str, cause: Exception) -> FailureInfo:
             stop_run=False,
             force_failed=False,
         )
-    if isinstance(cause, GeminiAPIError):
+    if isinstance(cause, LLMAPIError):
         status_code = cause.status_code
         if status_code == 429:
             return FailureInfo(

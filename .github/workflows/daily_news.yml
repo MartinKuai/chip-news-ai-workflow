@@ -51,16 +51,24 @@ jobs:
 
       - name: Restore Gemini quota ledger
         id: quota-restore
+        if: ${{ (vars.LLM_PROVIDER || 'gemini') == 'gemini' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: python scripts/restore_quota_ledger.py
 
       - name: Run the news production pipeline
-        # Restore succeeds only with auditable state; an API/artifact failure
-        # prevents generation instead of silently resetting the daily budget.
+        # Gemini requires an auditable restored ledger. Other providers skip
+        # that ledger and use their configured request/deadline limits.
         env:
           # Credentials come from Repository Secrets, models from Variables.
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          LLM_PROVIDER: ${{ vars.LLM_PROVIDER || 'gemini' }}
+          LLM_AUTH_MODE: ${{ vars.LLM_AUTH_MODE || 'bearer' }}
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_ALLOWED_MODELS: ${{ vars.LLM_ALLOWED_MODELS }}
+          LLM_FALLBACK_MODELS: ${{ vars.LLM_FALLBACK_MODELS }}
+          LLM_RESPONSE_FORMAT: ${{ vars.LLM_RESPONSE_FORMAT || 'json_object' }}
           # Website publishing (default): one commit per run to the site repo
           # with data/news/YYYY-MM-DD.json (when an item passed review) and
           # data/news/stats.json. SITE_PUBLISH_MODE: github | local | off.

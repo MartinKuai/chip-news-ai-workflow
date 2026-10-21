@@ -8,20 +8,29 @@ import re
 import time
 from collections.abc import Callable
 from email.utils import parsedate_to_datetime
-from typing import Any, Protocol
+from typing import Any
 from urllib.parse import quote
 
 import requests
 
+from .llm import (
+    JSONClient as JSONClient,
+)
+from .llm import (
+    LLMAPIError,
+    LLMError,
+    LLMResponseError,
+    LLMTruncatedResponseError,
+)
 from .metrics import RunMetrics
 from .quota import QuotaGuard, QuotaStopped, QuotaWaitDeadline
 
 
-class GeminiError(RuntimeError):
+class GeminiError(LLMError):
     """Base class for Gemini failures; the runner decides their scope."""
 
 
-class GeminiAPIError(GeminiError):
+class GeminiAPIError(LLMAPIError, GeminiError):
     """Raised for network, authentication, quota, model, or server failures."""
 
     def __init__(
@@ -38,28 +47,12 @@ class GeminiAPIError(GeminiError):
         self.transient = transient
 
 
-class GeminiResponseError(GeminiError):
+class GeminiResponseError(LLMResponseError, GeminiError):
     """Raised when Gemini does not return the promised JSON object."""
 
 
-class GeminiTruncatedResponseError(GeminiResponseError):
+class GeminiTruncatedResponseError(LLMTruncatedResponseError, GeminiResponseError):
     """Raised when Gemini stopped because the output budget was exhausted."""
-
-
-class JSONClient(Protocol):
-    """The narrow client interface the AI nodes depend on."""
-
-    def request_json(
-        self,
-        *,
-        model: str,
-        system_instruction: str,
-        payload: dict[str, Any],
-        purpose: str = "",
-        output_schema: dict[str, Any] | None = None,
-        thinking_level: str = "",
-        max_output_tokens: int | None = None,
-    ) -> dict[str, Any]: ...
 
 
 class _ThinkingConfigRejected(Exception):

@@ -70,3 +70,15 @@ python scripts/export_trace_sample.py --output output/trace-sample
 本任务只交付开发分支：没有合并 main、没有开 PR、没有手动触发工作流、没有修改仓库 Secrets/变量/设置，也没有向 `MartinKuai/martinkuai` 写入任何内容。
 
 程序未启动、配置解析失败、进程被强制终止或网站写入通道故障时，无法保证网站收到 trace；进入 runner 后被处理的故障会尽量随统计一起写入，真实故障仍由原运维告警和 Actions 结果记录。
+
+## 后续调整：服务商解耦与免费模型探测（2026-10-21）
+
+按本人后续要求，新增可配置的 Chat Completions 接入层，抽出中立的角色接口与错误类型。实际型号、服务地址、鉴权模式、允许名单及备用型号均由配置指定，未切换线上默认服务。
+
+Python 3.11 下 **318 项测试全部通过**，本轮新增 17 项服务商适配测试。trace、日新闻和统计的固定输出样本均未改变。
+新增代码/配置/测试的 Ruff 检查与改动格式检查通过；沿用旧源文件的已有长行规则例外。
+
+OpenCode 官方目录列出免费的 DS 与 GLM，API 文档还描述免鉴权调用，但实际直接 HTTP 和隔离官方 CLI 1.18.33 均返回 HTTP 403 `FreeTierError`。新闻 local 试跑真实结果为 FAILED，未生成新闻，仍导出了 [失败 trace](examples/opencode-free-2026-10-21.trace.json)。
+这不是免费通道成功验收，也不是长期稳定性结论。详细核查方法、局限和后续选择见 [model-providers.md](model-providers.md)。
+
+仍然只推送当前开发分支，不合并 main、不开 PR、不手动触发工作流，不改仓库 Secrets/变量/设置，不向网站仓库写入。

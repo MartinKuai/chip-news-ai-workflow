@@ -15,6 +15,7 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 
 class ConfigError(RuntimeError):
@@ -190,7 +191,7 @@ def _source_feeds(env: Mapping[str, str]) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class NodeProfile:
-    """Per-node Gemini routing: one model plus its generation budget."""
+    """Per-node model routing and generation budget, independent of provider."""
 
     model: str
     thinking_level: str = "low"
@@ -242,6 +243,17 @@ class Settings:
     breaker_failure_threshold: int = 3
     run_budget_seconds: float = 2100.0
     summary_path: str = ""
+    llm_provider: str = "gemini"
+    llm_base_url: str = ""
+    llm_api_key: str = field(default="", repr=False)
+    llm_auth_mode: str = "bearer"
+    llm_allowed_models: tuple[str, ...] = ()
+    llm_fallback_models: tuple[str, ...] = ()
+    llm_response_format: str = "json_object"
+    llm_timeout_seconds: float = 120.0
+    llm_max_attempts: int = 2
+    llm_call_budget_seconds: float = 240.0
+    llm_min_interval_seconds: float = 2.0
 
     @property
     def site_mode(self) -> str:
@@ -254,8 +266,49 @@ class Settings:
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
         source = os.environ if env is None else env
         publish_telegram = _bool(source, "PUBLISH_TELEGRAM", False)
+        provider = _choice(
+            source, "LLM_PROVIDER", "gemini", {"gemini", "openai-compatible"}
+        )
+        auth_mode = _choice(source, "LLM_AUTH_MODE", "bearer", {"bearer", "none"})
         settings = cls(
-            gemini_api_key=_required(source, "GEMINI_API_KEY"),
+            gemini_api_key=(
+                _required(source, "GEMINI_API_KEY")
+                if provider == "gemini"
+                else _optional_secret(source, "GEMINI_API_KEY")
+            ),
+            llm_provider=provider,
+            llm_api_key=(
+                _required(source, "LLM_API_KEY")
+                if provider == "openai-compatible" and auth_mode == "bearer"
+                else _optional_secret(source, "LLM_API_KEY")
+            ),
+            llm_auth_mode=auth_mode,
+            llm_base_url=source.get("LLM_BASE_URL", "").strip().rstrip("/"),
+            llm_allowed_models=tuple(
+                x.strip()
+                for x in source.get("LLM_ALLOWED_MODELS", "").split(",")
+                if x.strip()
+            ),
+            llm_fallback_models=tuple(
+                x.strip()
+                for x in source.get("LLM_FALLBACK_MODELS", "").split(",")
+                if x.strip()
+            ),
+            llm_response_format=_choice(
+                source, "LLM_RESPONSE_FORMAT", "json_object", {"json_object", "none"}
+            ),
+            llm_timeout_seconds=_positive_float(
+                source, "LLM_TIMEOUT_SECONDS", 120, minimum=1, maximum=300
+            ),
+            llm_max_attempts=_positive_int(
+                source, "LLM_MAX_ATTEMPTS", 2, minimum=1, maximum=5
+            ),
+            llm_call_budget_seconds=_positive_float(
+                source, "LLM_CALL_BUDGET_SECONDS", 240, minimum=1, maximum=900
+            ),
+            llm_min_interval_seconds=_positive_float(
+                source, "LLM_MIN_INTERVAL_SECONDS", 2, minimum=0, maximum=120
+            ),
             researcher=NodeProfile(
                 model=_required(source, "RESEARCHER_MODEL"),
                 thinking_level=_thinking_level(source, "RESEARCHER_THINKING_LEVEL"),
@@ -386,6 +439,39 @@ class Settings:
         )
         if settings.breaker_failure_threshold > settings.breaker_window_size:
             raise ConfigError("BREAKER_THRESHOLD must not exceed BREAKER_WINDOW")
+        if provider == "openai-compatible":
+            try:
+                parts = urlsplit(settings.llm_base_url)
+                valid = (
+                    parts.scheme == "https"
+                    and bool(parts.hostname)
+                    and not (
+                        parts.username
+                        or parts.password
+                        or parts.query
+                        or parts.fragment
+                    )
+                    and not any(c.isspace() for c in settings.llm_base_url)
+                    and parts.port != 0
+                )
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ConfigError(
+                    "LLM_BASE_URL must be HTTPS without credentials or query"
+                )
+            selected = {
+                settings.researcher.model,
+                settings.writer.model,
+                settings.reviewer.model,
+                *settings.llm_fallback_models,
+            }
+            if not settings.llm_allowed_models or not selected.issubset(
+                settings.llm_allowed_models
+            ):
+                raise ConfigError(
+                    "Every primary and fallback model must be in LLM_ALLOWED_MODELS"
+                )
         if settings.site_mode == "github" and not settings.site_repo_token:
             raise ConfigError(
                 "SITE_REPO_TOKEN is not configured "

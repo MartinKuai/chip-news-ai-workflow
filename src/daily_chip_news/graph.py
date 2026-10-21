@@ -7,13 +7,14 @@ from typing import Any, Literal
 
 from langgraph.graph import END, START, StateGraph
 
+from .compatible import CompatibleClient
 from .config import Settings
 from .gemini import GeminiClient
 from .health import ServiceHealth
-from .quota import QuotaGuard
 from .metrics import RunMetrics
 from .nodes import ResearcherNode, ReviewerNode, WriterNode
 from .publisher import PublisherNode, TelegramPublisher
+from .quota import QuotaGuard
 from .schemas import GraphState, SchemaError
 from .sources import ArticleExtractor
 
@@ -188,24 +189,40 @@ def create_runtime_graph(
     """Wire real infrastructure while preserving independent model selection."""
     run_metrics = metrics or RunMetrics()
     record = breaker.record if breaker is not None else None
-    client = GeminiClient(
-        settings.gemini_api_key,
-        timeout=settings.gemini_timeout_seconds,
-        max_attempts=settings.gemini_max_attempts,
-        call_budget_seconds=settings.gemini_call_budget_seconds,
-        structured_output=settings.gemini_structured_output,
-        fallback_models=settings.gemini_fallback_models,
-        run_deadline=run_deadline,
-        logger=print,
-        metrics=run_metrics,
-        quota_guard=QuotaGuard(
-            min_interval=settings.gemini_min_interval_seconds,
-            daily_limit=settings.gemini_daily_request_limit,
-            ledger_path=settings.gemini_quota_ledger_path,
-            required=settings.gemini_quota_ledger_required,
+    if settings.llm_provider == "openai-compatible":
+        client = CompatibleClient(
+            settings.llm_base_url,
+            settings.llm_api_key,
+            allowed_models=settings.llm_allowed_models,
+            auth_mode=settings.llm_auth_mode,
+            fallback_models=settings.llm_fallback_models,
+            response_format=settings.llm_response_format,
+            timeout=settings.llm_timeout_seconds,
+            max_attempts=settings.llm_max_attempts,
+            call_budget_seconds=settings.llm_call_budget_seconds,
+            min_interval=settings.llm_min_interval_seconds,
+            run_deadline=run_deadline,
+            metrics=run_metrics,
+        )
+    else:
+        client = GeminiClient(
+            settings.gemini_api_key,
+            timeout=settings.gemini_timeout_seconds,
+            max_attempts=settings.gemini_max_attempts,
+            call_budget_seconds=settings.gemini_call_budget_seconds,
+            structured_output=settings.gemini_structured_output,
+            fallback_models=settings.gemini_fallback_models,
+            run_deadline=run_deadline,
             logger=print,
-        ),
-    )
+            metrics=run_metrics,
+            quota_guard=QuotaGuard(
+                min_interval=settings.gemini_min_interval_seconds,
+                daily_limit=settings.gemini_daily_request_limit,
+                ledger_path=settings.gemini_quota_ledger_path,
+                required=settings.gemini_quota_ledger_required,
+                logger=print,
+            ),
+        )
     return build_editorial_graph(
         researcher=ResearcherNode(
             client,
